@@ -5,6 +5,17 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **`FileInfo` and `DirectoryEntry` carry the file's attributes**, in a new `attributes` field. Code that builds either one by hand (a test fixture, say) needs to fill it in; `FileAttributes::default()` means none.
+
+### Added
+
+- **A copy keeps its source's Hidden and Read-only flags, in the frames it already sends.** Every listing, `stat`, and open already got the file's attributes back, and now you do too: `DirectoryEntry::attributes` and `FileInfo::attributes` (so `FileDownload::info()`, `FileReader::info()`, and `read_file_compound_with_info` as well) hand them over as a `FileAttributes`, with `is_hidden()`, `is_readonly()`, and `is_directory()`. To set them, `FileTimes::set_attributes` puts them in the same SET_INFO as the times, so a writer stamps its copy's date and Hidden flag with one `FileWriter::set_times`, and `set_times` by path sets them on a file or a directory. What you pass replaces the file's attributes, and empty ones clear them all. Only the attributes a server lets you set go out, so you can pass a source's straight through: Directory, Sparse, and the like stay off the wire.
+- `NtStatus::CANNOT_DELETE`, what deleting a Read-only file gets. Clear Read-only first.
+
 ## [0.27.2] - 2026-10-07
 
 ### Added

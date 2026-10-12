@@ -1,5 +1,5 @@
-//! A file's timestamps: setting them, and handing out the ones a read already
-//! got.
+//! A file's timestamps and attributes: setting them, and handing out the ones
+//! a read already got.
 //!
 //! ## Setting
 //!
@@ -7,8 +7,19 @@
 //! handle) send SET_INFO `FileBasicInformation` (MS-FSCC § 2.4.7). Every time
 //! a caller leaves out goes on the wire as 0, which the spec defines as "MUST
 //! NOT change this attribute", so a caller setting only the modification time
-//! changes only that. `FileAttributes` goes as 0 too, which leaves the
-//! attributes alone.
+//! changes only that. Unset attributes go as 0 too, which leaves them alone.
+//!
+//! **Attributes are replaced, never merged**: the server swaps the file's
+//! whole settable set (MS-FSA § 2.1.5.15.2) for what's sent. That makes 0 a
+//! trap: it can't mean "none", so empty attributes go as `NORMAL`, the one
+//! value that clears them. Only the settable bits go at all, because the rest
+//! describe the file (and Directory on a file is refused outright), so
+//! attributes another file reported can be passed straight through.
+//!
+//! **Read-only blocks a delete and a rename onto it**, on Windows and on a
+//! Samba that maps it (MS-FSCC § 2.6: a read-only file "cannot" be written or
+//! deleted). A copy that wants it should set it once the file has landed under
+//! its final name, and a cleanup that deletes one clears it first.
 //!
 //! The two other special values, -1 ("stop updating this time on this
 //! handle") and -2 ("start again"), aren't offered: they're handle-scoped
@@ -25,8 +36,9 @@
 //!
 //! ## Reading
 //!
-//! Every CREATE response carries the file's four times and its size, so a read
-//! that opens the file already knows its dates. [`FileInfo`](crate::FileInfo) built from it is
+//! Every CREATE response carries the file's four times, its size, and its
+//! attributes, so a read that opens the file already knows its dates and
+//! whether it's Hidden or Read-only. [`FileInfo`](crate::FileInfo) built from it is
 //! what [`FileDownload::info`](crate::FileDownload::info),
 //! [`FileReader::info`](crate::FileReader::info), and
 //! [`Tree::read_file_compound_with_info`] hand out, with no extra round trip.
@@ -42,16 +54,18 @@ use crate::msg::create::{
 };
 use crate::msg::set_info::{InfoType, SetInfoRequest};
 use crate::pack::{FileTime, ReadCursor, Unpack};
-use crate::types::flags::FileAccessMask;
+use crate::types::flags::{FileAccessMask, FileAttributes};
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, FileId, OplockLevel};
 use crate::{Error, Tree};
 
-/// Which of a file's timestamps to set, for [`Tree::set_times`],
-/// [`Tree::set_handle_times`], and
-/// [`FileWriter::set_times`](crate::FileWriter::set_times).
+/// Which of a file's timestamps (and, optionally, its attributes) to set, for
+/// [`Tree::set_times`], [`Tree::set_handle_times`], and
+/// [`FileWriter::set_times`](crate::FileWriter::set_times). It's everything
+/// one SET_INFO `FileBasicInformation` changes, so a copy keeps its source's
+/// dates and Hidden flag in one frame.
 ///
-/// Every time starts out unset, and an unset time is left as the server has
+/// Every field starts out unset, and an unset one is left as the server has
 /// it. Shaped like [`std::fs::FileTimes`]: build one with [`new`](Self::new)
 /// and the `set_*` methods, which take a [`FileTime`] (for example one
 /// [`Tree::stat`] returned, unchanged) or a [`SystemTime`](std::time::SystemTime).
@@ -79,6 +93,10 @@ pub struct FileTimes {
     pub modified: Option<FileTime>,
     /// When the file's contents or metadata last changed (`ChangeTime`).
     pub changed: Option<FileTime>,
+    /// The attributes to give the file (Hidden, Read-only, ...), or `None` to
+    /// leave them as they are. They ride the same SET_INFO as the times; see
+    /// [`set_attributes`](Self::set_attributes).
+    pub attributes: Option<FileAttributes>,
 }
 
 impl FileTimes {
@@ -115,18 +133,48 @@ impl FileTimes {
         self.changed = Some(t.into());
         self
     }
+
+    /// Set the file's attributes, replacing the ones it has.
+    ///
+    /// The whole settable set is replaced, so a file sent only
+    /// [`HIDDEN`](FileAttributes::HIDDEN) also loses Read-only and Archive.
+    /// Empty attributes clear them all (they go on the wire as
+    /// [`NORMAL`](FileAttributes::NORMAL), since 0 would mean "don't
+    /// change"). Only the [`SETTABLE`](FileAttributes::SETTABLE) bits are
+    /// sent: the rest (Directory, Sparse, Compressed, ...) describe the file
+    /// rather than set it, and a server refuses Directory on a file, so the
+    /// attributes another file reported can be passed in as they are.
+    #[must_use]
+    pub fn set_attributes(mut self, attributes: FileAttributes) -> Self {
+        self.attributes = Some(attributes);
+        self
+    }
 }
 
-/// The 40-byte `FILE_BASIC_INFORMATION` that sets `times` and leaves
-/// everything else (attributes included) alone.
+/// The 40-byte `FILE_BASIC_INFORMATION` that sets what `times` names and
+/// leaves everything else alone.
 fn basic_info_buffer(times: &FileTimes) -> Result<Vec<u8>> {
     let mut buf = Vec::with_capacity(40);
     for t in [times.created, times.accessed, times.modified, times.changed] {
         buf.extend_from_slice(&wire_time(t)?.to_le_bytes());
     }
-    buf.extend_from_slice(&0u32.to_le_bytes()); // FileAttributes: don't change
+    buf.extend_from_slice(&wire_attributes(times.attributes).to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // Reserved
     Ok(buf)
+}
+
+/// The attributes as they go on the wire: 0 ("don't change") when unset,
+/// only the settable bits otherwise, and `NORMAL` when none of those are left,
+/// because 0 would leave the old ones in place instead of clearing them
+/// (MS-FSCC § 2.6).
+fn wire_attributes(attributes: Option<FileAttributes>) -> u32 {
+    match attributes {
+        None => 0,
+        Some(a) => match a.bits() & FileAttributes::SETTABLE {
+            0 => FileAttributes::NORMAL,
+            bits => bits,
+        },
+    }
 }
 
 /// One time as it goes on the wire: 0 ("don't change") when unset, and
@@ -155,8 +203,8 @@ fn set_basic_info(file_id: FileId, buffer: Vec<u8>) -> SetInfoRequest {
 }
 
 impl Tree {
-    /// Set a file's or directory's timestamps, leaving the ones `times`
-    /// doesn't name as they are.
+    /// Set a file's or directory's timestamps (and attributes, when `times`
+    /// carries them), leaving whatever `times` doesn't name as it is.
     ///
     /// One round trip: CREATE (attribute-write access, sharing everything) +
     /// SET_INFO `FileBasicInformation` + CLOSE as a compound. Works on
@@ -402,6 +450,63 @@ mod tests {
         );
     }
 
+    fn attributes_on_the_wire(attributes: u32) -> u32 {
+        let times = FileTimes::new().set_attributes(FileAttributes::new(attributes));
+        let buf = basic_info_buffer(&times).unwrap();
+        u32::from_le_bytes(buf[32..36].try_into().unwrap())
+    }
+
+    #[test]
+    fn attributes_land_in_their_field_beside_the_times() {
+        let times = FileTimes::new()
+            .set_modified(MODIFIED)
+            .set_attributes(FileAttributes::new(FileAttributes::HIDDEN));
+        let buf = basic_info_buffer(&times).unwrap();
+        assert_eq!(buf.len(), 40);
+        assert_eq!(u64_at(&buf, 16), MODIFIED.0, "LastWriteTime");
+        assert_eq!(&buf[32..36], &[0x02, 0, 0, 0], "FileAttributes: HIDDEN");
+        assert_eq!(&buf[36..40], &[0; 4], "Reserved");
+    }
+
+    #[test]
+    fn empty_attributes_clear_them_all_rather_than_meaning_dont_change() {
+        assert_eq!(attributes_on_the_wire(0), FileAttributes::NORMAL);
+    }
+
+    #[test]
+    fn normal_beside_another_attribute_is_dropped() {
+        assert_eq!(
+            attributes_on_the_wire(FileAttributes::NORMAL | FileAttributes::READONLY),
+            FileAttributes::READONLY
+        );
+        assert_eq!(
+            attributes_on_the_wire(FileAttributes::NORMAL),
+            FileAttributes::NORMAL
+        );
+    }
+
+    #[test]
+    fn attributes_a_file_reports_but_cant_be_given_stay_off_the_wire() {
+        // A directory's attributes, passed straight on: DIRECTORY on a file is
+        // refused (MS-FSA 2.1.5.15.2), so only the settable bits go.
+        assert_eq!(
+            attributes_on_the_wire(FileAttributes::DIRECTORY | FileAttributes::HIDDEN),
+            FileAttributes::HIDDEN
+        );
+        assert_eq!(
+            attributes_on_the_wire(
+                FileAttributes::DIRECTORY
+                    | FileAttributes::SPARSE_FILE
+                    | FileAttributes::REPARSE_POINT
+                    | FileAttributes::COMPRESSED
+                    | FileAttributes::ENCRYPTED
+            ),
+            FileAttributes::NORMAL,
+            "nothing settable left means clear"
+        );
+        assert_eq!(attributes_on_the_wire(u32::MAX), FileAttributes::SETTABLE);
+    }
+
     #[test]
     fn a_time_that_would_mean_a_handle_switch_is_refused() {
         for raw in [u64::MAX, u64::MAX - 1, 1 << 63] {
@@ -603,6 +708,57 @@ mod tests {
         assert_eq!(set.file_info_class, FILE_BASIC_INFORMATION);
         assert_eq!(u64_at(&set.buffer, 0), CREATED.0);
         assert_eq!(u64_at(&set.buffer, 16), MODIFIED.0);
+    }
+
+    #[tokio::test]
+    async fn set_handle_times_carries_the_attributes_in_the_same_set_info() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_set_info_response());
+        let mut conn = setup_connection(&mock);
+
+        tree()
+            .set_handle_times(
+                &mut conn,
+                file_id(),
+                FileTimes::new()
+                    .set_modified(MODIFIED)
+                    .set_attributes(FileAttributes::new(FileAttributes::HIDDEN)),
+            )
+            .await
+            .expect("set_handle_times");
+
+        assert_eq!(mock.sent_count(), 1, "still one frame");
+        let sent = mock.sent_message(0).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        Header::unpack(&mut cursor).unwrap();
+        let set = SetInfoRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(u64_at(&set.buffer, 16), MODIFIED.0);
+        assert_eq!(&set.buffer[32..36], &[0x02, 0, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn set_times_by_path_carries_the_attributes_too() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(file_id(), 0),
+            build_set_info_response(),
+            build_close_response(),
+        ]));
+        let mut conn = setup_connection(&mock);
+
+        tree()
+            .set_times(
+                &mut conn,
+                "dir",
+                FileTimes::new().set_attributes(FileAttributes::new(FileAttributes::READONLY)),
+            )
+            .await
+            .expect("set_times");
+
+        let subs = sub_requests(&mock.sent_message(0).unwrap());
+        let set = SetInfoRequest::unpack(&mut ReadCursor::new(&subs[1].1)).unwrap();
+        assert_eq!(&set.buffer[0..32], &[0; 32], "no time changes");
+        assert_eq!(&set.buffer[32..36], &[0x01, 0, 0, 0]);
     }
 
     #[tokio::test]

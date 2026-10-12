@@ -30,7 +30,7 @@ use crate::msg::tree_connect::{TreeConnectRequest, TreeConnectRequestFlags, Tree
 use crate::msg::tree_disconnect::TreeDisconnectRequest;
 use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{FileTime, ReadCursor, Unpack};
-use crate::types::flags::FileAccessMask;
+use crate::types::flags::{FileAccessMask, FileAttributes};
 use crate::types::status::NtStatus;
 #[cfg(test)]
 use crate::types::MessageId;
@@ -110,9 +110,6 @@ pub(super) fn all_or_first_err(
     Ok(out)
 }
 
-/// File attribute constant: the entry is a directory.
-const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
-
 /// Create option: the target must be a directory.
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 
@@ -152,6 +149,8 @@ pub struct DirectoryEntry {
     pub created: FileTime,
     /// The last modification time.
     pub modified: FileTime,
+    /// The entry's attributes: Hidden, Read-only, Directory, and the rest.
+    pub attributes: FileAttributes,
 }
 
 /// One QUERY_DIRECTORY round trip within a directory listing, captured by
@@ -232,6 +231,8 @@ pub struct FileInfo {
     pub modified: FileTime,
     /// The last access time.
     pub accessed: FileTime,
+    /// The file's attributes: Hidden, Read-only, Directory, and the rest.
+    pub attributes: FileAttributes,
 }
 
 /// File system space information for a share.
@@ -1472,7 +1473,7 @@ impl Tree {
                     | FileAccessMask::FILE_WRITE_ATTRIBUTES
                     | FileAccessMask::SYNCHRONIZE,
             ),
-            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            file_attributes: FileAttributes::NORMAL,
             share_access: ShareAccess(0),
             create_disposition,
             create_options: FILE_NON_DIRECTORY_FILE,
@@ -1962,7 +1963,7 @@ impl Tree {
                     | FileAccessMask::FILE_WRITE_ATTRIBUTES
                     | FileAccessMask::SYNCHRONIZE,
             ),
-            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            file_attributes: FileAttributes::NORMAL,
             share_access: ShareAccess(0),
             create_disposition: CreateDisposition::FileOverwriteIf,
             create_options: FILE_NON_DIRECTORY_FILE,
@@ -2239,7 +2240,7 @@ impl Tree {
             desired_access: FileAccessMask::new(
                 FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
             ),
-            file_attributes: FILE_ATTRIBUTE_DIRECTORY,
+            file_attributes: FileAttributes::DIRECTORY,
             share_access: ShareAccess(
                 ShareAccess::FILE_SHARE_READ
                     | ShareAccess::FILE_SHARE_WRITE
@@ -2555,7 +2556,7 @@ impl Tree {
                     | FileAccessMask::FILE_WRITE_ATTRIBUTES
                     | FileAccessMask::SYNCHRONIZE,
             ),
-            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            file_attributes: FileAttributes::NORMAL,
             share_access: ShareAccess(0),
             create_disposition,
             create_options: FILE_NON_DIRECTORY_FILE,
@@ -2615,7 +2616,7 @@ impl Tree {
                     | FileAccessMask::FILE_WRITE_ATTRIBUTES
                     | FileAccessMask::SYNCHRONIZE,
             ),
-            file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+            file_attributes: FileAttributes::NORMAL,
             share_access: ShareAccess(
                 ShareAccess::FILE_SHARE_READ
                     | ShareAccess::FILE_SHARE_WRITE
@@ -3203,7 +3204,7 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
     let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
     let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
     let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
-    let file_attributes = u32::from_le_bytes(basic_buf[32..36].try_into().unwrap());
+    let attributes = FileAttributes::new(u32::from_le_bytes(basic_buf[32..36].try_into().unwrap()));
 
     let std_resp = QueryInfoResponse::unpack(&mut ReadCursor::new(std_body))?;
     let std_buf = &std_resp.output_buffer;
@@ -3214,7 +3215,7 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
         )));
     }
     let end_of_file = u64::from_le_bytes(std_buf[8..16].try_into().unwrap());
-    let is_directory = std_buf[21] != 0 || (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    let is_directory = std_buf[21] != 0 || attributes.is_directory();
 
     Ok(FileInfo {
         size: end_of_file,
@@ -3222,6 +3223,7 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
         created,
         modified,
         accessed,
+        attributes,
     })
 }
 
@@ -3229,12 +3231,14 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
 /// file's size, attributes, and times, so a read that opened the file needs no
 /// `stat` to know them.
 pub(crate) fn file_info_from_create(resp: &CreateResponse) -> FileInfo {
+    let attributes = FileAttributes::new(resp.file_attributes);
     FileInfo {
         size: resp.end_of_file,
-        is_directory: resp.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        is_directory: attributes.is_directory(),
         created: resp.creation_time,
         modified: resp.last_write_time,
         accessed: resp.last_access_time,
+        attributes,
     }
 }
 
@@ -3277,7 +3281,7 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
         let _change_time = FileTime::unpack(&mut cursor)?;
         let end_of_file = cursor.read_u64_le()?;
         let _allocation_size = cursor.read_u64_le()?;
-        let file_attributes = cursor.read_u32_le()?;
+        let attributes = FileAttributes::new(cursor.read_u32_le()?);
         let file_name_length = cursor.read_u32_le()? as usize;
         let _ea_size = cursor.read_u32_le()?;
         let _short_name_length = cursor.read_u8()?;
@@ -3293,14 +3297,13 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
             String::new()
         };
 
-        let is_directory = (file_attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-
         entries.push(DirectoryEntry {
             name,
             size: end_of_file,
-            is_directory,
+            is_directory: attributes.is_directory(),
             created: creation_time,
             modified: last_write_time,
+            attributes,
         });
 
         if next_entry_offset == 0 {
@@ -3454,7 +3457,7 @@ mod tests {
         buf.extend_from_slice(&((size + 4095) & !4095).to_le_bytes());
         // FileAttributes (4)
         let attrs = if is_directory {
-            FILE_ATTRIBUTE_DIRECTORY
+            FileAttributes::DIRECTORY
         } else {
             0x00000020 // ARCHIVE
         };
@@ -3815,6 +3818,47 @@ mod tests {
         assert_eq!(entries[0].name, "test.txt");
         assert_eq!(entries[0].size, 42);
         assert!(!entries[0].is_directory);
+    }
+
+    #[test]
+    fn a_listing_entry_carries_its_attributes() {
+        let mut data = build_file_both_dir_info(".secret", 1, false, 0);
+        // FileAttributes sits after NextEntryOffset, FileIndex, four times,
+        // EndOfFile, and AllocationSize: byte 56.
+        let attrs = FileAttributes::HIDDEN | FileAttributes::READONLY | FileAttributes::ARCHIVE;
+        data[56..60].copy_from_slice(&attrs.to_le_bytes());
+
+        let entries = parse_file_both_directory_info(&data).unwrap();
+        assert_eq!(entries[0].attributes, FileAttributes::new(attrs));
+        assert!(entries[0].attributes.is_hidden());
+        assert!(entries[0].attributes.is_readonly());
+        assert!(!entries[0].is_directory);
+
+        let dir =
+            parse_file_both_directory_info(&build_file_both_dir_info("d", 0, true, 0)).unwrap();
+        assert!(dir[0].is_directory && dir[0].attributes.is_directory());
+    }
+
+    #[test]
+    fn a_create_response_hands_out_the_attributes_it_carries() {
+        use crate::msg::create::CreateAction;
+        let resp = CreateResponse {
+            oplock_level: OplockLevel::None,
+            flags: 0,
+            create_action: CreateAction::FileOpened,
+            creation_time: FileTime(1),
+            last_access_time: FileTime(2),
+            last_write_time: FileTime(3),
+            change_time: FileTime(4),
+            allocation_size: 0,
+            end_of_file: 7,
+            file_attributes: FileAttributes::HIDDEN | FileAttributes::READONLY,
+            file_id: FileId::default(),
+            create_contexts: vec![],
+        };
+        let info = file_info_from_create(&resp);
+        assert!(info.attributes.is_hidden() && info.attributes.is_readonly());
+        assert!(!info.is_directory);
     }
 
     #[tokio::test]
@@ -4209,6 +4253,10 @@ mod tests {
         assert_eq!(info.created, FileTime(132_000_000_000_000_000));
         assert_eq!(info.modified, FileTime(133_000_000_000_000_000));
         assert_eq!(info.accessed, FileTime(132_100_000_000_000_000));
+        assert_eq!(
+            info.attributes,
+            FileAttributes::new(FileAttributes::ARCHIVE)
+        );
         // One compound frame sent.
         assert_eq!(mock.sent_count(), 1);
     }

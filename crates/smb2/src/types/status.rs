@@ -200,6 +200,10 @@ nt_status_codes! {
     /// The I/O request was canceled.
     CANCELLED = 0xC000_0120, "STATUS_CANCELLED";
 
+    /// The file can't be deleted: it's read-only. Clear
+    /// [`FileAttributes::READONLY`](crate::FileAttributes::READONLY) first.
+    CANNOT_DELETE = 0xC000_0121, "STATUS_CANNOT_DELETE";
+
     /// An I/O request other than close was attempted using a file object
     /// that had already been closed.
     FILE_CLOSED = 0xC000_0128, "STATUS_FILE_CLOSED";
@@ -432,6 +436,7 @@ mod tests {
             NtStatus::DIRECTORY_NOT_EMPTY,
             NtStatus::NOT_A_DIRECTORY,
             NtStatus::CANCELLED,
+            NtStatus::CANNOT_DELETE,
             NtStatus::FILE_CLOSED,
             NtStatus::USER_SESSION_DELETED,
             NtStatus::INSUFF_SERVER_RESOURCES,

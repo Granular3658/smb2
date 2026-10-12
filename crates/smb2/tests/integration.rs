@@ -468,6 +468,45 @@ async fn resolve_on_raspberry_pi() {
     resolve_names_the_stored_file(&mut conn, tree, "smb2-resolve-Dir").await;
 }
 
+/// Read-only: the listing and `stat` agree on every root entry's Hidden,
+/// Read-only, and Directory attributes, and Directory agrees with
+/// `is_directory`. Writes nothing.
+#[tokio::test]
+#[ignore]
+async fn listing_and_stat_agree_on_attributes_on_nas() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_to_nas().await;
+
+    let entries = tree
+        .list_directory(&mut conn, "")
+        .await
+        .expect("list_directory failed");
+    let mut checked = 0;
+    for entry in entries.iter().filter(|e| e.name != "." && e.name != "..") {
+        let a = entry.attributes;
+        assert_eq!(a.is_directory(), entry.is_directory, "{}", entry.name);
+        let stat = tree
+            .stat(&mut conn, &entry.name)
+            .await
+            .unwrap_or_else(|e| panic!("stat {}: {e}", entry.name));
+        let s = stat.attributes;
+        assert_eq!(
+            (s.is_hidden(), s.is_readonly(), s.is_directory()),
+            (a.is_hidden(), a.is_readonly(), a.is_directory()),
+            "{}: listed {a:?}, stat {s:?}",
+            entry.name
+        );
+        if a.is_hidden() || a.is_readonly() {
+            println!("  {} {:?}", entry.name, a);
+        }
+        checked += 1;
+    }
+    println!("{checked} entries agree");
+    assert!(checked > 0, "expected at least one entry in root");
+
+    tree.disconnect(&mut conn).await.expect("disconnect failed");
+}
+
 #[tokio::test]
 #[ignore]
 async fn stat_file_on_nas() {

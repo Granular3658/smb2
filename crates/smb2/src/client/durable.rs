@@ -82,7 +82,7 @@ use crate::msg::create::{
 use crate::msg::create_context::{self, DurableGrant, DurableReconnectV2, DurableRequestV2};
 use crate::msg::query_info::{InfoType, QueryInfoRequest, QueryInfoResponse};
 use crate::pack::{Guid, ReadCursor, Unpack};
-use crate::types::flags::FileAccessMask;
+use crate::types::flags::{FileAccessMask, FileAttributes};
 use crate::types::status::NtStatus;
 use crate::types::{Command, CreditCharge, Dialect, FileId, OplockLevel};
 
@@ -90,8 +90,6 @@ use super::tree::Tree;
 
 /// `FILE_NON_DIRECTORY_FILE` (MS-SMB2 § 2.2.13).
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
-/// `FILE_ATTRIBUTE_NORMAL`.
-const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
 /// `FileInternalInformation` (MS-FSCC § 2.4.22): the file's index number.
 const FILE_INTERNAL_INFORMATION: u8 = 6;
 /// `FileFsVolumeInformation` (MS-FSCC § 2.5.9): which volume it lives on.
@@ -284,7 +282,7 @@ impl Tree {
                     | FileAccessMask::FILE_WRITE_ATTRIBUTES
                     | FileAccessMask::SYNCHRONIZE,
             ),
-            file_attributes: FILE_ATTRIBUTE_NORMAL,
+            file_attributes: FileAttributes::NORMAL,
             share_access: ShareAccess(ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE),
             create_disposition: CreateDisposition::FileOpenIf,
             create_options: FILE_NON_DIRECTORY_FILE,
@@ -385,7 +383,7 @@ impl Tree {
                     | FileAccessMask::FILE_WRITE_ATTRIBUTES
                     | FileAccessMask::SYNCHRONIZE,
             ),
-            file_attributes: FILE_ATTRIBUTE_NORMAL,
+            file_attributes: FileAttributes::NORMAL,
             share_access: ShareAccess(ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE),
             create_disposition: CreateDisposition::FileOpen,
             create_options: FILE_NON_DIRECTORY_FILE,

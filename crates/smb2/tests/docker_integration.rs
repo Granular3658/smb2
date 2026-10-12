@@ -554,6 +554,169 @@ async fn guest_a_stamp_by_path_loses_to_an_open_writers_close() {
         .expect("delete_file");
 }
 
+// ── Attributes (smb-guest) ──────────────────────────────────────────
+
+fn attrs(bits: u32) -> smb2::FileAttributes {
+    smb2::FileAttributes::new(bits)
+}
+
+/// The attributes `name` has in a listing of the share's root.
+async fn listed_attributes(conn: &mut Connection, tree: &Tree, name: &str) -> smb2::FileAttributes {
+    let entries = tree.list_directory(conn, "").await.expect("list_directory");
+    entries
+        .iter()
+        .find(|e| e.name == name)
+        .unwrap_or_else(|| panic!("{name} is listed"))
+        .attributes
+}
+
+/// Hidden rides a writer's own SET_INFO beside its date, and every read path
+/// reports it: `stat`, the listing, and a download's CREATE.
+#[tokio::test]
+#[ignore]
+async fn guest_a_writer_sets_hidden_beside_its_date_and_every_read_reports_it() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let tree = std::sync::Arc::new(tree);
+    let path = "docker_test_attrs_hidden.tmp";
+    let modified = filetime(1_250_000_000);
+
+    let mut writer = tree
+        .create_file_writer(conn.clone(), path)
+        .await
+        .expect("writer");
+    writer.write_chunk(b"contents").await.expect("write_chunk");
+    writer
+        .set_times(
+            smb2::FileTimes::new()
+                .set_modified(modified)
+                .set_attributes(attrs(smb2::FileAttributes::HIDDEN)),
+        )
+        .await
+        .expect("set_times");
+    writer.finish().await.expect("finish");
+
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+    assert!(stat.attributes.is_hidden(), "stat: {:?}", stat.attributes);
+    assert!(!stat.attributes.is_readonly());
+    assert_eq!(stat.modified, modified, "the date rode the same frame");
+    assert!(listed_attributes(&mut conn, &tree, path).await.is_hidden());
+    let download = tree.download(&mut conn, path).await.expect("download");
+    let info = download.info().expect("opened by the crate").clone();
+    drain(download).await;
+    assert!(
+        info.attributes.is_hidden(),
+        "download: {:?}",
+        info.attributes
+    );
+
+    // Clearing: empty attributes, never 0 ("don't change").
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_attributes(attrs(0)),
+    )
+    .await
+    .expect("clear");
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+    assert!(
+        !stat.attributes.is_hidden(),
+        "cleared: {:?}",
+        stat.attributes
+    );
+    assert_eq!(stat.modified, modified, "clearing left the date alone");
+
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("delete_file");
+}
+
+/// Read-only refuses a delete until it's cleared, which is the order a
+/// cleanup that removes a Read-only copy has to follow.
+#[tokio::test]
+#[ignore]
+async fn guest_a_readonly_file_refuses_deletion_until_cleared() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let path = "docker_test_attrs_readonly.tmp";
+    tree.write_file(&mut conn, path, b"locked")
+        .await
+        .expect("write_file");
+
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_attributes(attrs(
+            smb2::FileAttributes::READONLY | smb2::FileAttributes::HIDDEN,
+        )),
+    )
+    .await
+    .expect("set read-only and hidden");
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+    assert!(stat.attributes.is_readonly(), "stat: {:?}", stat.attributes);
+    assert!(stat.attributes.is_hidden(), "stat: {:?}", stat.attributes);
+    let listed = listed_attributes(&mut conn, &tree, path).await;
+    assert!(
+        listed.is_readonly() && listed.is_hidden(),
+        "listed: {listed:?}"
+    );
+
+    let refused = tree
+        .delete_file(&mut conn, path)
+        .await
+        .expect_err("a read-only file refuses deletion");
+    assert_eq!(
+        refused.status(),
+        Some(smb2::types::status::NtStatus::CANNOT_DELETE)
+    );
+
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_attributes(attrs(0)),
+    )
+    .await
+    .expect("clear read-only");
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+    assert!(!stat.attributes.is_readonly() && !stat.attributes.is_hidden());
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("delete once cleared");
+}
+
+/// A directory takes Hidden by path, and reports it with Directory still set.
+#[tokio::test]
+#[ignore]
+async fn guest_a_directory_takes_hidden_by_path() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let path = "docker_test_attrs_dir";
+    let _ = tree.delete_directory(&mut conn, path).await;
+    tree.create_directory(&mut conn, path)
+        .await
+        .expect("create_directory");
+
+    tree.set_times(
+        &mut conn,
+        path,
+        smb2::FileTimes::new().set_attributes(attrs(smb2::FileAttributes::HIDDEN)),
+    )
+    .await
+    .expect("hide the directory");
+    let stat = tree.stat(&mut conn, path).await.expect("stat");
+    assert!(stat.is_directory && stat.attributes.is_directory());
+    assert!(stat.attributes.is_hidden(), "stat: {:?}", stat.attributes);
+    let listed = listed_attributes(&mut conn, &tree, path).await;
+    assert!(
+        listed.is_directory() && listed.is_hidden(),
+        "listed: {listed:?}"
+    );
+
+    tree.delete_directory(&mut conn, path)
+        .await
+        .expect("delete_directory");
+}
+
 /// The 8.3 alias Samba hands out for `path` (`FileAlternateNameInformation`,
 /// class 21). Samba's aliases are hash-mangled, so a test asks rather than
 /// guesses.

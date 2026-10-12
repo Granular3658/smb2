@@ -120,8 +120,10 @@ pub use client::tree::{
     DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
 };
 
-// Which of a file's timestamps to set (`Tree::set_times`).
+// Which of a file's timestamps and attributes to set (`Tree::set_times`), and
+// the attributes `FileInfo` and `DirectoryEntry` report.
 pub use client::times::FileTimes;
+pub use types::flags::FileAttributes;
 
 // What a path resolved to on the server (`Tree::resolve`), and which file it is.
 pub use client::durable::FileIdentity;

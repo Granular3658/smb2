@@ -1580,8 +1580,9 @@ impl SmbClient {
         results
     }
 
-    /// Set a file's or directory's timestamps, leaving the ones `times`
-    /// doesn't name as they are. See [`Tree::set_times`], including why a
+    /// Set a file's or directory's timestamps (and attributes, when `times`
+    /// carries them), leaving whatever `times` doesn't name as it is. See
+    /// [`Tree::set_times`], including why a
     /// writer's own times are best set with
     /// [`FileWriter::set_times`](crate::FileWriter::set_times).
     ///
@@ -1902,7 +1903,7 @@ impl SmbClient {
                             | crate::types::flags::FileAccessMask::FILE_WRITE_ATTRIBUTES
                             | crate::types::flags::FileAccessMask::SYNCHRONIZE,
                     ),
-                    file_attributes: 0x80, // FILE_ATTRIBUTE_NORMAL
+                    file_attributes: crate::types::flags::FileAttributes::NORMAL,
                     share_access: crate::msg::create::ShareAccess(0),
                     create_disposition: crate::msg::create::CreateDisposition::FileOverwriteIf,
                     create_options: 0x0000_0040, // FILE_NON_DIRECTORY_FILE

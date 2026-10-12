@@ -322,6 +322,86 @@ impl FileAccessMask {
 
 impl_flags!(FileAccessMask, u32);
 
+// ── FileAttributes ──────────────────────────────────────────────────────
+
+/// A file's or directory's attributes (32-bit, from MS-FSCC 2.6): Hidden,
+/// Read-only, and the rest.
+///
+/// What [`FileInfo`](crate::FileInfo) and
+/// [`DirectoryEntry`](crate::DirectoryEntry) report, and what
+/// [`FileTimes::set_attributes`](crate::FileTimes::set_attributes) sends.
+///
+/// ```
+/// use smb2::FileAttributes;
+///
+/// let attrs = FileAttributes::new(FileAttributes::HIDDEN | FileAttributes::READONLY);
+/// assert!(attrs.is_hidden() && attrs.is_readonly());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct FileAttributes(pub u32);
+
+impl FileAttributes {
+    /// Read-only: a file can be read but not written or deleted; a directory
+    /// can't be deleted. macOS shows it as "Locked".
+    pub const READONLY: u32 = 0x0000_0001;
+    /// Hidden from an ordinary directory listing.
+    pub const HIDDEN: u32 = 0x0000_0002;
+    /// Used by the operating system.
+    pub const SYSTEM: u32 = 0x0000_0004;
+    /// A directory. Reported, never set.
+    pub const DIRECTORY: u32 = 0x0000_0010;
+    /// Marked for backup.
+    pub const ARCHIVE: u32 = 0x0000_0020;
+    /// No other attribute set. Only valid alone; a server ignores it beside
+    /// any other.
+    pub const NORMAL: u32 = 0x0000_0080;
+    /// Temporary storage. Settable on files only.
+    pub const TEMPORARY: u32 = 0x0000_0100;
+    /// A sparse file. Reported, never set this way.
+    pub const SPARSE_FILE: u32 = 0x0000_0200;
+    /// Has a reparse point (a symlink, for example). Reported, never set.
+    pub const REPARSE_POINT: u32 = 0x0000_0400;
+    /// Compressed. Reported, never set this way.
+    pub const COMPRESSED: u32 = 0x0000_0800;
+    /// Its data lives in offline storage.
+    pub const OFFLINE: u32 = 0x0000_1000;
+    /// Left out of content indexing.
+    pub const NOT_CONTENT_INDEXED: u32 = 0x0000_2000;
+    /// Encrypted. Reported, never set this way.
+    pub const ENCRYPTED: u32 = 0x0000_4000;
+
+    /// The attributes a SET_INFO `FileBasicInformation` can change (MS-FSA
+    /// 2.1.5.15.2's `ValidSetAttributes`). A server keeps every other bit as
+    /// it is, and refuses DIRECTORY on a file outright.
+    pub const SETTABLE: u32 = Self::READONLY
+        | Self::HIDDEN
+        | Self::SYSTEM
+        | Self::ARCHIVE
+        | Self::TEMPORARY
+        | Self::OFFLINE
+        | Self::NOT_CONTENT_INDEXED;
+
+    /// Hidden from an ordinary directory listing.
+    #[inline]
+    pub const fn is_hidden(&self) -> bool {
+        self.contains(Self::HIDDEN)
+    }
+
+    /// Read-only (macOS's "Locked").
+    #[inline]
+    pub const fn is_readonly(&self) -> bool {
+        self.contains(Self::READONLY)
+    }
+
+    /// A directory.
+    #[inline]
+    pub const fn is_directory(&self) -> bool {
+        self.contains(Self::DIRECTORY)
+    }
+}
+
+impl_flags!(FileAttributes, u32);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,5 +545,26 @@ mod tests {
         assert!(m.contains(FileAccessMask::FILE_READ_DATA));
         assert!(m.contains(FileAccessMask::FILE_WRITE_DATA));
         assert!(!m.contains(FileAccessMask::DELETE));
+    }
+
+    // ── FileAttributes ──────────────────────────────────────────────
+
+    #[test]
+    fn file_attributes_read_their_own_bits() {
+        let a = FileAttributes::new(FileAttributes::HIDDEN | FileAttributes::ARCHIVE);
+        assert!(a.is_hidden());
+        assert!(!a.is_readonly());
+        assert!(!a.is_directory());
+        assert!(FileAttributes::new(FileAttributes::READONLY).is_readonly());
+        assert!(FileAttributes::new(FileAttributes::DIRECTORY).is_directory());
+    }
+
+    #[test]
+    fn file_attributes_settable_is_ms_fsa_valid_set_attributes() {
+        // MS-FSA 2.1.5.15.2: READONLY | HIDDEN | SYSTEM | ARCHIVE | TEMPORARY
+        // | OFFLINE | NOT_CONTENT_INDEXED.
+        assert_eq!(FileAttributes::SETTABLE, 0x0000_3127);
+        assert_eq!(FileAttributes::SETTABLE & FileAttributes::DIRECTORY, 0);
+        assert_eq!(FileAttributes::SETTABLE & FileAttributes::NORMAL, 0);
     }
 }

@@ -7,7 +7,7 @@ Zero-cost newtype wrappers for protocol IDs, command/dialect enums, and bitflag 
 | File | Purpose |
 |---|---|
 | `mod.rs` | `SessionId`, `TreeId`, `FileId`, `MessageId`, `CreditCharge`, `Command`, `Dialect`, `OplockLevel` |
-| `flags.rs` | Bitflag types: `HeaderFlags`, `Capabilities`, `SecurityMode`, `FileAccessMask`, etc. |
+| `flags.rs` | Bitflag types: `HeaderFlags`, `Capabilities`, `SecurityMode`, `FileAccessMask`, `FileAttributes` (re-exported at the crate root; `SETTABLE` is MS-FSA's `ValidSetAttributes`), etc. |
 | `status.rs` | `NtStatus` enum (from MS-ERREF) with severity/facility helpers |
 
 ## Newtype IDs

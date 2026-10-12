@@ -28,7 +28,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `copy.rs` | Server-side copy (`FSCTL_SRV_COPYCHUNK`): resume-key + copychunk primitives, batched range/whole-file convenience, `ResumeKey` / `CopyChunk` / `ServerSideCopyLimits` public types |
 | `durable.rs` | Durable handles: `open_file_durable` / `reclaim_durable_handle`, `DurableHandle`, `FileIdentity`, and the two-proof rule that makes a resume safe |
 | `resolve.rs` | `Tree::resolve` / `Resolved` (which file the server opened, and its stored name), plus `open_and_name`, the CREATE + name-query compound behind `FileReader` / `FileWriter::resolved_path` |
-| `times.rs` | `FileTimes` and `Tree::set_times` / `set_handle_times` (SET_INFO `FileBasicInformation`); `FileWriter::set_times` sits on the latter. The read side (`FileInfo` from a CREATE response) is `tree.rs` `file_info_from_create` |
+| `times.rs` | `FileTimes` (times plus optional `FileAttributes`) and `Tree::set_times` / `set_handle_times` (SET_INFO `FileBasicInformation`); `FileWriter::set_times` sits on the latter. The read side (`FileInfo` from a CREATE response) is `tree.rs` `file_info_from_create` |
 
 ## Layering
 
@@ -368,14 +368,15 @@ measurements: `resolve.rs` module docs.
   then relative to the target share the caller's `Tree` points at afterwards.
 - Names come back through `decode_path` (Paths and the names SMB2 won't carry, above).
 
-## Timestamps (`times.rs`)
+## Timestamps and attributes (`times.rs`)
 
 Full rationale: `times.rs` module docs.
 
-- **Every time a caller leaves out goes as 0**, MS-FSCC § 2.4.7's "don't change", and `FileAttributes` as 0 too. A `FileTime` with the top bit set (-1, -2, or a forbidden value as a signed FILETIME) is refused before sending, as `Error::Io(InvalidInput)`; -1/-2 are handle-scoped switches, not dates, and Samba reads -1 as "don't change" anyway.
+- **Every time a caller leaves out goes as 0**, MS-FSCC § 2.4.7's "don't change", and unset attributes as 0 too. A `FileTime` with the top bit set (-1, -2, or a forbidden value as a signed FILETIME) is refused before sending, as `Error::Io(InvalidInput)`; -1/-2 are handle-scoped switches, not dates, and Samba reads -1 as "don't change" anyway.
 - **A server restamps a file when the handle that wrote it closes, unless that handle had its times set.** So a copy stamps the writer's own handle (`FileWriter::set_times`, which drains the WRITEs first) or sets by path after `finish`. A path stamp while the writer is open loses to its close, and a handle stamp holds through later writes (Samba's sticky write time; MS-FSA `UserSetModificationTime` on Windows). Both pinned against Samba 4.20.6 by `guest_a_writer_keeps_the_times_set_on_its_handle` and `guest_a_stamp_by_path_loses_to_an_open_writers_close`, and the writer stamp against a QNAP TS-464 by `nas_keeps_the_times_set_on_a_writers_handle` (2026-10-07).
+- **Attributes replace the file's whole settable set, never merge** (MS-FSA § 2.1.5.15.2). ❌ Never let 0 reach the wire for "none": it means "don't change", so `wire_attributes` sends empty as `NORMAL` and masks to `FileAttributes::SETTABLE` (Directory on a file is `STATUS_INVALID_PARAMETER`), which lets a consumer pass a source's reported attributes straight through. Samba 4.20.6 (defaults: `store dos attributes = yes`, `map readonly = no`) keeps Hidden and Read-only on files and directories and refuses to delete a Read-only file with `STATUS_CANNOT_DELETE` until it's cleared (`guest_a_readonly_file_refuses_deletion_until_cleared`, 2026-10-12).
 - **`set_times` opens with `FILE_WRITE_ATTRIBUTES` only, sharing everything, no create options**, so it works on directories and beside an open reader or writer.
-- **Reads hand out what their CREATE already answered** (`FileDownload::info`, `FileReader::info`, `read_file_compound*_with_info`), so a consumer never needs a `stat` beside a read for the dates. `FileDownload::info` is `None` only for `FileDownload::new` around a caller's own handle.
+- **Reads hand out what their CREATE already answered** (`FileDownload::info`, `FileReader::info`, `read_file_compound*_with_info`), so a consumer never needs a `stat` beside a read for the dates. Attributes too, and a listing's `DirectoryEntry::attributes` comes from the same `FileBothDirectoryInformation` bytes `is_directory` is read from. `FileDownload::info` is `None` only for `FileDownload::new` around a caller's own handle.
 - `SmbClient::set_times` is a mutation, so it takes `&Tree` and doesn't replay after a reconnect, like `rename`.
 
 ## Server-side copy (`copy.rs`)
