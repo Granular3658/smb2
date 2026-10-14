@@ -956,6 +956,7 @@ fn ls_json_carries_the_documented_keys() {
     assert_eq!(file["size"], 5);
     assert!(file["modified"].is_i64(), "{file:#?}");
     assert!(file["created"].is_i64(), "{file:#?}");
+    assert!(file["changed"].is_i64(), "{file:#?}");
 
     let directory = items
         .iter()
@@ -987,8 +988,15 @@ fn stat_json_carries_the_documented_keys_including_failures() {
     };
     assert_eq!(item["isDirectory"], false);
     assert_eq!(item["size"], 5);
-    for key in ["path", "modified", "created", "accessed"] {
-        assert!(item.get(key).is_some(), "{key} missing from {item:#?}");
+    assert!(item["path"].is_string(), "{item:#?}");
+    for key in ["modified", "created", "accessed", "changed"] {
+        assert!(item[key].is_i64(), "{key} missing from {item:#?}");
+    }
+
+    // The human form shows the change time beside the other three.
+    let human = ok(&["stat", &share.target("a.txt")]);
+    for label in ["created:", "modified:", "accessed:", "changed:"] {
+        assert!(human.contains(label), "{label} missing from:\n{human}");
     }
 
     // A failed path still gets a row, carrying `error` instead of the metadata,

@@ -85,6 +85,8 @@ smb2 rm //raspi/PiHDD/junk.txt
 smb2 rmdir //raspi/PiHDD/empty-dir
 ```
 
+`stat` shows four times: created, modified, accessed, and changed. `changed` moves on any change to the file, its attributes and timestamps included, so it catches an edit `modified` doesn't. `ls --json` carries `changed` too.
+
 `realpath` prints the path the way the server stores it: its casing, and long names in place of 8.3 aliases like `PROGRA~1`. It needs SMB 3.1.1 (Samba, or Windows 10 / Server v1803 and later) and says so when the server can't answer.
 
 `mv` won't replace a file that's already at the destination unless you pass `--replace`. With it, the server swaps the file in one step, so the destination is never missing in between. It never replaces a directory.

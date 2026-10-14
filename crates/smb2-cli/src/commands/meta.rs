@@ -55,6 +55,7 @@ pub async fn ls(
                     "size": entry.size,
                     "modified": output::unix_seconds(entry.modified),
                     "created": output::unix_seconds(entry.created),
+                    "changed": output::unix_seconds(entry.changed),
                 })
             })
             .collect();
@@ -103,6 +104,7 @@ pub async fn stat(
                         "modified": output::unix_seconds(info.modified),
                         "created": output::unix_seconds(info.created),
                         "accessed": output::unix_seconds(info.accessed),
+                        "changed": output::unix_seconds(info.changed),
                     }));
                 } else {
                     println!("{path}");
@@ -118,6 +120,7 @@ pub async fn stat(
                     println!("  created:  {}", output::timestamp(info.created));
                     println!("  modified: {}", output::timestamp(info.modified));
                     println!("  accessed: {}", output::timestamp(info.accessed));
+                    println!("  changed:  {}", output::timestamp(info.changed));
                 }
             }
             other => {
