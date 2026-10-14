@@ -87,6 +87,7 @@ The authenticator retains raw bytes of NEGOTIATE and CHALLENGE messages for this
 ## Key decisions
 
 - **`getrandom` for random values**: Client challenge, random session key, nonces, and confounders use `getrandom` (OS CSPRNG).
+- **Secrets never reach `Debug`**: `KerberosCredentials`, `EncryptionKey` (which covers every Kerberos message carrying a key), and `CcacheCredential` implement it by hand, printing `crypto::Redacted` (`***`) for the password or key. `NtlmCredentials` and the authenticators don't implement `Debug` at all. ❌ Don't `derive(Debug)` on any of them.
 - **`test_random_session_key` override**: Tests can inject a deterministic session key for reproducibility. Never used in production.
 - **Subkey in AP-REQ Authenticator**: The Kerberos authenticator includes a random subkey, which becomes the SMB session key. This provides forward secrecy.
 - **No full `authenticate()` unit tests**: The full flow requires a real KDC. Unit tests cover individual steps (encrypt/decrypt roundtrip, message encoding, etype parsing). Integration tests with Docker are planned.

@@ -85,7 +85,9 @@ const PA_PAC_REQUEST: i32 = 128;
 // ---------------------------------------------------------------------------
 
 /// Credentials for Kerberos authentication.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows the password as `***`.
+#[derive(Clone)]
 pub struct KerberosCredentials {
     /// Username (without realm).
     pub username: String,
@@ -95,6 +97,17 @@ pub struct KerberosCredentials {
     pub realm: String,
     /// KDC address (host:port or host, port defaults to 88).
     pub kdc_address: String,
+}
+
+impl std::fmt::Debug for KerberosCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KerberosCredentials")
+            .field("username", &self.username)
+            .field("password", &crate::crypto::Redacted)
+            .field("realm", &self.realm)
+            .field("kdc_address", &self.kdc_address)
+            .finish()
+    }
 }
 
 /// Stateful Kerberos authenticator.
@@ -1574,5 +1587,19 @@ mod tests {
 
         let key = auth.derive_user_key();
         assert_eq!(key.len(), 16, "RC4 key (NT hash) should be 16 bytes");
+    }
+
+    #[test]
+    fn kerberos_credentials_debug_output_hides_the_password() {
+        let creds = KerberosCredentials {
+            username: "smbtest".to_string(),
+            password: "hunter2-secret".to_string(),
+            realm: "TEST.LOCAL".to_string(),
+            kdc_address: "10.0.0.1".to_string(),
+        };
+        let printed = format!("{creds:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("password: ***"), "{printed}");
+        assert!(printed.contains("TEST.LOCAL"), "{printed}");
     }
 }

@@ -5,15 +5,25 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-/// Credentials for one SMB connection.
-#[derive(Debug, Clone)]
+/// Credentials for one SMB connection. `Debug` shows the password as `***`.
+#[derive(Clone)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
 }
 
-/// The credential-related flags, shared by every command.
-#[derive(Debug, Clone, clap::Args)]
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &format_args!("***"))
+            .finish()
+    }
+}
+
+/// The credential-related flags, shared by every command. `Debug` shows the
+/// password as `***`.
+#[derive(Clone, clap::Args)]
 pub struct AuthArgs {
     /// Username to log in with.
     #[arg(short = 'u', long, env = "SMB2_USER", global = true)]
@@ -31,6 +41,20 @@ pub struct AuthArgs {
     /// Connect as guest (no username or password).
     #[arg(long, global = true, conflicts_with_all = ["user", "password", "password_command"])]
     pub guest: bool,
+}
+
+impl std::fmt::Debug for AuthArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthArgs")
+            .field("user", &self.user)
+            .field(
+                "password",
+                &self.password.as_ref().map(|_| format_args!("***")),
+            )
+            .field("password_command", &self.password_command)
+            .field("guest", &self.guest)
+            .finish()
+    }
 }
 
 impl AuthArgs {
@@ -82,5 +106,29 @@ impl AuthArgs {
         }
 
         bail!("no password: pass --password-command, set SMB2_PASS, or run on a terminal")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn debug_output_hides_the_password() {
+        let creds = Credentials {
+            username: "david".to_string(),
+            password: "hunter2-secret".to_string(),
+        };
+        let args = AuthArgs {
+            user: Some("david".to_string()),
+            password: Some("hunter2-secret".to_string()),
+            password_command: None,
+            guest: false,
+        };
+        for printed in [format!("{creds:?}"), format!("{args:?}")] {
+            assert!(!printed.contains("hunter2"), "{printed}");
+            assert!(printed.contains("***"), "{printed}");
+            assert!(printed.contains("david"), "{printed}");
+        }
     }
 }

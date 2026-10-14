@@ -53,7 +53,9 @@ pub fn sp800_108_kdf(key: &[u8], label: &[u8], context: &[u8], key_length_bits: 
 }
 
 /// Derived session keys for signing, encryption, and decryption.
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows the keys as `***`.
+#[derive(Clone)]
 pub struct DerivedKeys {
     /// Key used to sign outgoing messages.
     pub signing_key: Vec<u8>,
@@ -61,6 +63,17 @@ pub struct DerivedKeys {
     pub encryption_key: Vec<u8>,
     /// Key used to decrypt incoming messages.
     pub decryption_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for DerivedKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::crypto::Redacted;
+        f.debug_struct("DerivedKeys")
+            .field("signing_key", &Redacted)
+            .field("encryption_key", &Redacted)
+            .field("decryption_key", &Redacted)
+            .finish()
+    }
 }
 
 /// Derive session keys for the given dialect.
@@ -521,5 +534,17 @@ mod tests {
         assert_ne!(keys.signing_key, keys.encryption_key);
         assert_ne!(keys.signing_key, keys.decryption_key);
         assert_ne!(keys.encryption_key, keys.decryption_key);
+    }
+
+    #[test]
+    fn derived_keys_debug_output_hides_the_keys() {
+        let keys = DerivedKeys {
+            signing_key: vec![0xAB; 16],
+            encryption_key: vec![0xAB; 16],
+            decryption_key: vec![0xAB; 16],
+        };
+        let printed = format!("{keys:?}");
+        assert!(!printed.contains("171"), "{printed}");
+        assert!(printed.contains("signing_key: ***"), "{printed}");
     }
 }

@@ -80,7 +80,9 @@ use crate::Error;
 use connections::{ConnectionEntry, Connections};
 
 /// Configuration for an SMB client connection.
-#[derive(Debug, Clone)]
+///
+/// `Debug` prints every field except the password, which shows as `***`.
+#[derive(Clone)]
 pub struct ClientConfig {
     /// Server address (host:port).
     pub addr: String,
@@ -169,6 +171,38 @@ pub struct ClientConfig {
     ///
     /// Default: 30 s, sized for a NAS waking a spun-down disk.
     pub response_timeout: Option<Duration>,
+}
+
+impl std::fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured, so a new field can't be left out of the output.
+        let Self {
+            addr,
+            timeout,
+            username,
+            password: _,
+            domain,
+            auto_reconnect,
+            compression,
+            dfs_enabled,
+            dfs_target_overrides,
+            connect_options,
+            response_timeout,
+        } = self;
+        f.debug_struct("ClientConfig")
+            .field("addr", addr)
+            .field("timeout", timeout)
+            .field("username", username)
+            .field("password", &crate::crypto::Redacted)
+            .field("domain", domain)
+            .field("auto_reconnect", auto_reconnect)
+            .field("compression", compression)
+            .field("dfs_enabled", dfs_enabled)
+            .field("dfs_target_overrides", dfs_target_overrides)
+            .field("connect_options", connect_options)
+            .field("response_timeout", response_timeout)
+            .finish()
+    }
 }
 
 impl ClientConfig {
@@ -4053,6 +4087,26 @@ mod tests {
                 Err(Error::Timeout) | Err(Error::ServerUnresponsive { .. })
             ),
             "expected a timeout, got {result:?}"
+        );
+    }
+
+    /// `{:?}` on a config is what a consumer logs first when a connect fails,
+    /// so the password can't be in it. Everything else is.
+    #[test]
+    fn a_configs_debug_output_hides_the_password() {
+        let config = ClientConfig {
+            addr: "nas.local:445".to_string(),
+            username: "david".to_string(),
+            password: "hunter2-secret".to_string(),
+            ..Default::default()
+        };
+        let printed = format!("{config:?}");
+        assert!(!printed.contains("hunter2"), "{printed}");
+        assert!(printed.contains("password: ***"), "{printed}");
+        assert!(printed.contains("nas.local:445") && printed.contains("david"));
+        assert!(
+            printed.contains("response_timeout"),
+            "every other field stays"
         );
     }
 }

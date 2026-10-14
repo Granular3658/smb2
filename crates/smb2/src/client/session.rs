@@ -21,7 +21,8 @@ use crate::Error;
 use crate::msg::session_setup::SessionSetupRequestFlags;
 
 /// An authenticated SMB2 session with derived keys.
-#[derive(Debug)]
+///
+/// `Debug` shows the keys as `***`.
 pub struct Session {
     /// The session ID assigned by the server.
     pub session_id: SessionId,
@@ -37,6 +38,31 @@ pub struct Session {
     pub should_sign: bool,
     /// Whether outgoing messages should be encrypted.
     pub should_encrypt: bool,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::crypto::Redacted;
+        // Destructured, so a new field can't be left out of the output.
+        let Self {
+            session_id,
+            signing_key: _,
+            encryption_key,
+            decryption_key,
+            signing_algorithm,
+            should_sign,
+            should_encrypt,
+        } = self;
+        f.debug_struct("Session")
+            .field("session_id", session_id)
+            .field("signing_key", &Redacted)
+            .field("encryption_key", &encryption_key.as_ref().map(|_| Redacted))
+            .field("decryption_key", &decryption_key.as_ref().map(|_| Redacted))
+            .field("signing_algorithm", signing_algorithm)
+            .field("should_sign", should_sign)
+            .field("should_encrypt", should_encrypt)
+            .finish()
+    }
 }
 
 impl Session {
@@ -1337,5 +1363,23 @@ mod tests {
         .await
         .unwrap();
         assert!(session.should_sign);
+    }
+
+    #[test]
+    fn a_sessions_debug_output_hides_its_keys() {
+        let session = Session {
+            session_id: SessionId(7),
+            signing_key: vec![0xAB; 16],
+            encryption_key: Some(vec![0xAB; 16]),
+            decryption_key: None,
+            signing_algorithm: SigningAlgorithm::AesCmac,
+            should_sign: true,
+            should_encrypt: true,
+        };
+        let printed = format!("{session:?}");
+        assert!(!printed.contains("171"), "{printed}");
+        assert!(printed.contains("encryption_key: Some(***)"), "{printed}");
+        assert!(printed.contains("decryption_key: None"), "{printed}");
+        assert!(printed.contains("should_encrypt: true"), "{printed}");
     }
 }

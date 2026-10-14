@@ -526,7 +526,10 @@ RUST_LOG=smb2=debug cargo test -p smb2 --test integration -- --ignored
 ```
 
 **Security rule:** Never log passwords, session keys, signing keys, or full signatures. At most log key lengths and the
-first four bytes of signatures for correlation.
+first four bytes of signatures for correlation. A consumer's `{:?}` counts as logging: every struct holding a password or
+key (`ClientConfig`, `Session`, `DerivedKeys`, `KerberosCredentials`, `EncryptionKey`, `CcacheCredential`, the CLI's
+`Credentials` / `AuthArgs`) implements `Debug` by hand and prints `crypto::Redacted` (`***`) in its place. ❌ Don't
+`derive(Debug)` on one. Memory isn't zeroized; redaction is the chosen line.
 
 **Backend note:** `log` is a facade. This crate does NOT depend on any specific backend. Applications using smb2 pick
 their own (for example, `env_logger`). The `env_logger` dev-dependency is only used in integration tests.

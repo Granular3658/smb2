@@ -38,7 +38,9 @@ pub struct CcachePrincipal {
 }
 
 /// A single cached credential (ticket + metadata).
-#[derive(Debug, Clone)]
+///
+/// `Debug` shows the session key as `***`.
+#[derive(Clone)]
 pub struct CcacheCredential {
     /// Client principal.
     pub client: CcachePrincipal,
@@ -58,6 +60,22 @@ pub struct CcacheCredential {
     pub renew_till: u32,
     /// Raw ticket bytes (DER-encoded Kerberos Ticket).
     pub ticket: Vec<u8>,
+}
+
+impl std::fmt::Debug for CcacheCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CcacheCredential")
+            .field("client", &self.client)
+            .field("server", &self.server)
+            .field("key_etype", &self.key_etype)
+            .field("key_data", &crate::crypto::Redacted)
+            .field("authtime", &self.authtime)
+            .field("starttime", &self.starttime)
+            .field("endtime", &self.endtime)
+            .field("renew_till", &self.renew_till)
+            .field("ticket", &self.ticket)
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -443,5 +461,29 @@ mod tests {
         assert_eq!(ccache.credentials.len(), 0);
         assert_eq!(ccache.default_principal.realm, "R");
         assert_eq!(ccache.default_principal.components, vec!["u"]);
+    }
+
+    #[test]
+    fn a_cached_credentials_debug_output_hides_its_session_key() {
+        let principal = CcachePrincipal {
+            name_type: 1,
+            realm: "TEST.LOCAL".to_string(),
+            components: vec!["smbtest".to_string()],
+        };
+        let credential = CcacheCredential {
+            client: principal.clone(),
+            server: principal,
+            key_etype: 18,
+            key_data: vec![0xAB; 32],
+            authtime: 0,
+            starttime: 0,
+            endtime: 0,
+            renew_till: 0,
+            ticket: vec![1, 2, 3],
+        };
+        let printed = format!("{credential:?}");
+        assert!(!printed.contains("171"), "{printed}");
+        assert!(printed.contains("key_data: ***"), "{printed}");
+        assert!(printed.contains("key_etype: 18"), "{printed}");
     }
 }

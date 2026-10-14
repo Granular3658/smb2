@@ -107,12 +107,23 @@ pub struct EncKdcRepPart {
 }
 
 /// Encryption key (keytype + key value).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Debug` shows the key value as `***`.
+#[derive(Clone, PartialEq, Eq)]
 pub struct EncryptionKey {
     /// Key type (etype number).
     pub keytype: i32,
     /// Key value bytes.
     pub keyvalue: Vec<u8>,
+}
+
+impl std::fmt::Debug for EncryptionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionKey")
+            .field("keytype", &self.keytype)
+            .field("keyvalue", &crate::crypto::Redacted)
+            .finish()
+    }
 }
 
 /// Parsed AP-REP (`APPLICATION [15]`).
@@ -1627,5 +1638,18 @@ mod tests {
 
         // Wrap in APPLICATION [25] (EncASRepPart)
         der_application(25, &seq)
+    }
+
+    /// Covers every message carrying a key (`EncKdcRepPart`, `EncApRepPart`),
+    /// since they hold it as an `EncryptionKey`.
+    #[test]
+    fn an_encryption_keys_debug_output_hides_the_key() {
+        let key = EncryptionKey {
+            keytype: 18,
+            keyvalue: vec![0xAB; 32],
+        };
+        let printed = format!("{key:?}");
+        assert!(!printed.contains("171"), "{printed}");
+        assert!(printed.contains("keytype: 18"), "{printed}");
     }
 }
