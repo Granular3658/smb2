@@ -4404,6 +4404,60 @@ async fn guest_file_writer_basic() {
 
 #[tokio::test]
 #[ignore]
+async fn guest_a_writer_checkpoint_names_the_file_it_flushed() {
+    // A write handle carries no FILE_READ_ATTRIBUTES, and the identity rides
+    // on its CREATE, so this is what proves Samba answers both identity
+    // classes on a handle like that.
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    let path = "smb2_test_writer_checkpoint.bin";
+
+    let mut writer = client
+        .create_file_writer(&tree, path)
+        .await
+        .expect("create_file_writer failed");
+    writer.write_chunk(b"durable-").await.unwrap();
+    let first = writer.flush_checkpoint().await.expect("checkpoint failed");
+    writer.write_chunk(b"prefix").await.unwrap();
+    let second = writer.flush_checkpoint().await.expect("checkpoint failed");
+    assert_eq!(writer.finish().await.unwrap(), 14);
+
+    assert_eq!((first.offset, second.offset), (8, 14));
+    let identity = first
+        .identity
+        .expect("Samba identifies a file on a write handle");
+    assert_eq!(second.identity, Some(identity));
+    let resolved = client
+        .resolve(&mut tree, path)
+        .await
+        .expect("resolve failed");
+    assert_eq!(
+        resolved.identity,
+        Some(identity),
+        "the writer's identity is the one any other open sees"
+    );
+    assert_eq!(
+        client.read_file(&mut tree, path).await.unwrap(),
+        b"durable-prefix"
+    );
+
+    client
+        .delete_file(&tree, path)
+        .await
+        .expect("cleanup failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
 async fn guest_compound_write_exclusive_never_replaces_an_existing_file() {
     // The one-frame write for a name that must be NEW: a file someone else put
     // there is refused with `ErrorKind::AlreadyExists` and survives byte for

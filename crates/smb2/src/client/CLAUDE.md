@@ -20,6 +20,7 @@ Entry point for most users. `SmbClient` wraps `Connection` + `Session` and provi
 | `write_pipe.rs` | `WritePipe`, the one engine every pipelined upload runs on: window, write budget, dispatch, confirmations, the upload rate hint |
 | `download_tests.rs` | `FileDownload` against the mock: order, short reads, EOF, errors, window bounds, cancel safety, answers out of order, adaptive timing on tokio's paused clock |
 | `upload_tests.rs` | Uploads against the mock: chunk size, the cold window, adaptive timing, fixed windows, the upload rate hint and `quick_write_limit`, every write path pacing alike, `write_chunk` cancel safety |
+| `resume_tests.rs` | Checkpoints against the mock: the offset moves only after a FLUSH, a dropped checkpoint loses nothing, a short WRITE is an error, and the writer open asks for the identity |
 | `stale_handle_tests.rs` | Every handle type opened before a reconnect, against a new session that would answer its stale ids: nothing reaches it, and close/abort send nothing |
 | `socket_lifecycle_tests.rs` | When the socket closes, over real loopback sockets: last clone dropped, server hang-up, `mark_dead` |
 | `smol_runtime_tests.rs` | The same connection on smol with no tokio runtime (`--features smol`): a NEGOTIATE + ECHO round trip against a `std::net` fake server, the response deadline, and the socket-lifetime cases. Every spawn, timer, and socket here goes through `crate::rt`; see `src/rt/CLAUDE.md` |
@@ -199,7 +200,7 @@ Table, rationale, and the empirical evidence: `src/name.rs` module docs. What ma
 - **Stat compound**: CREATE + QUERY_INFO (basic) + QUERY_INFO (standard) + CLOSE (4 ops, 1 round-trip). Default for `stat`.
 - **Fs-info compound**: CREATE + QUERY_INFO (FileFsFullSizeInformation) + CLOSE (3 ops, 1 round-trip). Default for `fs_info`.
 - **Resolve compound**: CREATE + QUERY_INFO ×6 (basic, standard, class 18, index, volume, class 48) + CLOSE (8 ops, 1 round-trip). Default for `resolve`. The order is load-bearing; see § Resolving names.
-- **Named open**: CREATE + QUERY_INFO (class 18, readers only) + QUERY_INFO (class 48), no CLOSE. Every `FileReader` and `FileWriter` open.
+- **Named open**: CREATE + QUERY_INFO (class 18 for a reader; index and volume for a writer) + QUERY_INFO (class 48), no CLOSE. Every `FileReader` and `FileWriter` open (`resolve.rs` `open_and_name`, `OpenFor`). Class 48 stays last for the same cascade reason as in `resolve`.
 - **A compound CLOSE that didn't succeed gets a standalone CLOSE** in `resolve`, whatever failed ahead of it: MS-SMB2 § 3.3.5.2.7.2 lets a server fail every related op after a failed one with the same status, so an optional query failing takes the CLOSE with it.
 - If CREATE succeeds but a later op fails, the client issues a standalone CLOSE to avoid leaking the handle.
 
@@ -453,7 +454,8 @@ Every pipelined upload (`FileWriter`, `FileUpload`, `Tree::write_file_pipelined`
 - **What a confirmation measures**: the server having every byte, plus its disk and half a round trip. The gap between two confirmations is the uplink's time for the second WRITE when it was queued behind the first, the same full-pipe test as for READs, and each is timed by arrival (`Landed.arrived_at`, from the guard), so a producer that polls its answers late doesn't skew it. It reads low (answers share the downlink; a slow disk holds them), never high. The rate is shared on the connection apart from the download one (`note_write_rate`, `upload_rate_hint`, same 30 s TTL, cleared on revival), because most links are asymmetric.
 - **`Connection::quick_write_limit`** is the one-frame cut-off: `max(512 KiB, upload rate × QUICK_FRAME_BUDGET)` (250 ms, not the learned headroom), capped at `compound_write_limit()` (which wins over the floor, and can be 0). It never exceeds `compound_write_limit`, so a consumer that promised one frame by it can still send that frame after the limit moved.
 - **`FileWriter::write_chunk` is cancel-safe**: pushed bytes leave `pending_data` only once their WRITE is dispatched. A WRITE caught mid-send can go out twice, same bytes, same offset. Pinned by `dropping_write_chunk_while_it_waits_for_room_loses_nothing`.
-- **Errors**: the pipe drains what's in flight (`abandon`) before handing an error back; the owner closes the handle only on a WRITE the server refused (`Error::Protocol { command: Write }`), since any other error may be the connection itself.
+- **Errors**: the pipe drains what's in flight (`abandon`) before handing an error back; the owner closes the handle only on a WRITE the server refused (`Error::Protocol { command: Write }`) or answered short (`Error::InvalidData`), since any other error may be the connection itself.
+- **A short WRITE is an error, never a partial confirmation** (`WritePipe::land`). The WRITEs after it don't know about the hole, so counting the part that landed would let a checkpoint vouch for bytes that were never written. `Count` is how many bytes the server wrote (MS-SMB2 § 2.2.22, § 3.2.5.12), and nothing says it has to be all of them.
 - `WriteBehind::Fixed(n)` plus `with_chunk_size(MaxWriteSize)` is the escape hatch to the old shape; only `FileWriter` takes the knobs.
 
 For full control, `Tree::open_file` (returns `(FileId, u64)`) plus `FileDownload::new` let callers build custom chunk
@@ -461,11 +463,23 @@ loops with non-default `chunk_size`. Most users shouldn't need this — `read_fi
 when the size is already known) handles small files and `Tree::download` / `SmbClient::download` handle the streaming
 case.
 
+`FileWriter::flush_checkpoint` is the one non-terminal flush: send, drain, FLUSH, keep the handle (§ Resuming an upload).
+
 FileWriter has two terminal operations:
 - `finish()` — send all buffered data, drain in-flight WRITEs, FLUSH (fsync on the server), CLOSE. Use on normal completion.
 - `abort()` — discard unsent data, drain in-flight WRITEs to keep credits/message-ids in sync, skip FLUSH, best-effort CLOSE. Use on cancellation or error paths where the partial remote file is going to be deleted anyway — `abort()` saves the fsync round-trip. The caller is responsible for deleting the partial remote file.
 
 Both consume `self` so write-after-close/abort is a compile error. `Drop` logs a debug warning if neither was called (handle leaks).
+
+## Resuming an upload
+
+`FileWriter::flush_checkpoint` sends what's buffered, drains the pipe, sends a standalone FLUSH, and returns a `WriteCheckpoint { offset, identity }` without closing. A caller persists it and resumes from it after a crash or a reconnect. Pinned by `resume_tests.rs` and the Docker `guest_a_writer_checkpoint_names_the_file_it_flushed`.
+
+- **The offset is `WritePipe::offset` after a drain, and it's set only after the FLUSH succeeded.** With short WRITEs refused (§ Uploads), a drained pipe means every byte before it was confirmed. ❌ Don't report `confirmed()` instead: it's this writer's count, and a writer opened at an offset starts past zero.
+- **Cancel-safe by construction**: `send_pending`, `drain`, and the FLUSH are each safe to drop, and `durable_offset` is written with no await after the FLUSH. A dropped FLUSH proves nothing, so the next call sends its own.
+- **The FLUSH is standalone**, so Windows' async-must-end-the-compound rule (pitfall 33) can't apply.
+- **The identity comes from the writer's own CREATE** (`OpenFor::Writing`: class 6 + `FileFsVolumeInformation`, the same pair `durable.rs` uses, and for the same Samba reasons), so it costs no round trip and names the file this handle writes. Neither class needs an access right, so the write handle's missing `FILE_READ_ATTRIBUTES` doesn't matter: Samba 4.20.6 answers both on it (2026-10-14). ❌ Don't ask at checkpoint time instead: compounded with the FLUSH, the FLUSH has to go last (Windows), and a refused query ahead of it can take the FLUSH down with it on a server that cascades failures.
+- **`FileIdentity::is_proof`: both halves non-zero, or the writer has no identity.** Stricter than a durable reclaim, which tolerates a missing volume serial because its `CreateGuid` is a second proof; a resume has only this one, and a share can span mount points whose inode numbers overlap. A checkpoint without an identity still says how far the file is durable; it just can't be resumed.
 
 ## Session setup flow
 

@@ -5050,10 +5050,9 @@ mod tests {
             persistent: 0xAA,
             volatile: 0xBB,
         };
-        mock.queue_response(build_compound_response_frame(&[
-            build_create_response(file_id, 0),
-            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-        ]));
+        mock.queue_response(crate::client::test_helpers::build_writer_open_response(
+            file_id, 0, None, None,
+        ));
         mock.queue_response(build_close_response());
 
         let conn = setup_connection(&mock);
@@ -5093,6 +5092,8 @@ mod tests {
         // time `FileCreate` hits an existing file.
         mock.queue_response(build_compound_response_frame(&[
             build_create_error_response(NtStatus::OBJECT_NAME_COLLISION),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_COLLISION),
+            build_query_info_error_response(NtStatus::OBJECT_NAME_COLLISION),
             build_query_info_error_response(NtStatus::OBJECT_NAME_COLLISION),
         ]));
 

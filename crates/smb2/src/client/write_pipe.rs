@@ -121,6 +121,12 @@ impl WritePipe {
         self.conn.fundable_chunk(self.chunk_size)
     }
 
+    /// Where the next WRITE lands. Once the pipe is drained, every byte
+    /// before it has been confirmed.
+    pub(crate) fn offset(&self) -> u64 {
+        self.offset
+    }
+
     pub(crate) fn confirmed(&self) -> u64 {
         self.confirmed
     }
@@ -305,6 +311,16 @@ impl WritePipe {
             });
         }
         let resp = WriteResponse::unpack(&mut ReadCursor::new(&frame.body))?;
+        // A server that wrote less than it was sent leaves a hole the WRITEs
+        // after it don't know about, so nothing past here is the file the
+        // caller pushed. ❌ Don't count the part that landed: a checkpoint
+        // built on it would vouch for bytes that were never written.
+        if resp.count < landed.len {
+            return Err(Error::invalid_data(format!(
+                "the server wrote {} of the {} bytes a WRITE sent",
+                resp.count, landed.len
+            )));
+        }
         self.confirmed += u64::from(resp.count);
 
         // Each confirmation is handled as it lands, so what's in flight is

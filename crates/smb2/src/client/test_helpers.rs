@@ -285,6 +285,22 @@ pub(crate) fn build_flush_response() -> Vec<u8> {
     pack_message(&h, &body)
 }
 
+/// Build a FLUSH response with a non-success status (for error tests).
+pub(crate) fn build_flush_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
+    use crate::msg::header::ErrorResponse;
+    let mut h = Header::new_request(Command::Flush);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+
+    let body = ErrorResponse {
+        error_context_count: 0,
+        error_data: vec![],
+    };
+
+    pack_message(&h, &body)
+}
+
 /// Build a READ response carrying the given data bytes.
 pub(crate) fn build_read_response(data: Vec<u8>) -> Vec<u8> {
     use crate::msg::read::ReadResponse;
@@ -500,6 +516,39 @@ pub(crate) fn file_name_information(name: &str) -> Vec<u8> {
     let mut out = (utf16.len() as u32).to_le_bytes().to_vec();
     out.extend_from_slice(&utf16);
     out
+}
+
+/// What every `FileWriter` open gets back: the CREATE, then the two identity
+/// queries (answered when `identity` is `Some`, refused otherwise), then class
+/// 48 (answered with `name` when given, refused otherwise).
+pub(crate) fn build_writer_open_response(
+    file_id: FileId,
+    end_of_file: u64,
+    identity: Option<crate::client::durable::FileIdentity>,
+    name: Option<&str>,
+) -> Vec<u8> {
+    use crate::types::status::NtStatus;
+    let refused = || build_query_info_error_response(NtStatus::NOT_SUPPORTED);
+    let (index, volume) = match identity {
+        Some(id) => {
+            let mut volume = vec![0u8; 8];
+            volume.extend_from_slice(&id.volume_serial.to_le_bytes());
+            volume.extend_from_slice(&[0u8; 6]);
+            (
+                build_query_info_response(id.index_number.to_le_bytes().to_vec()),
+                build_query_info_response(volume),
+            )
+        }
+        None => (refused(), refused()),
+    };
+    build_compound_response_frame(&[
+        build_create_response(file_id, end_of_file),
+        index,
+        volume,
+        name.map_or_else(refused, |n| {
+            build_query_info_response(file_name_information(n))
+        }),
+    ])
 }
 
 /// `FILE_ALL_INFORMATION` (MS-FSCC § 2.4.2) with every fixed field zeroed and

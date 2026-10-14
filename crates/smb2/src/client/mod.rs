@@ -20,6 +20,8 @@ mod fault_injection_tests;
 pub mod pipeline;
 pub mod read_ahead;
 pub mod resolve;
+#[cfg(test)]
+mod resume_tests;
 pub mod session;
 pub mod shares;
 #[cfg(all(test, feature = "smol"))]
@@ -56,7 +58,7 @@ pub use pipeline::{Op, OpResult, Pipeline};
 pub use resolve::Resolved;
 pub use session::Session;
 pub use shares::list_shares;
-pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
+pub use stream::{FileDownload, FileUpload, FileWriter, Progress, WriteCheckpoint};
 pub use times::FileTimes;
 pub use tree::{
     DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions, Tree,
@@ -2723,10 +2725,10 @@ mod tests {
                 LinkCall::UploadSmall => 4,
                 // CREATE + QUERY_INFO (class 18) + QUERY_INFO (class 48).
                 LinkCall::OpenFileReader => 3,
-                // CREATE + QUERY_INFO (class 48).
+                // CREATE + QUERY_INFO (index, volume, class 48).
                 LinkCall::CreateFileWriter
                 | LinkCall::CreateFileWriterExclusive
-                | LinkCall::CreateFileWriterAt => 2,
+                | LinkCall::CreateFileWriterAt => 4,
                 _ => 1,
             }
         }

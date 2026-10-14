@@ -52,12 +52,10 @@ fn reader_opened(end_of_file: u64) -> Vec<u8> {
     ])
 }
 
-/// What a writer's open gets back: CREATE, then a refused class 48 query.
+/// What a writer's open gets back: CREATE, then refused identity and class
+/// 48 queries.
 fn writer_opened() -> Vec<u8> {
-    build_compound_response_frame(&[
-        build_create_response(FILE, 0),
-        build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-    ])
+    crate::client::test_helpers::build_writer_open_response(FILE, 0, None, None)
 }
 
 /// Revives into a fresh mock that answers whatever it was told to, as a new

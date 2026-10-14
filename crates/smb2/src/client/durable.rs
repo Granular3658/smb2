@@ -143,6 +143,21 @@ impl FileIdentity {
         }
     }
 
+    /// Whether both halves were answered, which is what a resume across
+    /// sessions needs before it may call two files the same one (see
+    /// [`WriteCheckpoint`](crate::client::stream::WriteCheckpoint)). A `0` in
+    /// either half is a server that answered without saying: `from_frames`
+    /// reports an unanswered volume query as `0`, and an index number of `0`
+    /// is no file in particular.
+    ///
+    /// Stricter than a durable reclaim, which accepts a missing volume serial
+    /// because its `CreateGuid` is a second proof that the server matched our
+    /// own open. A resume has nothing else, and a share can span mount
+    /// points whose inode numbers overlap.
+    pub(crate) fn is_proof(&self) -> bool {
+        self.volume_serial != 0 && self.index_number != 0
+    }
+
     fn payload(frame: &Frame) -> Option<Vec<u8>> {
         if frame.header.status != NtStatus::SUCCESS {
             return None;

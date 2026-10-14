@@ -19,8 +19,10 @@ use log::{debug, trace};
 
 use crate::client::connection::{Connection, Frame, WaiterGuard};
 use crate::client::credits;
+use crate::client::durable::FileIdentity;
 use crate::client::read_ahead::{Dispatch, Outstanding, Window};
 pub use crate::client::read_ahead::{ReadAhead, DOWNLOAD_CHUNK_SIZE};
+use crate::client::resolve::OpenFor;
 use crate::client::times::FileTimes;
 use crate::client::tree::{close_outcome, file_info_from_create, FileInfo, Tree};
 pub use crate::client::write_behind::{WriteBehind, UPLOAD_CHUNK_SIZE};
@@ -735,19 +737,24 @@ pub async fn open_file_reader(tree: Arc<Tree>, conn: Connection, path: &str) -> 
     trace!("stream: open_file_reader path={}", path);
 
     let mut conn = tree.pinned_conn(&conn).pinned_to_session();
-    let (created, resolved_path) = tree
-        .open_and_name(&mut conn, path, &tree.read_open_request(path), true)
+    let opened = tree
+        .open_and_name(
+            &mut conn,
+            path,
+            &tree.read_open_request(path),
+            OpenFor::Reading,
+        )
         .await?;
     let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
     let mut reader = FileReader::new(
         tree,
         conn,
-        created.file_id,
-        file_info_from_create(&created),
+        opened.created.file_id,
+        file_info_from_create(&opened.created),
         max_read,
     );
-    reader.resolved_path = resolved_path;
+    reader.resolved_path = opened.name;
     Ok(reader)
 }
 
@@ -1061,7 +1068,8 @@ impl<'a> FileUpload<'a> {
     }
 
     /// The upload can't go on: close the handle without a flush
-    /// (best-effort) and hand the error back.
+    /// (best-effort) and hand the error back. Only when the server refused a
+    /// WRITE or answered one short; any other error may be the connection.
     async fn failed(&mut self, e: Error) -> Error {
         self.done = true;
         if matches!(
@@ -1069,7 +1077,7 @@ impl<'a> FileUpload<'a> {
             Error::Protocol {
                 command: Command::Write,
                 ..
-            }
+            } | Error::InvalidData { .. }
         ) {
             let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
         }
@@ -1153,6 +1161,43 @@ pub struct FileWriter {
     done: bool,
     /// What the server called the file at open, if it said.
     resolved_path: Option<String>,
+    /// Which file the handle writes, if the server said in full.
+    identity: Option<FileIdentity>,
+    /// How far the file is known to be on disk: set only by a FLUSH that
+    /// succeeded after every WRITE before it was confirmed.
+    durable_offset: Option<u64>,
+}
+
+/// How far an upload is known to be on the server's disk, and which file it
+/// went into: what an interrupted upload resumes from.
+///
+/// [`FileWriter::flush_checkpoint`] makes one. Persist both fields beside
+/// whatever tracks the source (the offset says how far into it to restart),
+/// and hand them back to
+/// `SmbClient::resume_file_writer`
+/// after a crash or a reconnect. A checkpoint is plain data and safe to keep
+/// for as long as you like: the resume proves the file is still the one it
+/// names before writing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct WriteCheckpoint {
+    /// Every byte before this offset reached the file and was flushed (SMB2
+    /// FLUSH, the server's fsync). An absolute position in the file, so a
+    /// writer opened at an offset counts what was there before it too.
+    pub offset: u64,
+    /// Which file the bytes went into. `None` when the server wouldn't say
+    /// (it refused the identity queries, or answered `0` for either half),
+    /// and then the checkpoint can't be resumed: nothing could prove a
+    /// reopened file is the same one.
+    pub identity: Option<FileIdentity>,
+}
+
+impl WriteCheckpoint {
+    /// A checkpoint read back from wherever the caller persisted one.
+    #[must_use]
+    pub fn new(offset: u64, identity: Option<FileIdentity>) -> Self {
+        Self { offset, identity }
+    }
 }
 
 /// Open (or create) a file for writing and return a streaming [`FileWriter`]
@@ -1173,13 +1218,7 @@ pub struct FileWriter {
 pub async fn open_file_writer(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileWriter> {
     trace!("stream: open_file_writer path={}", path);
 
-    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
-    let (file_id, resolved_path) =
-        open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOverwriteIf).await?;
-    let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-
-    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
-    writer.resolved_path = resolved_path;
+    let (writer, _) = open_writer(tree, conn, path, CreateDisposition::FileOverwriteIf).await?;
     Ok(writer)
 }
 
@@ -1197,13 +1236,7 @@ pub async fn open_file_writer_exclusive(
 ) -> Result<FileWriter> {
     trace!("stream: open_file_writer_exclusive path={}", path);
 
-    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
-    let (file_id, resolved_path) =
-        open_for_writer(&tree, &mut conn, path, CreateDisposition::FileCreate).await?;
-    let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-
-    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
-    writer.resolved_path = resolved_path;
+    let (writer, _) = open_writer(tree, conn, path, CreateDisposition::FileCreate).await?;
     Ok(writer)
 }
 
@@ -1244,34 +1277,35 @@ pub async fn open_file_writer_at(
         offset
     );
 
-    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
-    let (file_id, resolved_path) =
-        open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOpenIf).await?;
-    let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-
-    let mut writer = FileWriter::new(tree, conn, file_id, max_write);
+    let (mut writer, _) = open_writer(tree, conn, path, CreateDisposition::FileOpenIf).await?;
     writer.pipe.set_offset(offset);
-    writer.resolved_path = resolved_path;
     Ok(writer)
 }
 
 /// The CREATE behind every [`FileWriter`], with the server's name for the
-/// file asked in the same round trip.
-async fn open_for_writer(
-    tree: &Tree,
-    conn: &mut Connection,
+/// file and which file it is asked in the same round trip. Also hands back
+/// the file's length at open.
+async fn open_writer(
+    tree: Arc<Tree>,
+    conn: Connection,
     path: &str,
     disposition: CreateDisposition,
-) -> Result<(FileId, Option<String>)> {
-    let (created, resolved_path) = tree
+) -> Result<(FileWriter, u64)> {
+    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
+    let opened = tree
         .open_and_name(
-            conn,
+            &mut conn,
             path,
             &tree.write_open_request(path, disposition),
-            false,
+            OpenFor::Writing,
         )
         .await?;
-    Ok((created.file_id, resolved_path))
+    let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
+
+    let mut writer = FileWriter::new(tree, conn, opened.created.file_id, max_write);
+    writer.resolved_path = opened.name;
+    writer.identity = opened.identity;
+    Ok((writer, opened.created.end_of_file))
 }
 
 impl FileWriter {
@@ -1299,7 +1333,25 @@ impl FileWriter {
             pending_offset: 0,
             done: false,
             resolved_path: None,
+            identity: None,
+            durable_offset: None,
         }
+    }
+
+    /// Which file this writer writes, asked in the same round trip as the
+    /// open. `None` when the server wouldn't say in full, and then a
+    /// [`WriteCheckpoint`] from this writer can't be resumed.
+    #[must_use]
+    pub fn identity(&self) -> Option<FileIdentity> {
+        self.identity
+    }
+
+    /// How far the file is known to be on disk: the offset of the last
+    /// [`flush_checkpoint`](Self::flush_checkpoint) that succeeded, or the
+    /// checkpoint a resumed writer started from. `None` before either.
+    #[must_use]
+    pub fn durable_offset(&self) -> Option<u64> {
+        self.durable_offset
     }
 
     /// The path the server opened, as it stores it: relative to the share,
@@ -1382,15 +1434,7 @@ impl FileWriter {
     /// Returns the total number of confirmed bytes written. Consumes `self`
     /// to prevent write-after-close at compile time.
     pub async fn finish(mut self) -> Result<u64> {
-        self.send_pending().await?;
-        if let Err(e) = self.pipe.drain().await {
-            return Err(self.failed(e).await);
-        }
-
-        // Flush to ensure data is persisted.
-        self.tree.flush_handle(&mut self.conn, self.file_id).await?;
-
-        // Close the handle.
+        self.flush_all().await?;
         self.tree.close_handle(&mut self.conn, self.file_id).await?;
 
         self.done = true;
@@ -1490,6 +1534,41 @@ impl FileWriter {
         Ok(self.pipe.confirmed())
     }
 
+    /// Make everything pushed so far durable, without closing the file, and
+    /// say how far that is.
+    ///
+    /// Sends what's buffered, waits for every WRITE's answer, then sends an
+    /// SMB2 FLUSH (the server's fsync) on the handle. The returned
+    /// [`WriteCheckpoint`] is what an interrupted upload resumes from: persist
+    /// it, and after a crash or a reconnect hand it to
+    /// `SmbClient::resume_file_writer`.
+    /// The writer stays open, so keep pushing chunks afterwards.
+    ///
+    /// How often is a trade: each checkpoint costs a round trip plus the
+    /// server's flush, and empties the write-behind window, so every few tens
+    /// of MiB is plenty.
+    ///
+    /// The guarantees:
+    ///
+    /// - The offset moves only once the FLUSH succeeded, after every WRITE
+    ///   before it was confirmed in full. A WRITE the server answered short
+    ///   is an error ([`ErrorKind::InvalidData`](crate::ErrorKind::InvalidData)),
+    ///   never a confirmed byte, and closes the handle.
+    /// - Dropping this future loses nothing. Bytes not yet sent stay buffered
+    ///   and WRITEs already out stay tracked; the next call (or
+    ///   [`finish`](Self::finish)) picks up where this one stopped, and
+    ///   [`durable_offset`](Self::durable_offset) keeps the last checkpoint
+    ///   that completed.
+    /// - On an error the offset stays where it was, and so does the handle
+    ///   unless the server refused a WRITE.
+    pub async fn flush_checkpoint(&mut self) -> Result<WriteCheckpoint> {
+        self.flush_all().await?;
+        let offset = self.pipe.offset();
+        self.durable_offset = Some(offset);
+        trace!("stream: FileWriter checkpoint at {offset}");
+        Ok(WriteCheckpoint::new(offset, self.identity))
+    }
+
     /// Confirmed bytes written (from server WRITE responses).
     #[must_use]
     pub fn bytes_written(&self) -> u64 {
@@ -1564,17 +1643,30 @@ impl FileWriter {
         Ok(())
     }
 
-    /// The server refused a WRITE: the file is done for, so close the handle
-    /// (best-effort) and hand the refusal back. The pipe has already waited
-    /// out the WRITEs behind it. Any other error leaves the handle alone: the
-    /// connection may be the thing that failed.
+    /// Send what's buffered, wait for every WRITE, then FLUSH: everything
+    /// [`finish`](Self::finish) and [`flush_checkpoint`](Self::flush_checkpoint)
+    /// share. Each step is cancel-safe, so the whole is too.
+    async fn flush_all(&mut self) -> Result<()> {
+        self.send_pending().await?;
+        if let Err(e) = self.pipe.drain().await {
+            return Err(self.failed(e).await);
+        }
+        // Standalone, so Windows' rule that a compounded op going async must
+        // end the chain (AGENTS.md pitfall 33) can't apply.
+        self.tree.flush_handle(&mut self.conn, self.file_id).await
+    }
+
+    /// The server refused a WRITE, or answered one short: the file is done
+    /// for, so close the handle (best-effort) and hand the error back. The
+    /// pipe has already waited out the WRITEs behind it. Any other error
+    /// leaves the handle alone: the connection may be the thing that failed.
     async fn failed(&mut self, e: Error) -> Error {
         if matches!(
             e,
             Error::Protocol {
                 command: Command::Write,
                 ..
-            }
+            } | Error::InvalidData { .. }
         ) {
             let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
             self.done = true;
@@ -1605,7 +1697,8 @@ mod tests {
         build_flush_response, build_query_info_error_response, build_query_info_response,
         build_read_error_response, build_read_response, build_set_info_response,
         build_write_error_response, build_write_response, build_write_response_granting,
-        file_all_information, file_name_information, setup_connection, CREATE_TIMES,
+        build_writer_open_response, file_all_information, file_name_information, setup_connection,
+        CREATE_TIMES,
     };
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -1631,13 +1724,10 @@ mod tests {
         }
     }
 
-    /// The compound a writer's open gets back: CREATE, then a class 48 name
-    /// query the server refused (so `resolved_path` is `None`).
+    /// The compound a writer's open gets back: CREATE, then identity and
+    /// class 48 queries the server refused (so `resolved_path` is `None`).
     fn writer_opened(file_id: FileId) -> Vec<u8> {
-        build_compound_response_frame(&[
-            build_create_response(file_id, 0),
-            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
-        ])
+        build_writer_open_response(file_id, 0, None, None)
     }
 
     /// The compound a reader's open gets back: CREATE, then class 18 and
@@ -2515,18 +2605,21 @@ mod tests {
     #[tokio::test]
     async fn a_writer_records_the_name_the_server_opened() {
         let mock = Arc::new(MockTransport::new());
-        mock.queue_response(build_compound_response_frame(&[
-            build_create_response(test_file_id(), 0),
-            build_query_info_response(file_name_information("Out\\new\u{F025}.bin")),
-        ]));
+        mock.queue_response(build_writer_open_response(
+            test_file_id(),
+            0,
+            None,
+            Some("Out\\new\u{F025}.bin"),
+        ));
         mock.queue_response(build_close_response());
         let writer = test_tree()
             .create_file_writer(setup_connection(&mock), "out/new?.bin")
             .await
             .unwrap();
         assert_eq!(writer.resolved_path(), Some("Out/new?.bin"));
-        // A write handle has no FILE_READ_ATTRIBUTES, so class 18 isn't asked.
-        assert_eq!(sent_query_classes(&mock, 0), vec![48]);
+        // A write handle has no FILE_READ_ATTRIBUTES, so class 18 isn't asked;
+        // the identity classes need no access.
+        assert_eq!(sent_query_classes(&mock, 0), vec![6, 1, 48]);
         writer.abort().await.unwrap();
     }
 
@@ -2534,10 +2627,12 @@ mod tests {
     async fn every_writer_open_names_what_it_opened() {
         for disposition in ["exclusive", "at"] {
             let mock = Arc::new(MockTransport::new());
-            mock.queue_response(build_compound_response_frame(&[
-                build_create_response(test_file_id(), 0),
-                build_query_info_response(file_name_information("Out.bin")),
-            ]));
+            mock.queue_response(build_writer_open_response(
+                test_file_id(),
+                0,
+                None,
+                Some("Out.bin"),
+            ));
             mock.queue_response(build_close_response());
             let conn = setup_connection(&mock);
             let writer = match disposition {
