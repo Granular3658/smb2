@@ -889,6 +889,34 @@ fn mv_renames_one_path_and_a_whole_batch() {
     assert_eq!(share.kind("a.mp4"), Kind::Missing);
 }
 
+/// `mv` never replaces a file unless asked, and `--replace` swaps it in one
+/// step on the server, which is the "write a temp, then rename over" save.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn mv_replaces_a_taken_name_only_with_replace() {
+    let share = Fixture::new("mv-replace");
+    share.write("notes.txt", b"old");
+    share.write("notes.txt.tmp", b"new");
+
+    let stderr = fails(&[
+        "mv",
+        &share.target("notes.txt.tmp"),
+        &share.target("notes.txt"),
+    ]);
+    assert!(stderr.contains("1 failed"), "{stderr:?}");
+    assert_eq!(share.read("notes.txt"), b"old");
+    assert_eq!(share.read("notes.txt.tmp"), b"new");
+
+    ok(&[
+        "mv",
+        "--replace",
+        &share.target("notes.txt.tmp"),
+        &share.target("notes.txt"),
+    ]);
+    assert_eq!(share.read("notes.txt"), b"new");
+    assert_eq!(share.kind("notes.txt.tmp"), Kind::Missing);
+}
+
 #[test]
 #[ignore = "needs the smb-auth container"]
 fn mv_refuses_to_cross_shares() {

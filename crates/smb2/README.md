@@ -359,6 +359,8 @@ For when you want to do one thing and get the result:
 - `client.read_file_compound_with_info(&mut share, path)`: Read a small file plus its size, dates, and
   attributes, in the same round trip. Downloads and file readers carry the same (`download.info()`, `reader.info()`)
 - `client.rename(&share, from, to)`: Rename a file
+- `client.rename_with(&share, from, to, RenameOptions::new().replace_if_exists(true))`: Rename over an existing file
+  in one step, so a "write a temp, then rename it over" save never leaves the name missing
 - `client.rename_files(&mut share, &renames)`: Batch rename
 - `client.create_directory(&share, path)`: Create a directory
 - `client.delete_directory(&share, path)`: Remove a directory

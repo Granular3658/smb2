@@ -117,7 +117,7 @@ pub use client::copy::{
 
 // Tree and file types
 pub use client::tree::{
-    DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree,
+    DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions, Tree,
 };
 
 // Which of a file's timestamps and attributes to set (`Tree::set_times`), and

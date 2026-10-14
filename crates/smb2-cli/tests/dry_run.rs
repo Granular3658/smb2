@@ -146,3 +146,19 @@ fn mv_plans_the_rename_without_connecting() {
         "{stdout:?}"
     );
 }
+
+#[test]
+fn mv_replace_says_so_in_the_plan() {
+    let stdout = expect_dry(&[
+        "--guest",
+        "--dry-run",
+        "mv",
+        "--replace",
+        &format!("{DEAD_SHARE}/old"),
+        &format!("{DEAD_SHARE}/new"),
+    ]);
+    assert!(
+        stdout.contains("mv --replace //127.0.0.1:1/share/old //127.0.0.1:1/share/new"),
+        "{stdout:?}"
+    );
+}

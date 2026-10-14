@@ -80,11 +80,14 @@ smb2 put ./notes.txt //raspi/PiHDD/read-me.txt # under a name you choose
 # Change things
 smb2 mkdir -p //raspi/PiHDD/2026/2026-08-05
 smb2 mv //raspi/PiHDD/old.txt //raspi/PiHDD/new.txt
+smb2 mv --replace //raspi/PiHDD/notes.tmp //raspi/PiHDD/notes.txt  # over a file that's there
 smb2 rm //raspi/PiHDD/junk.txt
 smb2 rmdir //raspi/PiHDD/empty-dir
 ```
 
 `realpath` prints the path the way the server stores it: its casing, and long names in place of 8.3 aliases like `PROGRA~1`. It needs SMB 3.1.1 (Samba, or Windows 10 / Server v1803 and later) and says so when the server can't answer.
+
+`mv` won't replace a file that's already at the destination unless you pass `--replace`. With it, the server swaps the file in one step, so the destination is never missing in between. It never replaces a directory.
 
 `mkdir -p` is happy to find the directory already there, and stops when the name belongs to a file, the way GNU `mkdir -p` does.
 

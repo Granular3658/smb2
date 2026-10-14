@@ -56,7 +56,9 @@ pub use session::Session;
 pub use shares::list_shares;
 pub use stream::{FileDownload, FileUpload, FileWriter, Progress};
 pub use times::FileTimes;
-pub use tree::{DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, Tree};
+pub use tree::{
+    DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions, Tree,
+};
 pub use watcher::{FileNotifyAction, FileNotifyEvent, Watcher};
 
 // Re-export high-level client types.
@@ -418,13 +420,17 @@ async fn rename_on(
     caller: (TreeId, String),
     from: &str,
     to: &str,
+    options: RenameOptions,
 ) -> Result<()> {
     let on_caller_tree = (tree.tree_id, &tree.server) == (caller.0, &caller.1);
     if on_caller_tree {
-        return tree.rename(&mut conn, &path, to).await;
+        return tree.rename_with(&mut conn, &path, to, options).await;
     }
     match link_rename_target(from, to, &path) {
-        Some(target_to) => tree.rename(&mut conn, &path, &target_to).await,
+        Some(target_to) => {
+            tree.rename_with(&mut conn, &path, &target_to, options)
+                .await
+        }
         // The server's own answer: this rename can't follow the link.
         None => Err(Error::Protocol {
             status: NtStatus::PATH_NOT_COVERED,
@@ -1611,9 +1617,39 @@ impl SmbClient {
     /// any other keeps the server's `STATUS_PATH_NOT_COVERED`, since its
     /// destination may not be behind the same link.
     pub async fn rename(&mut self, tree: &Tree, from: &str, to: &str) -> Result<()> {
+        self.rename_with(tree, from, to, RenameOptions::default())
+            .await
+    }
+
+    /// Rename like [`rename`](Self::rename), with `options` deciding what
+    /// happens to a file already at `to`. See [`Tree::rename_with`].
+    ///
+    /// # Example
+    ///
+    /// Save over a file without a moment where it's missing: write the new
+    /// contents beside it, then swap them in.
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut smb2::SmbClient, share: &smb2::Tree) -> Result<(), smb2::Error> {
+    /// use smb2::RenameOptions;
+    ///
+    /// client.write_file(share, "notes.txt.tmp", b"new contents").await?;
+    /// client
+    ///     .rename_with(share, "notes.txt.tmp", "notes.txt", RenameOptions::new().replace_if_exists(true))
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn rename_with(
+        &mut self,
+        tree: &Tree,
+        from: &str,
+        to: &str,
+        options: RenameOptions,
+    ) -> Result<()> {
         let caller = (tree.tree_id, tree.server.clone());
         self.beside_tree(tree, from, |conn, target, path| {
-            rename_on(conn, target, path, caller.clone(), from, to)
+            rename_on(conn, target, path, caller.clone(), from, to, options)
         })
         .await
         .map(|(done, _)| done)
@@ -1631,12 +1667,24 @@ impl SmbClient {
     /// for the referral once per batch; `tree` stays on its own share, where
     /// the other items are.
     pub async fn rename_files(&mut self, tree: &Tree, renames: &[(&str, &str)]) -> Vec<Result<()>> {
+        self.rename_files_with(tree, renames, RenameOptions::default())
+            .await
+    }
+
+    /// Rename multiple files like [`rename_files`](Self::rename_files), each
+    /// with the same `options` (see [`rename_with`](Self::rename_with)).
+    pub async fn rename_files_with(
+        &mut self,
+        tree: &Tree,
+        renames: &[(&str, &str)],
+        options: RenameOptions,
+    ) -> Vec<Result<()>> {
         let mut results = Vec::with_capacity(renames.len());
         let caller = (tree.tree_id, tree.server.clone());
         for (from, to) in renames {
             let result = self
                 .beside_tree(tree, from, |conn, target, path| {
-                    rename_on(conn, target, path, caller.clone(), from, to)
+                    rename_on(conn, target, path, caller.clone(), from, to, options)
                 })
                 .await;
             results.push(result.map(|(done, _)| done));

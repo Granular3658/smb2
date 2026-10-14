@@ -177,6 +177,7 @@ pub async fn rmdir(
 pub async fn mv(
     targets: &[String],
     from_file: Option<&str>,
+    replace: bool,
     credentials: &Credentials,
     concurrency: usize,
     dry_run: bool,
@@ -210,7 +211,8 @@ pub async fn mv(
     if dry_run {
         for (from, to) in &pairs {
             println!(
-                "mv {} {}",
+                "mv {}{} {}",
+                if replace { "--replace " } else { "" },
                 base.with_path(from).display(),
                 base.with_path(to).display()
             );
@@ -225,7 +227,7 @@ pub async fn mv(
     let paths: Vec<String> = pairs.iter().map(|(from, _)| from.clone()).collect();
     let jobs = pairs
         .into_iter()
-        .map(|(from, to)| Job::Rename { from, to })
+        .map(|(from, to)| Job::Rename { from, to, replace })
         .collect();
     run_jobs(&base, credentials, concurrency, paths, jobs, false)
         .await?

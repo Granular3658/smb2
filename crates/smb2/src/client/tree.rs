@@ -251,6 +251,40 @@ pub struct FsInfo {
     pub sectors_per_unit: u32,
 }
 
+/// How a rename treats a destination that already exists, for
+/// [`Tree::rename_with`] and [`SmbClient::rename_with`](crate::SmbClient::rename_with).
+///
+/// The default is what [`Tree::rename`] does: refuse an existing destination.
+///
+/// ```
+/// use smb2::RenameOptions;
+///
+/// let options = RenameOptions::new().replace_if_exists(true);
+/// assert!(options.replace_if_exists);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenameOptions {
+    /// Replace a file already at the destination, in the same step as the
+    /// rename (`ReplaceIfExists`, MS-FSCC § 2.4.42.2).
+    pub replace_if_exists: bool,
+}
+
+impl RenameOptions {
+    /// Refuse an existing destination, like [`Tree::rename`].
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replace a file already at the destination instead of refusing it.
+    #[must_use]
+    pub fn replace_if_exists(mut self, replace: bool) -> Self {
+        self.replace_if_exists = replace;
+        self
+    }
+}
+
 /// Where a tree came from, when a DFS referral put it somewhere else.
 ///
 /// A file manager showing `\\fs01\projects_dfs` for a path the person typed as
@@ -1289,15 +1323,54 @@ impl Tree {
     /// Rename or move a file within the same share using a compound request (1 round-trip).
     ///
     /// Sends CREATE + SET_INFO (FileRenameInformation) + CLOSE as a single
-    /// compound message.
+    /// compound message. A name that's already taken is refused with
+    /// `STATUS_OBJECT_NAME_COLLISION` ([`ErrorKind::AlreadyExists`](crate::ErrorKind::AlreadyExists))
+    /// and neither file changes; [`rename_with`](Self::rename_with) can
+    /// replace it instead.
     pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
+        self.rename_with(conn, from, to, RenameOptions::default())
+            .await
+    }
+
+    /// Rename like [`rename`](Self::rename), with `options` deciding what
+    /// happens to a file already at `to`.
+    ///
+    /// With [`RenameOptions::replace_if_exists`], the server swaps the source
+    /// in under `to` in the same SET_INFO that renames it, so the name is
+    /// never missing: write `file.tmp`, then rename it over `file`, and a
+    /// reader sees either the old contents or the new ones. Nothing is
+    /// emulated client-side; a delete-then-rename would leave a window where
+    /// `file` is gone. (Samba has a much narrower one of its own: a client
+    /// opening `file` at the very moment of the swap is occasionally told
+    /// it's missing, because Samba's open looks the file up twice.)
+    ///
+    /// What a replacing rename can still be refused with:
+    ///
+    /// - **A directory at either end.** Only a file is replaced. Samba refuses
+    ///   with `STATUS_OBJECT_NAME_COLLISION` ([`ErrorKind::AlreadyExists`](crate::ErrorKind::AlreadyExists)),
+    ///   Windows with `STATUS_ACCESS_DENIED` (MS-FSA § 2.1.5.15.12), and
+    ///   nothing moves.
+    /// - **A destination someone has open, or one marked Read-only**:
+    ///   Windows refuses with `STATUS_ACCESS_DENIED`. Samba 4.20 replaces it
+    ///   anyway, open handles and leases included.
+    ///
+    /// Renaming a file onto its own name succeeds and changes nothing, and a
+    /// rename that only changes case succeeds with or without the option.
+    pub async fn rename_with(
+        &self,
+        conn: &mut Connection,
+        from: &str,
+        to: &str,
+        options: RenameOptions,
+    ) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
         let from_normalized = self.format_path(from);
         let to_normalized = normalize_path(to);
         trace!(
-            "tree: rename (compound) from={} to={}",
+            "tree: rename (compound) from={} to={} replace_if_exists={}",
             from_normalized,
-            to_normalized
+            to_normalized,
+            options.replace_if_exists
         );
 
         // Build CREATE request with DELETE access (required for rename).
@@ -1325,7 +1398,7 @@ impl Tree {
             file_info_class: FILE_RENAME_INFORMATION,
             additional_information: 0,
             file_id: FileId::SENTINEL,
-            buffer: build_rename_info_buffer(&to_normalized),
+            buffer: build_rename_info_buffer(&to_normalized, options.replace_if_exists),
         };
 
         // Build CLOSE request with sentinel FileId.
@@ -1414,6 +1487,18 @@ impl Tree {
         conn: &mut Connection,
         renames: &[(&str, &str)],
     ) -> Vec<Result<()>> {
+        self.rename_files_with(conn, renames, RenameOptions::default())
+            .await
+    }
+
+    /// Rename multiple files like [`rename_files`](Self::rename_files), each
+    /// with the same `options` (see [`rename_with`](Self::rename_with)).
+    pub async fn rename_files_with(
+        &self,
+        conn: &mut Connection,
+        renames: &[(&str, &str)],
+        options: RenameOptions,
+    ) -> Vec<Result<()>> {
         let conn = &mut self.pinned_conn(conn);
         if renames.is_empty() {
             return vec![];
@@ -1423,7 +1508,7 @@ impl Tree {
 
         let mut results: Vec<Result<()>> = Vec::with_capacity(renames.len());
         for (from, to) in renames {
-            results.push(self.rename(conn, from, to).await);
+            results.push(self.rename_with(conn, from, to, options).await);
         }
 
         debug!(
@@ -3257,13 +3342,13 @@ pub(crate) fn close_outcome(frame: &Frame) -> Result<()> {
     Ok(())
 }
 
-/// Build a FileRenameInformation buffer (MS-FSCC 2.4.34.2).
-fn build_rename_info_buffer(new_name: &str) -> Vec<u8> {
+/// Build a FILE_RENAME_INFORMATION_TYPE_2 buffer (MS-FSCC 2.4.42.2).
+fn build_rename_info_buffer(new_name: &str, replace_if_exists: bool) -> Vec<u8> {
     let name_u16: Vec<u16> = new_name.encode_utf16().collect();
     let name_byte_len = name_u16.len() * 2;
 
     let mut buf = Vec::with_capacity(20 + name_byte_len);
-    buf.push(0); // ReplaceIfExists = false
+    buf.push(u8::from(replace_if_exists)); // ReplaceIfExists
     buf.extend_from_slice(&[0u8; 7]); // Reserved
     buf.extend_from_slice(&0u64.to_le_bytes()); // RootDirectory
     buf.extend_from_slice(&(name_byte_len as u32).to_le_bytes()); // FileNameLength
@@ -4678,6 +4763,64 @@ mod tests {
         let _header = Header::unpack(&mut cursor).unwrap();
         let req = CreateRequest::unpack(&mut cursor).unwrap();
         assert!(req.desired_access.contains(FileAccessMask::DELETE));
+    }
+
+    /// The `FILE_RENAME_INFORMATION` buffer of the SET_INFO in a sent rename
+    /// compound (CREATE + SET_INFO + CLOSE).
+    fn sent_rename_info(frame: &[u8]) -> Vec<u8> {
+        let mut cursor = ReadCursor::new(frame);
+        let create = Header::unpack(&mut cursor).unwrap();
+        let mut cursor = ReadCursor::new(&frame[create.next_command as usize..]);
+        let header = Header::unpack(&mut cursor).unwrap();
+        assert_eq!(header.command, Command::SetInfo);
+        let req = SetInfoRequest::unpack(&mut cursor).unwrap();
+        assert_eq!(req.file_info_class, FILE_RENAME_INFORMATION);
+        req.buffer
+    }
+
+    #[tokio::test]
+    async fn rename_replaces_an_existing_destination_only_when_asked() {
+        let mock = Arc::new(MockTransport::new());
+        for _ in 0..3 {
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(FileId::SENTINEL, 0),
+                build_set_info_response(),
+                build_close_response(),
+            ]));
+        }
+        let mut conn = setup_connection(&mock);
+        let tree = Tree {
+            pin: None,
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+            dfs_origin: None,
+        };
+
+        tree.rename(&mut conn, "a.tmp", "a").await.unwrap();
+        tree.rename_with(&mut conn, "b.tmp", "b", RenameOptions::new())
+            .await
+            .unwrap();
+        tree.rename_with(
+            &mut conn,
+            "c.tmp",
+            "c",
+            RenameOptions::new().replace_if_exists(true),
+        )
+        .await
+        .unwrap();
+
+        // ReplaceIfExists is the buffer's first byte; the name follows the
+        // 20-byte fixed part either way.
+        let infos: Vec<Vec<u8>> = (0..3)
+            .map(|i| sent_rename_info(&mock.sent_message(i).unwrap()))
+            .collect();
+        assert_eq!(infos[0][0], 0, "rename never replaces");
+        assert_eq!(infos[1][0], 0, "the default options don't replace");
+        assert_eq!(infos[2][0], 1, "replace_if_exists sets ReplaceIfExists");
+        assert_eq!(&infos[2][20..], &[b'c', 0]);
     }
 
     #[tokio::test]

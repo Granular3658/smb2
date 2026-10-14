@@ -890,6 +890,167 @@ async fn guest_file_handles_record_the_name_the_server_opened() {
     tree.delete_file(&mut conn, stored).await.unwrap();
 }
 
+/// A fresh directory for one test, emptied of whatever an earlier run left.
+async fn fresh_dir(conn: &mut Connection, tree: &Tree, dir: &str) {
+    if let Ok(entries) = tree.list_directory(conn, dir).await {
+        for entry in entries.iter().filter(|e| e.name != "." && e.name != "..") {
+            let path = format!("{dir}/{}", entry.name);
+            if entry.is_directory {
+                let _ = tree.delete_directory(conn, &path).await;
+            } else {
+                let _ = tree.delete_file(conn, &path).await;
+            }
+        }
+    } else {
+        tree.create_directory(conn, dir)
+            .await
+            .expect("create test dir");
+    }
+}
+
+/// Without the option a rename refuses a taken name and touches neither file;
+/// with it the source's contents take the destination's name in one step.
+#[tokio::test]
+#[ignore]
+async fn guest_rename_replaces_an_existing_destination_only_when_asked() {
+    use smb2::{ErrorKind, RenameOptions};
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let dir = "rename_replace";
+    fresh_dir(&mut conn, &tree, dir).await;
+    let (tmp, file) = (format!("{dir}/notes.txt.tmp"), format!("{dir}/notes.txt"));
+    tree.write_file(&mut conn, &file, b"old").await.unwrap();
+    tree.write_file(&mut conn, &tmp, b"new").await.unwrap();
+
+    let refused = tree.rename(&mut conn, &tmp, &file).await.unwrap_err();
+    assert_eq!(refused.kind(), ErrorKind::AlreadyExists, "{refused:?}");
+    let default = tree
+        .rename_with(&mut conn, &tmp, &file, RenameOptions::new())
+        .await
+        .unwrap_err();
+    assert_eq!(default.kind(), ErrorKind::AlreadyExists, "{default:?}");
+    assert_eq!(tree.read_file(&mut conn, &file).await.unwrap(), b"old");
+    assert_eq!(tree.read_file(&mut conn, &tmp).await.unwrap(), b"new");
+
+    tree.rename_with(
+        &mut conn,
+        &tmp,
+        &file,
+        RenameOptions::new().replace_if_exists(true),
+    )
+    .await
+    .expect("replacing rename");
+    assert_eq!(tree.read_file(&mut conn, &file).await.unwrap(), b"new");
+    let gone = tree.stat(&mut conn, &tmp).await.unwrap_err();
+    assert_eq!(gone.kind(), ErrorKind::NotFound, "{gone:?}");
+
+    tree.delete_file(&mut conn, &file).await.unwrap();
+    tree.disconnect(&mut conn).await.unwrap();
+}
+
+/// A replacing rename moves the source's own file under the taken name: the
+/// server renames over the destination rather than writing into it, so
+/// afterwards the name points at the very file that was the temp (same index
+/// number, its inode here). On a POSIX server that's one `rename(2)`, which is
+/// what makes "write a temp, then rename it over" atomic. That the client
+/// sends it as one SET_INFO and never deletes first is the mock's job
+/// (`rename_replaces_an_existing_destination_only_when_asked`).
+///
+/// No concurrent reader checks that the name never goes missing, because
+/// Samba 4.20's own open path misses a file swapped mid-open now and then
+/// (`client/CLAUDE.md` § Compound requests), more often under load.
+#[tokio::test]
+#[ignore]
+async fn guest_a_replacing_rename_moves_the_source_file_under_the_taken_name() {
+    use smb2::RenameOptions;
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let dir = "rename_replace_identity";
+    fresh_dir(&mut conn, &tree, dir).await;
+    let (tmp, file) = (format!("{dir}/doc.tmp"), format!("{dir}/doc"));
+    tree.write_file(&mut conn, &file, b"old").await.unwrap();
+    tree.write_file(&mut conn, &tmp, b"new").await.unwrap();
+    let identity = |r: smb2::Resolved| r.identity.expect("Samba reports file identity");
+    let source = identity(tree.resolve(&mut conn, &tmp).await.unwrap());
+    let replaced = identity(tree.resolve(&mut conn, &file).await.unwrap());
+    assert_ne!(source, replaced);
+
+    tree.rename_with(
+        &mut conn,
+        &tmp,
+        &file,
+        RenameOptions::new().replace_if_exists(true),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        identity(tree.resolve(&mut conn, &file).await.unwrap()),
+        source,
+        "the destination name now points at the source's own file"
+    );
+    assert_eq!(tree.read_file(&mut conn, &file).await.unwrap(), b"new");
+    tree.delete_file(&mut conn, &file).await.unwrap();
+    tree.disconnect(&mut conn).await.unwrap();
+}
+
+/// The edges of a replacing rename, as Samba 4.20 answers them: a directory
+/// in either position is refused with OBJECT_NAME_COLLISION and nothing
+/// moves (Windows answers ACCESS_DENIED, MS-FSA § 2.1.5.15.12), and a rename
+/// onto itself or one that only changes case still succeeds.
+#[tokio::test]
+#[ignore]
+async fn guest_a_replacing_rename_refuses_directories_and_allows_case_changes() {
+    use smb2::{ErrorKind, RenameOptions};
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let dir = "rename_replace_edges";
+    fresh_dir(&mut conn, &tree, dir).await;
+    let replace = RenameOptions::new().replace_if_exists(true);
+    let (file, sub) = (format!("{dir}/Report.txt"), format!("{dir}/sub"));
+    tree.write_file(&mut conn, &file, b"keep").await.unwrap();
+    tree.create_directory(&mut conn, &sub).await.unwrap();
+
+    let onto_dir = tree
+        .rename_with(&mut conn, &file, &sub, replace)
+        .await
+        .unwrap_err();
+    assert_eq!(onto_dir.kind(), ErrorKind::AlreadyExists, "{onto_dir:?}");
+    let dir_onto_file = tree
+        .rename_with(&mut conn, &sub, &file, replace)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        dir_onto_file.kind(),
+        ErrorKind::AlreadyExists,
+        "{dir_onto_file:?}"
+    );
+    assert!(tree.stat(&mut conn, &sub).await.unwrap().is_directory);
+    assert_eq!(tree.read_file(&mut conn, &file).await.unwrap(), b"keep");
+
+    tree.rename_with(&mut conn, &file, &file, replace)
+        .await
+        .expect("onto itself");
+    let lower = format!("{dir}/report.txt");
+    tree.rename_with(&mut conn, &file, &lower, replace)
+        .await
+        .expect("case only");
+    let names: Vec<String> = tree
+        .list_directory(&mut conn, dir)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(names.iter().any(|n| n == "report.txt"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "Report.txt"), "{names:?}");
+    assert_eq!(tree.read_file(&mut conn, &lower).await.unwrap(), b"keep");
+
+    tree.delete_file(&mut conn, &lower).await.unwrap();
+    tree.delete_directory(&mut conn, &sub).await.unwrap();
+    tree.disconnect(&mut conn).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore]
 async fn guest_create_delete_directory() {

@@ -8,7 +8,7 @@
 
 use anyhow::{Context, Result};
 use smb2::types::status::NtStatus;
-use smb2::{FileInfo, SmbClient, Tree};
+use smb2::{FileInfo, RenameOptions, SmbClient, Tree};
 
 use crate::auth::Credentials;
 use crate::remote::{self, RemoteKind};
@@ -38,6 +38,8 @@ pub enum Job {
     Rename {
         from: String,
         to: String,
+        /// Replace a file already at `to`.
+        replace: bool,
     },
     DeleteFile(String),
     DeleteDirectory(String),
@@ -161,7 +163,10 @@ async fn execute(client: &mut SmbClient, tree: &mut Tree, job: &Job) -> Outcome 
             Ok(info) => Outcome::Stat(info),
             Err(error) => Outcome::Failed(error.to_string()),
         },
-        Job::Rename { from, to } => report(client.rename(tree, from, to).await),
+        Job::Rename { from, to, replace } => {
+            let options = RenameOptions::new().replace_if_exists(*replace);
+            report(client.rename_with(tree, from, to, options).await)
+        }
         Job::DeleteFile(path) => report(client.delete_file(tree, path).await),
         Job::DeleteDirectory(path) => report(client.delete_directory(tree, path).await),
         Job::CreateDirectory(path) => create_directory(client, tree, path, false).await,

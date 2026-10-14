@@ -98,6 +98,10 @@ enum Commands {
         /// Read `from<TAB>to` pairs from this file, or `-` for stdin.
         #[arg(long, value_name = "FILE")]
         from_file: Option<String>,
+        /// Replace a file already at the destination, in one step on the
+        /// server. Without it, a taken name is an error.
+        #[arg(long)]
+        replace: bool,
         #[command(flatten)]
         concurrency: pool::Concurrency,
     },
@@ -197,11 +201,13 @@ async fn main() -> Result<()> {
         Commands::Mv {
             targets,
             from_file,
+            replace,
             concurrency,
         } => {
             commands::mutate::mv(
                 targets,
                 from_file.as_deref(),
+                *replace,
                 &credentials,
                 concurrency.workers(),
                 cli.dry_run,

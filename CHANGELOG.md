@@ -16,6 +16,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **A rename can replace the file at its destination, in one step on the server.** `rename_with` and `rename_files_with` (on `SmbClient` and `Tree`) take a `RenameOptions`, and `RenameOptions::new().replace_if_exists(true)` swaps the source in under a name that's already taken. That's the safe way to save over a file: write `notes.txt.tmp`, then rename it over `notes.txt`, and the server swaps the file under the name in one step, so `notes.txt` never goes missing the way it does between a delete and a rename. `rename` still refuses a taken name with `ErrorKind::AlreadyExists`. A directory at either end is refused either way. The CLI's `mv` gets `--replace` for the same thing. Based on [#4](https://github.com/vdavid/smb2/pull/4) by @kalicyh.
 - `Error::HandleInvalidated { opened_on, current }`, carrying the connection generations involved. It classifies as `ErrorKind::ConnectionLost` and is retryable: open the file again.
 
 ## [0.29.1] - 2026-10-14
