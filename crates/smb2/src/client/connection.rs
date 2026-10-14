@@ -2800,7 +2800,7 @@ impl Connection {
         // Update preauth hash with request bytes.
         self.inner.preauth_hasher.lock().unwrap().update(&req_bytes);
 
-        let mut guard = self.register_waiter(msg_id, Command::Negotiate)?;
+        let guard = self.register_waiter(msg_id, Command::Negotiate)?;
 
         let rtt_start = std::time::Instant::now();
         self.inner
@@ -2809,7 +2809,10 @@ impl Connection {
         reservation.commit();
         self.inner.mark_sent(&[msg_id]);
 
-        let frame = guard.recv().await?;
+        // Through the response deadline like every other request: a server
+        // that accepts the socket and never answers would otherwise hang the
+        // handshake (and any reconnect built on it) forever.
+        let frame = self.await_response(guard, Command::Negotiate).await?;
         *self.inner.estimated_rtt.lock().unwrap() = Some(rtt_start.elapsed());
 
         // Preauth hash update with response bytes.
@@ -6477,6 +6480,38 @@ mod tests {
             conn.outstanding_requests().is_empty(),
             "the abandoned request must not leak a waiter"
         );
+    }
+
+    /// The handshake is a request like any other: a server that accepts the
+    /// TCP connection and then never answers the NEGOTIATE must not hang the
+    /// caller. NEGOTIATE used to wait on a bare `guard.recv()`, so a reconnect
+    /// against such a server never returned (70 s and counting, observed from
+    /// Cmdr, which held its reconnect lock the whole time).
+    #[tokio::test]
+    async fn a_server_that_never_answers_negotiate_cannot_hang_the_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (conn, accepted) = tokio::join!(
+            Connection::connect(&addr, std::time::Duration::from_secs(5)),
+            listener.accept()
+        );
+        let mut conn = conn.unwrap();
+        // Held open and silent for the whole test.
+        let _server = accepted.unwrap().0;
+        conn.set_response_timeout(Some(std::time::Duration::from_millis(200)));
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), conn.negotiate())
+            .await
+            .expect("the handshake must give up on its own, not hang until the test times out");
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::Timeout) | Err(Error::ServerUnresponsive { .. })
+            ),
+            "expected a timeout, got {result:?}"
+        );
+        assert_eq!(conn.metrics().response_timeouts, 1);
     }
 
     /// A server that answers STATUS_PENDING is working, not dead. Timing it

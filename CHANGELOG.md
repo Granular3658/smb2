@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A server that accepts the connection and then never answers can no longer hang `connect` forever** ([cmdr#406](https://github.com/vdavid/cmdr/issues/406)). The NEGOTIATE that opens every connection waited for its answer with no deadline, so `SmbClient::connect`, `Connection::negotiate`, and any reconnect built on them never returned. It now gets the same response deadline as every other request (30 s of silence by default, tuned with `Connection::set_response_timeout`) and gives up with `Error::Timeout`, or `Error::ServerUnresponsive` when the connection is provably dead.
+
 ## [0.28.0] - 2026-10-12
 
 ### Breaking
