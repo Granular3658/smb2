@@ -3354,57 +3354,6 @@ impl Tree {
         conn.dispatch(Command::Close, &req, Some(self.tree_id))
             .await
     }
-
-    /// Write data to a file in chunks.
-    ///
-    /// Kept for potential future use by callers that need per-chunk control
-    /// without pipelining or compounding.
-    #[allow(dead_code)]
-    async fn write_loop(&self, conn: &mut Connection, file_id: FileId, data: &[u8]) -> Result<u64> {
-        let conn = &mut self.pinned_conn(conn);
-        let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
-
-        let mut total_written = 0u64;
-        let mut offset = 0usize;
-
-        while offset < data.len() {
-            let remaining = data.len() - offset;
-            let chunk_size = remaining.min(conn.fundable_chunk(max_write) as usize);
-            let chunk = &data[offset..offset + chunk_size];
-
-            // DataOffset: header (64) + fixed write body (48) = 112 = 0x70
-            let req = WriteRequest {
-                data_offset: 0x70,
-                offset: offset as u64,
-                file_id,
-                channel: 0,
-                remaining_bytes: 0,
-                write_channel_info_offset: 0,
-                write_channel_info_length: 0,
-                flags: 0,
-                data: chunk.to_vec(),
-            };
-
-            let frame = conn
-                .execute(Command::Write, &req, Some(self.tree_id))
-                .await?;
-
-            if frame.header.status != NtStatus::SUCCESS {
-                return Err(Error::Protocol {
-                    status: frame.header.status,
-                    command: Command::Write,
-                });
-            }
-
-            let mut cursor = ReadCursor::new(&frame.body);
-            let resp = WriteResponse::unpack(&mut cursor)?;
-
-            total_written += resp.count as u64;
-            offset += chunk_size;
-        }
-
-        Ok(total_written)
-    }
 }
 
 /// What a CLOSE response says about the close.
