@@ -5,8 +5,8 @@
 //! no deletes.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smb2::client::Connection;
@@ -130,7 +130,9 @@ pub async fn discover(
                 let child = if dir.is_empty() {
                     e.name.clone()
                 } else {
-                    format!("{dir}\\{}", e.name)
+                    // `/`, never `\`: the crate reads a `\` as a character in
+                    // the name (AGENTS.md pitfall 23).
+                    format!("{dir}/{}", e.name)
                 };
                 to_expand.push_back(child);
             }
@@ -154,19 +156,23 @@ pub async fn discover(
 // ───────────────────────── serial phase breakdown ────────────────────────
 
 /// Serial, one-connection listing of every dir in `dirs`, capturing a
-/// per-phase [`ListingTrace`] for each.
+/// per-phase [`ListingTrace`] for each. Also
+/// hands back the listings that failed, `(path, error)`, so a report can
+/// say why a pass covered fewer dirs than it was given.
 pub async fn phase_breakdown(
     conn: &mut Connection,
     tree: &Tree,
     dirs: &[String],
-) -> Vec<ListingTrace> {
+) -> (Vec<ListingTrace>, Vec<(String, String)>) {
     let mut traces = Vec::with_capacity(dirs.len());
+    let mut failed = Vec::new();
     for dir in dirs {
-        if let Ok((_, trace)) = tree.list_directory_instrumented(conn, dir, None).await {
-            traces.push(trace);
+        match tree.list_directory_instrumented(conn, dir, None).await {
+            Ok((_, trace)) => traces.push(trace),
+            Err(e) => failed.push((dir.clone(), e.to_string())),
         }
     }
-    traces
+    (traces, failed)
 }
 
 // ─────────────────────────── concurrency pool ────────────────────────────
@@ -177,6 +183,9 @@ pub struct PoolResult {
     pub entries: u64,
     pub ok: u64,
     pub err: u64,
+    /// The first listing that failed and why, so an `err` count says what it
+    /// is counting.
+    pub first_error: Option<String>,
 }
 
 impl PoolResult {
@@ -195,6 +204,7 @@ pub async fn run_pool(workers: Vec<Worker>, dirs: Arc<[String]>) -> PoolResult {
     let entries = Arc::new(AtomicU64::new(0));
     let ok = Arc::new(AtomicU64::new(0));
     let err = Arc::new(AtomicU64::new(0));
+    let first_error = Arc::new(Mutex::new(None));
 
     let start = Instant::now();
     let mut handles = Vec::with_capacity(workers.len());
@@ -204,6 +214,7 @@ pub async fn run_pool(workers: Vec<Worker>, dirs: Arc<[String]>) -> PoolResult {
         let entries = entries.clone();
         let ok = ok.clone();
         let err = err.clone();
+        let first_error = first_error.clone();
         handles.push(tokio::spawn(async move {
             loop {
                 let idx = cursor.fetch_add(1, Ordering::Relaxed);
@@ -215,8 +226,12 @@ pub async fn run_pool(workers: Vec<Worker>, dirs: Arc<[String]>) -> PoolResult {
                         entries.fetch_add(es.len() as u64, Ordering::Relaxed);
                         ok.fetch_add(1, Ordering::Relaxed);
                     }
-                    Err(_) => {
+                    Err(e) => {
                         err.fetch_add(1, Ordering::Relaxed);
+                        first_error
+                            .lock()
+                            .unwrap()
+                            .get_or_insert_with(|| format!("{}: {e}", dirs[idx]));
                     }
                 }
             }
@@ -231,6 +246,7 @@ pub async fn run_pool(workers: Vec<Worker>, dirs: Arc<[String]>) -> PoolResult {
         entries: entries.load(Ordering::Relaxed),
         ok: ok.load(Ordering::Relaxed),
         err: err.load(Ordering::Relaxed),
+        first_error: first_error.lock().unwrap().take(),
     }
 }
 

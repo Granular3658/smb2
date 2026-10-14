@@ -32,7 +32,7 @@ not part of the library workspace.
 
 - `--config <path>`: config file (default `../smb/config.toml`; or set `SMB_LISTING_CONFIG`).
 - `--target <name>`: which target from the config (default: the first).
-- `--root <path>`: share-relative directory to walk from (default: the share root). Use `/` or `\` separators.
+- `--root <path>`: share-relative directory to walk from (default: the share root). Use `/` separators; a `\` is turned into `/`, since the probe never meets a name with a backslash in it.
 - `--sample <n>`: directories for the serial phase breakdown and warm sweeps (default 200).
 - `--windows <csv>`: in-flight window sizes for the throughput sweeps (default `1,8,32,64,128`).
 - `--cold-slice <n>`: directories per fresh slice in the cold sweeps (default 60). Each window size and each session
@@ -62,6 +62,12 @@ Release mode matters: the measurement compares wire time, so local overhead must
    sessions beat a single session's ceiling, or is the disk the shared bottleneck?
 
 A timestamped copy of the full text report is saved to `results/`.
+
+Every `err` count comes with the first failing directory and its error, and a phase-breakdown pass that lost dirs says
+how many and why. Gotcha/Why: the probe used to count failures silently, so when smb2 0.18's name mapping made `\` a
+name character (U+F026) and `/` the only separator, the `\`-joined paths it built for every directory below depth 1
+all failed with `STATUS_OBJECT_NAME_NOT_FOUND`, and the reports read `err 21` and `0 dirs/s` cold for two months
+without saying why. Build child paths with `/`.
 
 ## Crate instrumentation
 

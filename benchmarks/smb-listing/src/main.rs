@@ -53,7 +53,7 @@ impl Args {
             match flag.as_str() {
                 "--config" => a.config = PathBuf::from(val()),
                 "--target" => a.target = Some(val()),
-                "--root" => a.root = val().replace('/', "\\"),
+                "--root" => a.root = val().replace('\\', "/"),
                 "--sample" => a.sample = val().parse().unwrap_or(a.sample),
                 "--windows" => a.windows = parse_usize_csv(&val()),
                 "--cold-slice" => a.cold_slice = val().parse().unwrap_or(a.cold_slice),
@@ -183,16 +183,22 @@ async fn main() {
     // ── 2. Phase breakdown: cold then warm ────────────────────────────────
     emit("\n== Phase breakdown (serial, one connection) ==".to_string());
     let t = Instant::now();
-    let cold = probe::phase_breakdown(&mut c0, &tree0, &sample_dirs).await;
+    let (cold, cold_failed) = probe::phase_breakdown(&mut c0, &tree0, &sample_dirs).await;
     let cold_wall = t.elapsed();
     emit("Pass 1 (cold — dirs never listed before):".to_string());
     emit(report::summarize_phases(&cold, cold_wall));
+    if let Some(line) = report::failures(&cold_failed) {
+        emit(line);
+    }
 
     let t = Instant::now();
-    let warm = probe::phase_breakdown(&mut c0, &tree0, &sample_dirs).await;
+    let (warm, warm_failed) = probe::phase_breakdown(&mut c0, &tree0, &sample_dirs).await;
     let warm_wall = t.elapsed();
     emit("Pass 2 (warm — same dirs, ARC-cached):".to_string());
     emit(report::summarize_phases(&warm, warm_wall));
+    if let Some(line) = report::failures(&warm_failed) {
+        emit(line);
+    }
 
     // ── 3. Large-dir query-buffer sweep ───────────────────────────────────
     emit("\n== Query-buffer sweep (fat dirs, warm) ==".to_string());
@@ -260,6 +266,9 @@ async fn main() {
                 r.err,
                 hi - lo,
             ));
+            if let Some(e) = &r.first_error {
+                emit(format!("          first error: {e}"));
+            }
         }
         primary = one.into_iter().next().unwrap();
     }
@@ -285,6 +294,9 @@ async fn main() {
                 r.ok,
                 r.err,
             ));
+            if let Some(e) = &r.first_error {
+                emit(format!("          first error: {e}"));
+            }
         }
         primary = one.into_iter().next().unwrap();
     }
@@ -341,6 +353,9 @@ async fn main() {
             r.err,
             hi - lo,
         ));
+        if let Some(e) = &r.first_error {
+            emit(format!("          first error: {e}"));
+        }
     }
 
     // 5b. WARM: the ceiling, all dirs ARC-cached.
@@ -362,6 +377,9 @@ async fn main() {
             r.ok,
             r.err,
         ));
+        if let Some(e) = &r.first_error {
+            emit(format!("          first error: {e}"));
+        }
     }
 
     emit(format!("\nFinished {}", chrono::Local::now().to_rfc3339()));

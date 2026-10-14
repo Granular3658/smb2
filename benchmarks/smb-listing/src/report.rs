@@ -33,6 +33,14 @@ pub fn stats_ms(durs: &[Duration]) -> Stats {
     }
 }
 
+/// One line naming how many listings in a pass failed and the first one's
+/// error, or `None` when none did. A pass that quietly drops its failures
+/// reports stats for fewer dirs than it was given, which reads as fine.
+pub fn failures(failed: &[(String, String)]) -> Option<String> {
+    let (dir, error) = failed.first()?;
+    Some(format!("  {} failed, first: {dir}: {error}", failed.len()))
+}
+
 /// Aggregate a serial phase-breakdown pass: per-phase stats plus totals.
 pub fn summarize_phases(traces: &[ListingTrace], wall: Duration) -> String {
     let create: Vec<Duration> = traces.iter().map(|t| t.create).collect();
