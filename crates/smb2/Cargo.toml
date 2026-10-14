@@ -57,7 +57,8 @@ ccm = "0.6.1"
 cmac = "0.8.0"
 digest = "0.11"
 # Constant-time signature comparison. RustCrypto's own crate, already in the tree through aes-gcm, ccm, and digest.
-ctutils = "0.4.2"
+# Capped below 0.4.3, which needs rustc 1.87, for the same reason as `aes` above. Lift it with an MSRV bump to 1.87+.
+ctutils = ">=0.4.2, <0.4.3"
 
 # NTLM authentication (MS-NLMP)
 md-5 = "0.11"
