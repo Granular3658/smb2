@@ -47,11 +47,13 @@ that shouldn't ship, or an `include_str!`/`include_bytes!` that reaches outside 
      can install.
 2. **Update `CHANGELOG.md`** — replace `[Unreleased]` with the new version + ISO date. Keep the keep-a-changelog
    sections (`Added`, `Changed`, `Fixed`, `Notes`). Lead with **Breaking** entries when present.
-3. **Update `crates/smb2/fuzz/Cargo.lock` and `benchmarks/read-ahead/Cargo.lock`** so both see the new version. Edit
-   the `version` line under `name = "smb2"` by hand, then confirm the lockfile still resolves:
+3. **Update `crates/smb2/fuzz/Cargo.lock`, `benchmarks/read-ahead/Cargo.lock`, and `benchmarks/smb-listing/Cargo.lock`**
+   so all three see the new version (`grep -l 'name = "smb2"' benchmarks/*/Cargo.lock` finds any newcomer). Edit the
+   `version` line under `name = "smb2"` by hand, then confirm the lockfile still resolves:
    ```bash
    (cd crates/smb2/fuzz && cargo metadata --locked --format-version 1 >/dev/null)
    (cd benchmarks/read-ahead && cargo metadata --locked --format-version 1 >/dev/null)
+   (cd benchmarks/smb-listing && cargo metadata --locked --format-version 1 >/dev/null)
    ```
    ❌ Don't use `cargo update -p smb2` there: in the fuzz crate it also moves smb2's own dependencies to whatever is
    newest, skipping Renovate's release-age window (seen 2026-09-23: `tokio`, `wasip2`, and nine others).
