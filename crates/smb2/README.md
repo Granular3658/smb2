@@ -369,6 +369,11 @@ For when you want to do one thing and get the result:
 - `client.download(&share, path)`: Streaming download with progress (memory-efficient)
 - `client.upload(&share, path, data)`: Streaming upload with progress
 - `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)
+- `client.create_file_writer(&share, path)`: A writer you push chunks into at your own pace. `writer.flush_checkpoint()`
+  makes everything so far durable without closing it and returns a `WriteCheckpoint` to persist
+- `client.resume_file_writer(&share, path, &checkpoint)`: Carry on an interrupted upload after a crash or a reconnect.
+  It proves the file is still the one the checkpoint names and still that long before writing anything, and refuses
+  with `ErrorKind::ResumeRefused` otherwise (start over then)
 - `client.watch(&share, path, recursive)`: Watch for file changes (CHANGE_NOTIFY). Re-issues its subscription every
   10 minutes (`Connection::set_long_poll_refresh`), so a server that quietly drops one heals itself
 - `client.fs_info(&mut share)`: Disk space (total, free, used)

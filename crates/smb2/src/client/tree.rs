@@ -134,6 +134,9 @@ const FILE_RENAME_INFORMATION: u8 = 10;
 /// FileDispositionInformation class for SET_INFO (MS-FSCC 2.4.11).
 const FILE_DISPOSITION_INFORMATION: u8 = 13;
 
+/// FileEndOfFileInformation class for SET_INFO (MS-FSCC 2.4.14).
+const FILE_END_OF_FILE_INFORMATION: u8 = 20;
+
 /// FileFsFullSizeInformation class for QUERY_INFO (MS-FSCC 2.5.4).
 const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
 
@@ -2373,6 +2376,10 @@ impl Tree {
     /// The natural way to append after a server-side-copied prefix
     /// ([`server_side_copy_range`](Self::server_side_copy_range)) or to patch a
     /// known region of an existing file.
+    ///
+    /// To carry on an interrupted upload, use
+    /// [`resume_file_writer`](Self::resume_file_writer) instead: this one
+    /// trusts that the file is still the one you were writing.
     pub async fn create_file_writer_at(
         self: &Arc<Self>,
         conn: Connection,
@@ -2381,6 +2388,50 @@ impl Tree {
     ) -> Result<super::stream::FileWriter> {
         let conn = self.pinned_conn(&conn);
         super::stream::open_file_writer_at(Arc::clone(self), conn, path, offset).await
+    }
+
+    /// Carry on an interrupted upload from its checkpoint, once the server
+    /// has proven the file is still the one the checkpoint names.
+    ///
+    /// See [`open_file_writer_resume`](super::stream::open_file_writer_resume)
+    /// for what is checked and what each refusal means.
+    pub async fn resume_file_writer(
+        self: &Arc<Self>,
+        conn: Connection,
+        path: &str,
+        checkpoint: &super::stream::WriteCheckpoint,
+    ) -> Result<super::stream::FileWriter> {
+        let conn = self.pinned_conn(&conn);
+        super::stream::open_file_writer_resume(Arc::clone(self), conn, path, checkpoint).await
+    }
+
+    /// Set the length of an open file (SET_INFO `FileEndOfFileInformation`,
+    /// MS-FSCC § 2.4.14), cutting off or zero-extending its end.
+    pub(crate) async fn set_end_of_file(
+        &self,
+        conn: &mut Connection,
+        file_id: FileId,
+        length: u64,
+    ) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
+        trace!("tree: setting end of file to {length}");
+        let req = SetInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_END_OF_FILE_INFORMATION,
+            additional_information: 0,
+            file_id,
+            buffer: length.to_le_bytes().to_vec(),
+        };
+        let frame = conn
+            .execute(Command::SetInfo, &req, Some(self.tree_id))
+            .await?;
+        if frame.header.status != NtStatus::SUCCESS {
+            return Err(Error::Protocol {
+                status: frame.header.status,
+                command: Command::SetInfo,
+            });
+        }
+        Ok(())
     }
 
     /// Create a directory.

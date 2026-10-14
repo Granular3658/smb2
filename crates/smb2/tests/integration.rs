@@ -262,6 +262,70 @@ async fn write_and_read_file_on_nas() {
 /// filesystem (ext4 on mdraid) aren't the Docker fixture's.
 #[tokio::test]
 #[ignore]
+async fn nas_resumes_an_upload_from_its_checkpoint_on_a_new_connection() {
+    // QNAP firmware is Samba underneath, but its own build and filesystem:
+    // this proves it identifies a file on a write handle the way the Docker
+    // fixture does, and gives the same identity back on a new session.
+    let _ = env_logger::try_init();
+
+    let dir = "smb2-test-resume";
+    let path = "smb2-test-resume/upload.bin";
+    let saved = {
+        let (mut conn, tree) = connect_to_nas().await;
+        let _ = tree.delete_file(&mut conn, path).await;
+        let _ = tree.delete_directory(&mut conn, dir).await;
+        tree.create_directory(&mut conn, dir).await.expect("mkdir");
+        let tree = std::sync::Arc::new(tree);
+        let mut writer = tree
+            .create_file_writer(conn.clone(), path)
+            .await
+            .expect("create_file_writer");
+        writer.write_chunk(&[1u8; 300_000]).await.unwrap();
+        let saved = writer.flush_checkpoint().await.expect("checkpoint");
+        writer
+            .write_chunk(b"left behind by the crash")
+            .await
+            .unwrap();
+        writer.flush_checkpoint().await.expect("second checkpoint");
+        // The crash: the writer is never finished and the connection goes.
+        drop(writer);
+        drop(conn);
+        saved
+    };
+    assert_eq!(saved.offset, 300_000);
+    assert!(saved.identity.is_some(), "the QNAP identifies the file");
+
+    let (mut conn, tree) = connect_to_nas().await;
+    let tree = std::sync::Arc::new(tree);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut writer = loop {
+        // The dead session's open shares nothing until the server notices.
+        match tree.resume_file_writer(conn.clone(), path, &saved).await {
+            Err(e)
+                if e.kind() == smb2::ErrorKind::SharingViolation
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other => break other.expect("the same file resumes"),
+        }
+    };
+    writer.write_chunk(&[2u8; 100_000]).await.unwrap();
+    assert_eq!(writer.finish().await.unwrap(), 100_000);
+
+    let data = tree.read_file_pipelined(&mut conn, path).await.unwrap();
+    assert_eq!(data.len(), 400_000, "the crash's tail is trimmed");
+    assert!(data[..300_000].iter().all(|&b| b == 1));
+    assert!(data[300_000..].iter().all(|&b| b == 2));
+
+    tree.delete_file(&mut conn, path).await.expect("cleanup");
+    tree.delete_directory(&mut conn, dir)
+        .await
+        .expect("cleanup");
+}
+
+#[tokio::test]
+#[ignore]
 async fn nas_keeps_the_times_set_on_a_writers_handle() {
     let _ = env_logger::try_init();
 

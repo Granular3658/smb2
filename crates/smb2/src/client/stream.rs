@@ -27,7 +27,7 @@ use crate::client::times::FileTimes;
 use crate::client::tree::{close_outcome, file_info_from_create, FileInfo, Tree};
 pub use crate::client::write_behind::{WriteBehind, UPLOAD_CHUNK_SIZE};
 use crate::client::write_pipe::WritePipe;
-use crate::error::Result;
+use crate::error::{Result, ResumeRefusal};
 use crate::msg::create::CreateDisposition;
 use crate::msg::read::{ReadRequest, ReadResponse, SMB2_CHANNEL_NONE};
 use crate::pack::{ReadCursor, Unpack};
@@ -1166,6 +1166,9 @@ pub struct FileWriter {
     /// How far the file is known to be on disk: set only by a FLUSH that
     /// succeeded after every WRITE before it was confirmed.
     durable_offset: Option<u64>,
+    /// For a resumed writer, the file's length at open when it was longer
+    /// than the checkpoint: `finish` cuts off what's still past its last byte.
+    trim_past: Option<u64>,
 }
 
 /// How far an upload is known to be on the server's disk, and which file it
@@ -1174,7 +1177,7 @@ pub struct FileWriter {
 /// [`FileWriter::flush_checkpoint`] makes one. Persist both fields beside
 /// whatever tracks the source (the offset says how far into it to restart),
 /// and hand them back to
-/// `SmbClient::resume_file_writer`
+/// [`SmbClient::resume_file_writer`](crate::SmbClient::resume_file_writer)
 /// after a crash or a reconnect. A checkpoint is plain data and safe to keep
 /// for as long as you like: the resume proves the file is still the one it
 /// names before writing anything.
@@ -1250,6 +1253,12 @@ pub async fn open_file_writer_exclusive(
 /// [`FileReader`]'s positioned reads — the natural shape for appending after a
 /// server-side-copied prefix, or patching a known region of an existing file.
 ///
+/// It trusts that the file is what you think it is. ❌ Don't resume an
+/// interrupted upload with it: a file replaced, truncated, or deleted
+/// meanwhile becomes a corrupt one (or a fresh one with a hole). Use
+/// [`open_file_writer_resume`] with the [`WriteCheckpoint`] the upload left,
+/// which proves the file first.
+///
 /// `bytes_written()` counts bytes this writer confirmed, not the absolute file
 /// position. `SmbClient::create_file_writer_at` and `Tree::create_file_writer_at`
 /// are thin convenience wrappers.
@@ -1279,6 +1288,120 @@ pub async fn open_file_writer_at(
 
     let (mut writer, _) = open_writer(tree, conn, path, CreateDisposition::FileOpenIf).await?;
     writer.pipe.set_offset(offset);
+    Ok(writer)
+}
+
+/// Carry on an interrupted upload from a [`WriteCheckpoint`], once the server
+/// has proven the file is still the one the checkpoint names and still holds
+/// everything it vouches for.
+///
+/// One round trip, before any byte is written: a CREATE that only opens
+/// (`FileOpen`, never creating), with the file's identity asked in the same
+/// compound and its length read from the CREATE's answer. Every check that
+/// fails closes the handle it opened and returns
+/// [`Error::ResumeRefused`], whose [`ResumeRefusal`] says which:
+///
+/// - **`Missing`**: nothing is at `path`. A fresh file would start with a hole
+///   where the checkpointed bytes were.
+/// - **`Replaced`**: the file at `path` isn't the one the checkpoint names.
+/// - **`IdentityUnavailable`**: the checkpoint has no identity, or the server
+///   won't identify the file now. Nothing could prove it's the same one, so
+///   the resume refuses rather than guess. A checkpoint without an identity is
+///   refused before anything is sent.
+/// - **`Truncated`**: the file is shorter than the checkpoint, so bytes it
+///   vouches for are gone.
+///
+/// Any other error (the network, access denied, a sharing violation) comes
+/// back as itself, so [`Error::is_retryable`](crate::Error::is_retryable)
+/// tells "try the resume again later" from "write the file from the start".
+///
+/// A file LONGER than the checkpoint is expected: WRITEs that landed after it
+/// and before the crash. The writer starts at the checkpoint and overwrites
+/// them, and [`finish`](FileWriter::finish) cuts off whatever is still past
+/// its last byte, so a finished resume holds exactly the checkpointed prefix
+/// plus what this writer wrote, the same file a fresh upload of the same
+/// source would have produced. [`abort`](FileWriter::abort) leaves the file as
+/// it is.
+///
+/// `bytes_written()` counts what this writer wrote, from the checkpoint on.
+/// [`SmbClient::resume_file_writer`](crate::SmbClient::resume_file_writer)
+/// and [`Tree::resume_file_writer`] are the convenience wrappers.
+///
+/// # Example
+///
+/// ```no_run
+/// # async fn example(
+/// #     client: &mut smb2::SmbClient,
+/// #     share: &smb2::Tree,
+/// #     source: &[u8],
+/// #     saved: smb2::WriteCheckpoint,
+/// # ) -> Result<(), smb2::Error> {
+/// let mut writer = match client.resume_file_writer(share, "backup.img", &saved).await {
+///     Ok(writer) => writer,
+///     // Not the file we were writing any more: start over.
+///     Err(e) if e.kind() == smb2::ErrorKind::ResumeRefused => {
+///         client.create_file_writer(share, "backup.img").await?
+///     }
+///     Err(e) => return Err(e),
+/// };
+/// let from = writer.durable_offset().unwrap_or(0) as usize;
+/// writer.write_chunk(&source[from..]).await?;
+/// writer.finish().await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn open_file_writer_resume(
+    tree: Arc<Tree>,
+    conn: Connection,
+    path: &str,
+    checkpoint: &WriteCheckpoint,
+) -> Result<FileWriter> {
+    trace!(
+        "stream: open_file_writer_resume path={} offset={}",
+        path,
+        checkpoint.offset
+    );
+    let refused = |reason| {
+        debug!(
+            "stream: not resuming {path} at {}: {reason}",
+            checkpoint.offset
+        );
+        Error::ResumeRefused {
+            path: path.to_string(),
+            offset: checkpoint.offset,
+            reason,
+        }
+    };
+    let Some(expected) = checkpoint.identity else {
+        return Err(refused(ResumeRefusal::IdentityUnavailable));
+    };
+
+    let (mut writer, length) =
+        match open_writer(tree, conn, path, CreateDisposition::FileOpen).await {
+            Ok(opened) => opened,
+            Err(Error::Protocol {
+                status: NtStatus::OBJECT_NAME_NOT_FOUND | NtStatus::OBJECT_PATH_NOT_FOUND,
+                command: Command::Create,
+            }) => return Err(refused(ResumeRefusal::Missing)),
+            Err(e) => return Err(e),
+        };
+
+    // Identity before length: a different file's length says nothing.
+    let refusal = match writer.identity {
+        None => Some(ResumeRefusal::IdentityUnavailable),
+        Some(found) if found != expected => Some(ResumeRefusal::Replaced),
+        Some(_) if length < checkpoint.offset => Some(ResumeRefusal::Truncated { length }),
+        Some(_) => None,
+    };
+    if let Some(reason) = refusal {
+        // Nothing was written, so nothing is in flight: this is just the CLOSE.
+        writer.abort().await?;
+        return Err(refused(reason));
+    }
+
+    writer.pipe.set_offset(checkpoint.offset);
+    writer.durable_offset = Some(checkpoint.offset);
+    writer.trim_past = (length > checkpoint.offset).then_some(length);
     Ok(writer)
 }
 
@@ -1335,6 +1458,7 @@ impl FileWriter {
             resolved_path: None,
             identity: None,
             durable_offset: None,
+            trim_past: None,
         }
     }
 
@@ -1434,7 +1558,7 @@ impl FileWriter {
     /// Returns the total number of confirmed bytes written. Consumes `self`
     /// to prevent write-after-close at compile time.
     pub async fn finish(mut self) -> Result<u64> {
-        self.flush_all().await?;
+        self.flush_all(true).await?;
         self.tree.close_handle(&mut self.conn, self.file_id).await?;
 
         self.done = true;
@@ -1541,7 +1665,7 @@ impl FileWriter {
     /// SMB2 FLUSH (the server's fsync) on the handle. The returned
     /// [`WriteCheckpoint`] is what an interrupted upload resumes from: persist
     /// it, and after a crash or a reconnect hand it to
-    /// `SmbClient::resume_file_writer`.
+    /// [`SmbClient::resume_file_writer`](crate::SmbClient::resume_file_writer).
     /// The writer stays open, so keep pushing chunks afterwards.
     ///
     /// How often is a trade: each checkpoint costs a round trip plus the
@@ -1562,7 +1686,7 @@ impl FileWriter {
     /// - On an error the offset stays where it was, and so does the handle
     ///   unless the server refused a WRITE.
     pub async fn flush_checkpoint(&mut self) -> Result<WriteCheckpoint> {
-        self.flush_all().await?;
+        self.flush_all(false).await?;
         let offset = self.pipe.offset();
         self.durable_offset = Some(offset);
         trace!("stream: FileWriter checkpoint at {offset}");
@@ -1646,10 +1770,22 @@ impl FileWriter {
     /// Send what's buffered, wait for every WRITE, then FLUSH: everything
     /// [`finish`](Self::finish) and [`flush_checkpoint`](Self::flush_checkpoint)
     /// share. Each step is cancel-safe, so the whole is too.
-    async fn flush_all(&mut self) -> Result<()> {
+    ///
+    /// `last` is `finish`: a resumed writer then cuts off what the crash left
+    /// past its last byte, before the FLUSH so the flush covers the new
+    /// length. ❌ Never at a checkpoint: the caller may still be on its way to
+    /// overwriting that tail.
+    async fn flush_all(&mut self, last: bool) -> Result<()> {
         self.send_pending().await?;
         if let Err(e) = self.pipe.drain().await {
             return Err(self.failed(e).await);
+        }
+        let end = self.pipe.offset();
+        if last && self.trim_past.is_some_and(|old| old > end) {
+            self.tree
+                .set_end_of_file(&mut self.conn, self.file_id, end)
+                .await?;
+            self.trim_past = None;
         }
         // Standalone, so Windows' rule that a compounded op going async must
         // end the chain (AGENTS.md pitfall 33) can't apply.

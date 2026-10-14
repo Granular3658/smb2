@@ -4456,6 +4456,142 @@ async fn guest_a_writer_checkpoint_names_the_file_it_flushed() {
         .expect("disconnect failed");
 }
 
+/// Resume `checkpoint` at `path`, waiting out the moment after a crash when
+/// the dead connection's open still holds the file (a writer shares nothing,
+/// so the server answers `STATUS_SHARING_VIOLATION` until it has noticed).
+async fn resume_after_crash(
+    client: &mut SmbClient,
+    tree: &Tree,
+    path: &str,
+    checkpoint: &smb2::WriteCheckpoint,
+) -> smb2::Result<smb2::FileWriter> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match client.resume_file_writer(tree, path, checkpoint).await {
+            Err(e)
+                if e.kind() == smb2::ErrorKind::SharingViolation
+                    && std::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            other => return other,
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_an_upload_resumes_from_its_checkpoint_after_a_crash() {
+    let _ = env_logger::try_init();
+    let path = "smb2_test_resume_after_crash.bin";
+
+    // Before the crash: a checkpoint at 8, then 12 more bytes that land but
+    // that the persisted checkpoint doesn't cover.
+    let saved = {
+        let mut client = guest_client().await;
+        let tree = client.connect_share("public").await.unwrap();
+        let mut writer = client.create_file_writer(&tree, path).await.unwrap();
+        writer.write_chunk(b"durable-").await.unwrap();
+        let saved = writer.flush_checkpoint().await.unwrap();
+        writer.write_chunk(b"left-behind!").await.unwrap();
+        assert_eq!(writer.flush_checkpoint().await.unwrap().offset, 20);
+        // The crash: neither finished nor aborted, and the whole client goes.
+        drop(writer);
+        drop(client);
+        saved
+    };
+    assert_eq!(saved.offset, 8);
+
+    let mut client = guest_client().await;
+    let mut tree = client.connect_share("public").await.unwrap();
+    let mut writer = resume_after_crash(&mut client, &tree, path, &saved)
+        .await
+        .expect("the same file, long enough, resumes");
+    assert_eq!(writer.durable_offset(), Some(8));
+    writer.write_chunk(b"prefix").await.unwrap();
+    assert_eq!(writer.finish().await.unwrap(), 6);
+
+    assert_eq!(
+        client.read_file(&mut tree, path).await.unwrap(),
+        b"durable-prefix",
+        "the checkpointed prefix, then what the resume wrote, and nothing the crash left past it"
+    );
+    client.delete_file(&tree, path).await.unwrap();
+    client.disconnect_share(&tree).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore]
+async fn guest_a_resume_refuses_a_file_that_changed_under_it() {
+    use smb2::error::ResumeRefusal;
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client.connect_share("public").await.unwrap();
+    let path = "smb2_test_resume_refusals.bin";
+    let other = "smb2_test_resume_refusals.other";
+    let _ = client.delete_file(&tree, other).await;
+
+    let mut writer = client.create_file_writer(&tree, path).await.unwrap();
+    writer.write_chunk(b"0123456789").await.unwrap();
+    let saved = writer.flush_checkpoint().await.unwrap();
+    writer.finish().await.unwrap();
+    let reason = |result: smb2::Result<smb2::FileWriter>| match result {
+        Err(smb2::Error::ResumeRefused { reason, .. }) => reason,
+        Err(e) => panic!("expected ResumeRefused, got {e}"),
+        Ok(_) => panic!("the resume must be refused"),
+    };
+
+    // Truncated in place: the same file, so the same identity, but shorter.
+    client.write_file(&tree, path, b"0123").await.unwrap();
+    assert_eq!(
+        client.resolve(&mut tree, path).await.unwrap().identity,
+        saved.identity,
+        "an overwrite keeps the file"
+    );
+    assert_eq!(
+        reason(client.resume_file_writer(&tree, path, &saved).await),
+        ResumeRefusal::Truncated { length: 4 }
+    );
+
+    // Replaced: another file renamed over it, the same name and a longer
+    // length, so only the identity can tell.
+    client
+        .write_file(&tree, other, b"someone else's file")
+        .await
+        .unwrap();
+    client
+        .rename_with(
+            &tree,
+            other,
+            path,
+            smb2::RenameOptions::new().replace_if_exists(true),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reason(client.resume_file_writer(&tree, path, &saved).await),
+        ResumeRefusal::Replaced
+    );
+    assert_eq!(
+        client.read_file(&mut tree, path).await.unwrap(),
+        b"someone else's file",
+        "nothing was written into it"
+    );
+
+    // Missing: the resume never creates it.
+    client.delete_file(&tree, path).await.unwrap();
+    assert_eq!(
+        reason(client.resume_file_writer(&tree, path, &saved).await),
+        ResumeRefusal::Missing
+    );
+    assert_eq!(
+        client.stat(&mut tree, path).await.unwrap_err().kind(),
+        smb2::ErrorKind::NotFound
+    );
+    client.disconnect_share(&tree).await.unwrap();
+}
+
 #[tokio::test]
 #[ignore]
 async fn guest_compound_write_exclusive_never_replaces_an_existing_file() {

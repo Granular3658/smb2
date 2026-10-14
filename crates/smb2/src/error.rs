@@ -42,6 +42,50 @@ impl std::fmt::Display for DurableLoss {
     }
 }
 
+/// Why an interrupted upload can't carry on from its checkpoint.
+///
+/// All four mean "write the file again from the start" to a caller. They are
+/// told apart so a consumer can say what happened: only
+/// [`Replaced`](Self::Replaced) and [`Truncated`](Self::Truncated) mean
+/// someone else changed the file, and
+/// [`IdentityUnavailable`](Self::IdentityUnavailable) means this server can
+/// never resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResumeRefusal {
+    /// Nothing is at the path any more. The resume never creates a file, since
+    /// a new one would start with a hole where the checkpointed bytes were.
+    Missing,
+    /// A file is at the path, but not the one the checkpoint names: it was
+    /// deleted and recreated, or another file was renamed over it.
+    Replaced,
+    /// Nothing can prove the file is the one the checkpoint names, because
+    /// the server didn't identify it in full, either now or when the
+    /// checkpoint was made (see
+    /// [`WriteCheckpoint::identity`](crate::WriteCheckpoint::identity)).
+    IdentityUnavailable,
+    /// The file is shorter than the checkpoint, so bytes the checkpoint
+    /// vouches for are gone: someone truncated it, or the server lost what it
+    /// had flushed.
+    Truncated {
+        /// The file's length when the resume opened it.
+        length: u64,
+    },
+}
+
+impl std::fmt::Display for ResumeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Missing => f.write_str("the file is gone"),
+            Self::Replaced => f.write_str("a different file is at that path now"),
+            Self::IdentityUnavailable => {
+                f.write_str("the server won't say which file it is, so it can't be proven the same")
+            }
+            Self::Truncated { length } => write!(f, "the file is only {length} bytes now"),
+        }
+    }
+}
+
 /// Top-level error type for SMB2 operations.
 ///
 /// `#[non_exhaustive]`: new variants appear as the crate learns to tell more
@@ -142,6 +186,30 @@ pub enum Error {
         path: String,
         /// Which guarantee did not hold.
         reason: DurableLoss,
+    },
+
+    /// An interrupted upload can't resume from its checkpoint, because the
+    /// file at the path is no longer provably the one it was writing, or no
+    /// longer holds what the checkpoint vouches for.
+    ///
+    /// Returned by
+    /// [`SmbClient::resume_file_writer`](crate::SmbClient::resume_file_writer)
+    /// before any byte is written, with the handle it opened already closed.
+    /// The response is always the same: write the file again from the start.
+    /// `reason` says why, for the person watching the transfer.
+    ///
+    /// Classifies as [`ErrorKind::ResumeRefused`] and is **not** retryable:
+    /// asking again with the same checkpoint can only be refused again. A
+    /// network failure during the resume comes back as that failure instead,
+    /// so `is_retryable` is exactly "try the resume again later".
+    #[error("can't resume the upload to {path} at offset {offset}: {reason}")]
+    ResumeRefused {
+        /// The path the resume opened.
+        path: String,
+        /// The checkpoint's offset.
+        offset: u64,
+        /// Which check failed.
+        reason: ResumeRefusal,
     },
 
     /// A file handle or a [`Tree`](crate::Tree) outlived the session that
@@ -557,6 +625,10 @@ pub enum ErrorKind {
     /// `STATUS_NOT_SUPPORTED`, `STATUS_INVALID_DEVICE_REQUEST`, and
     /// `STATUS_NOT_IMPLEMENTED`.
     Unsupported,
+    /// An interrupted upload can't resume from its checkpoint: write the
+    /// file again from the start. Only [`Error::ResumeRefused`] has it, and
+    /// its `reason` says why.
+    ResumeRefused,
     /// A protocol error not covered by other variants.
     ///
     /// Use [`Error::status()`] to get the raw NTSTATUS code. Some defined
@@ -609,6 +681,7 @@ impl Error {
             // consumer that wants to explain why.
             Error::ReconnectFailed { .. } => ErrorKind::ConnectionLost,
             Error::DurableHandleLost { .. } => ErrorKind::ConnectionLost,
+            Error::ResumeRefused { .. } => ErrorKind::ResumeRefused,
             // The session the handle was opened on is the connection that was
             // lost; the revived one can't use it.
             Error::HandleInvalidated { .. } => ErrorKind::ConnectionLost,

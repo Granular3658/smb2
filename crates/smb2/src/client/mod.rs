@@ -1971,6 +1971,10 @@ impl SmbClient {
     /// `offset`. Use it to append after a server-side-copied prefix (see
     /// [`server_side_copy_range`](Tree::server_side_copy_range)) or to patch a
     /// known region of an existing file.
+    ///
+    /// To carry on an interrupted upload, use
+    /// [`resume_file_writer`](Self::resume_file_writer) instead: this one
+    /// trusts that the file is still the one you were writing.
     pub async fn create_file_writer_at(
         &mut self,
         tree: &Tree,
@@ -1979,6 +1983,37 @@ impl SmbClient {
     ) -> Result<stream::FileWriter> {
         self.beside_tree(tree, path, |conn, tree, path| async move {
             stream::open_file_writer_at(std::sync::Arc::new(tree), conn, &path, offset).await
+        })
+        .await
+        .map(|(writer, _)| writer)
+    }
+
+    /// Carry on an interrupted upload from a checkpoint
+    /// ([`FileWriter::flush_checkpoint`](stream::FileWriter::flush_checkpoint)),
+    /// once the server has proven `path` is still the file it names and still
+    /// holds everything it vouches for.
+    ///
+    /// One round trip, and nothing is written unless every check holds. A
+    /// file that's gone, replaced, shorter than the checkpoint, or that the
+    /// server won't identify is refused with
+    /// [`Error::ResumeRefused`]: write it again
+    /// from the start. Details and an example:
+    /// [`open_file_writer_resume`](stream::open_file_writer_resume).
+    ///
+    /// To patch a region of a file you know about, without any of these
+    /// checks, use [`create_file_writer_at`](Self::create_file_writer_at).
+    ///
+    /// Follows a DFS link like [`create_file_writer`](Self::create_file_writer).
+    pub async fn resume_file_writer(
+        &mut self,
+        tree: &Tree,
+        path: &str,
+        checkpoint: &stream::WriteCheckpoint,
+    ) -> Result<stream::FileWriter> {
+        let checkpoint = *checkpoint;
+        self.beside_tree(tree, path, move |conn, tree, path| async move {
+            stream::open_file_writer_resume(std::sync::Arc::new(tree), conn, &path, &checkpoint)
+                .await
         })
         .await
         .map(|(writer, _)| writer)
@@ -2510,6 +2545,18 @@ mod tests {
     /// Every `SmbClient` method that takes a `Tree` and hands back a handle or
     /// drives the transfer itself, one variant each. The rest go through the
     /// DFS retry wrappers and are covered by the same lookup.
+    /// A checkpoint the resume openers will act on, so they get as far as
+    /// sending their CREATE.
+    fn resumable_checkpoint() -> stream::WriteCheckpoint {
+        stream::WriteCheckpoint::new(
+            10,
+            Some(FileIdentity {
+                volume_serial: 1,
+                index_number: 1,
+            }),
+        )
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum TreeCall {
         Download,
@@ -2520,11 +2567,12 @@ mod tests {
         CreateFileWriter,
         CreateFileWriterExclusive,
         CreateFileWriterAt,
+        ResumeFileWriter,
         WriteFileWithProgress,
     }
 
     impl TreeCall {
-        const ALL: [TreeCall; 9] = [
+        const ALL: [TreeCall; 10] = [
             TreeCall::Download,
             TreeCall::UploadSmall,
             TreeCall::UploadLarge,
@@ -2533,6 +2581,7 @@ mod tests {
             TreeCall::CreateFileWriter,
             TreeCall::CreateFileWriterExclusive,
             TreeCall::CreateFileWriterAt,
+            TreeCall::ResumeFileWriter,
             TreeCall::WriteFileWithProgress,
         ];
 
@@ -2556,6 +2605,10 @@ mod tests {
                     .map(drop),
                 TreeCall::CreateFileWriterAt => client
                     .create_file_writer_at(tree, "f.bin", 10)
+                    .await
+                    .map(drop),
+                TreeCall::ResumeFileWriter => client
+                    .resume_file_writer(tree, "f.bin", &resumable_checkpoint())
                     .await
                     .map(drop),
                 TreeCall::WriteFileWithProgress => client
@@ -2697,13 +2750,14 @@ mod tests {
         CreateFileWriter,
         CreateFileWriterExclusive,
         CreateFileWriterAt,
+        ResumeFileWriter,
         ReadFileWithProgress,
         WriteFileWithProgress,
         WriteFileStreamed,
     }
 
     impl LinkCall {
-        const ALL: [LinkCall; 11] = [
+        const ALL: [LinkCall; 12] = [
             LinkCall::Download,
             LinkCall::UploadSmall,
             LinkCall::UploadLarge,
@@ -2712,6 +2766,7 @@ mod tests {
             LinkCall::CreateFileWriter,
             LinkCall::CreateFileWriterExclusive,
             LinkCall::CreateFileWriterAt,
+            LinkCall::ResumeFileWriter,
             LinkCall::ReadFileWithProgress,
             LinkCall::WriteFileWithProgress,
             LinkCall::WriteFileStreamed,
@@ -2728,7 +2783,8 @@ mod tests {
                 // CREATE + QUERY_INFO (index, volume, class 48).
                 LinkCall::CreateFileWriter
                 | LinkCall::CreateFileWriterExclusive
-                | LinkCall::CreateFileWriterAt => 4,
+                | LinkCall::CreateFileWriterAt
+                | LinkCall::ResumeFileWriter => 4,
                 _ => 1,
             }
         }
@@ -2755,6 +2811,10 @@ mod tests {
                 LinkCall::CreateFileWriterAt => {
                     client.create_file_writer_at(tree, path, 10).await.map(drop)
                 }
+                LinkCall::ResumeFileWriter => client
+                    .resume_file_writer(tree, path, &resumable_checkpoint())
+                    .await
+                    .map(drop),
                 LinkCall::ReadFileWithProgress => client
                     .read_file_with_progress(tree, path, |_| ControlFlow::Continue(()))
                     .await
@@ -3037,6 +3097,7 @@ mod tests {
         send(client.watch(tree, "f", false));
         send(client.open_directory_reader(tree, "f"));
         send(client.create_file_writer(tree, "f"));
+        send(client.resume_file_writer(tree, "f", &resumable_checkpoint()));
         send(client.delete_files(tree, &["f"]));
         send(client.read_file_with_progress(tree, "f", |_| ControlFlow::Continue(())));
     }
