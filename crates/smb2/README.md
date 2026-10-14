@@ -355,6 +355,7 @@ For when you want to do one thing and get the result:
 - `client.delete_files(&share, &paths)`: Delete many files, one result each
 - `client.stat(&mut share, path)`: Get file metadata: size, attributes, and the creation, modification, access, and
   change times (`changed` moves on a metadata-only change that `modified` misses)
+- `client.stat_with_identity(&mut share, path)`: The same, plus the file's `FileIdentity` (index number and volume serial) in the same round trip, to tell "the same file" from "a file with the same name". It matches the identity a `WriteCheckpoint` carries
 - `client.stat_files(&share, &paths)`: Batch stat
 - `client.set_times(&share, path, FileTimes::new().set_modified(t))`: Set a file's timestamps, leaving the ones you
   don't name alone. On a writer you're about to finish, `writer.set_times(...)` instead, so its close can't restamp

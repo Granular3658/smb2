@@ -4456,6 +4456,55 @@ async fn guest_a_writer_checkpoint_names_the_file_it_flushed() {
         .expect("disconnect failed");
 }
 
+#[tokio::test]
+#[ignore]
+async fn guest_stat_with_identity_names_the_same_file_a_writer_checkpoint_does() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    let path = "smb2_test_stat_identity.bin";
+    let other = "smb2_test_stat_identity_other.bin";
+
+    let mut writer = client
+        .create_file_writer(&tree, path)
+        .await
+        .expect("create_file_writer failed");
+    writer.write_chunk(b"identity").await.unwrap();
+    let checkpoint = writer.flush_checkpoint().await.expect("checkpoint failed");
+    writer.finish().await.unwrap();
+    client.write_file(&tree, other, b"other").await.unwrap();
+
+    let (info, first) = client
+        .stat_with_identity(&mut tree, path)
+        .await
+        .expect("stat_with_identity failed");
+    let (_, second) = client.stat_with_identity(&mut tree, path).await.unwrap();
+    let (_, different) = client.stat_with_identity(&mut tree, other).await.unwrap();
+
+    assert_eq!(info.size, 8);
+    let first = first.expect("Samba identifies a file");
+    assert_eq!(second, Some(first), "the same file, asked twice");
+    assert_ne!(different, Some(first), "another file is another identity");
+    assert!(different.is_some());
+    assert_eq!(
+        checkpoint.identity,
+        Some(first),
+        "a stat and the writer that wrote the file agree on which file it is"
+    );
+
+    for p in [path, other] {
+        client.delete_file(&tree, p).await.expect("cleanup failed");
+    }
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
 /// Resume `checkpoint` at `path`, waiting out the moment after a crash when
 /// the dead connection's open still holds the file (a writer shares nothing,
 /// so the server answers `STATUS_SHARING_VIOLATION` until it has noticed).

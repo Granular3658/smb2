@@ -13,6 +13,7 @@ use log::{debug, info, trace, warn};
 use crate::client::connection::{CompoundOp, Connection, Frame, SessionPin, WaiterGuard};
 use crate::client::credits;
 use crate::client::directory::DirectoryReader;
+use crate::client::durable::FileIdentity;
 use crate::client::stream::{FileDownload, Progress};
 use crate::client::write_pipe::WritePipe;
 use crate::error::Result;
@@ -1025,7 +1026,46 @@ impl Tree {
     ///
     /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
     /// QUERY_INFO (FileStandardInformation) + CLOSE as a single compound message.
+    /// To also learn which file the path names, use
+    /// [`stat_with_identity`](Self::stat_with_identity).
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
+        let (info, _) = self.stat_compound(conn, path, false).await?;
+        Ok(info)
+    }
+
+    /// [`stat`](Self::stat), plus which file the path names on the server:
+    /// its [`FileIdentity`] (index number and volume serial), or `None` when
+    /// the server won't say in full.
+    ///
+    /// Still one round trip: the two identity queries ride in the same
+    /// compound, after the metadata ones, so a server that refuses them
+    /// still answers the stat. Use it to compare two paths, or a path now and
+    /// later, for "is this the same file?" (a rename keeps the identity, a
+    /// replace changes it). It's the same identity a
+    /// [`WriteCheckpoint`](crate::WriteCheckpoint) carries for the file it
+    /// wrote. Plain `stat` doesn't ask, so it costs nothing extra.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`stat`](Self::stat) fails with. The identity never fails
+    /// the call.
+    pub async fn stat_with_identity(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+    ) -> Result<(FileInfo, Option<FileIdentity>)> {
+        self.stat_compound(conn, path, true).await
+    }
+
+    /// The compound behind [`stat`](Self::stat) and
+    /// [`stat_with_identity`](Self::stat_with_identity): CREATE, the two
+    /// metadata queries, the identity queries when asked, CLOSE.
+    async fn stat_compound(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        with_identity: bool,
+    ) -> Result<(FileInfo, Option<FileIdentity>)> {
         let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
         trace!("tree: stat (compound) path={}", normalized);
@@ -1038,14 +1078,10 @@ impl Tree {
                 FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
             ),
             file_attributes: 0,
-            share_access: ShareAccess(
-                ShareAccess::FILE_SHARE_READ
-                    | ShareAccess::FILE_SHARE_WRITE
-                    | ShareAccess::FILE_SHARE_DELETE,
-            ),
+            share_access: SHARE_ALL,
             create_disposition: CreateDisposition::FileOpen,
             create_options: 0,
-            name: normalized.clone(),
+            name: normalized,
             create_contexts: vec![],
         };
 
@@ -1071,109 +1107,93 @@ impl Tree {
             input_buffer: vec![],
         };
 
+        let index_req = FileIdentity::index_query();
+        let volume_req = FileIdentity::volume_query();
+
         // CLOSE with sentinel FileId.
         let close_req = CloseRequest {
             flags: 0,
             file_id: FileId::SENTINEL,
         };
 
-        let ops = [
-            CompoundOp {
-                command: Command::Create,
-                body: &create_req,
-                tree_id: Some(self.tree_id),
-                credit_charge: CreditCharge(1),
-            },
-            CompoundOp {
-                command: Command::QueryInfo,
-                body: &basic_req,
-                tree_id: Some(self.tree_id),
-                credit_charge: CreditCharge(1),
-            },
-            CompoundOp {
-                command: Command::QueryInfo,
-                body: &std_req,
-                tree_id: Some(self.tree_id),
-                credit_charge: CreditCharge(1),
-            },
-            CompoundOp {
-                command: Command::Close,
-                body: &close_req,
-                tree_id: Some(self.tree_id),
-                credit_charge: CreditCharge(1),
-            },
+        let op = |command, body| CompoundOp {
+            command,
+            body,
+            tree_id: Some(self.tree_id),
+            credit_charge: CreditCharge(1),
+        };
+        // The optional identity queries go after the required ones (AGENTS.md
+        // pitfall 31): a server that fails every related op after a failed
+        // one (MS-SMB2 § 3.3.5.2.7.2) can then only take the CLOSE with them.
+        let mut ops = vec![
+            op(Command::Create, &create_req),
+            op(Command::QueryInfo, &basic_req),
+            op(Command::QueryInfo, &std_req),
         ];
+        if with_identity {
+            ops.push(op(Command::QueryInfo, &index_req));
+            ops.push(op(Command::QueryInfo, &volume_req));
+        }
+        ops.push(op(Command::Close, &close_req));
 
         let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
-
-        let create_header = &responses[0].header;
-        let create_body = &responses[0].body;
-        let basic_header = &responses[1].header;
-        let basic_body = &responses[1].body;
-        let std_header = &responses[2].header;
-        let std_body = &responses[2].body;
-        let close_header = &responses[3].header;
+        let (create, basic, std, close) = (
+            &responses[0],
+            &responses[1],
+            &responses[2],
+            &responses[responses.len() - 1],
+        );
 
         // If CREATE failed, all ops cascade. No handle to clean up.
-        if create_header.status != NtStatus::SUCCESS {
+        if create.header.status != NtStatus::SUCCESS {
             return Err(Error::Protocol {
-                status: create_header.status,
+                status: create.header.status,
                 command: Command::Create,
             });
         }
 
-        // Check first QUERY_INFO (basic). If it failed, issue standalone CLOSE.
-        if !basic_header.status.is_success_or_partial() {
-            let mut cursor = ReadCursor::new(create_body);
-            let create_resp = CreateResponse::unpack(&mut cursor)?;
-            warn!(
-                "tree: compound QUERY_INFO (basic) failed ({:?}), issuing standalone CLOSE",
-                basic_header.status
-            );
-            let _ = self.close_handle(conn, create_resp.file_id).await;
-            return Err(Error::Protocol {
-                status: basic_header.status,
-                command: Command::QueryInfo,
-            });
-        }
-        if basic_header.status == NtStatus::BUFFER_OVERFLOW {
-            warn!("recv: STATUS_BUFFER_OVERFLOW on FileBasicInformation, response data may be truncated");
-        }
-
-        // Check second QUERY_INFO (standard). If it failed, issue standalone CLOSE.
-        if !std_header.status.is_success_or_partial() {
-            let mut cursor = ReadCursor::new(create_body);
-            let create_resp = CreateResponse::unpack(&mut cursor)?;
-            warn!(
-                "tree: compound QUERY_INFO (standard) failed ({:?}), issuing standalone CLOSE",
-                std_header.status
-            );
-            let _ = self.close_handle(conn, create_resp.file_id).await;
-            return Err(Error::Protocol {
-                status: std_header.status,
-                command: Command::QueryInfo,
-            });
-        }
-        if std_header.status == NtStatus::BUFFER_OVERFLOW {
-            warn!("recv: STATUS_BUFFER_OVERFLOW on FileStandardInformation, response data may be truncated");
-        }
-
-        let info = file_info_from(basic_body, std_body)?;
-
-        // Check CLOSE response (non-fatal, we already have the data).
-        if close_header.status != NtStatus::SUCCESS {
+        // A CLOSE that didn't succeed left the handle open, most often because
+        // a query ahead of it failed and the server cascaded that failure.
+        if close.header.status != NtStatus::SUCCESS {
+            let file_id = CreateResponse::unpack(&mut ReadCursor::new(&create.body))?.file_id;
             debug!(
-                "tree: compound CLOSE returned {:?} (non-fatal, stat data already read)",
-                close_header.status,
+                "tree: stat's compound CLOSE returned {:?}, closing standalone",
+                close.header.status
             );
+            let _ = self.close_handle(conn, file_id).await;
         }
+
+        for (frame, what) in [(basic, "basic"), (std, "standard")] {
+            if !frame.header.status.is_success_or_partial() {
+                warn!(
+                    "tree: compound QUERY_INFO ({}) failed ({:?})",
+                    what, frame.header.status
+                );
+                return Err(Error::Protocol {
+                    status: frame.header.status,
+                    command: Command::QueryInfo,
+                });
+            }
+            if frame.header.status == NtStatus::BUFFER_OVERFLOW {
+                warn!("recv: STATUS_BUFFER_OVERFLOW on QUERY_INFO ({what}), response data may be truncated");
+            }
+        }
+
+        let info = file_info_from(&basic.body, &std.body)?;
+        let identity = if with_identity {
+            FileIdentity::from_frames(Some(&responses[3]), Some(&responses[4]))
+                .filter(FileIdentity::is_proof)
+        } else {
+            None
+        };
 
         trace!(
-            "tree: stat done, size={}, is_dir={}",
+            "tree: stat done, size={}, is_dir={}, identity={:?}",
             info.size,
-            info.is_directory
+            info.is_directory,
+            identity
         );
-        Ok(info)
+        Ok((info, identity))
     }
 
     /// Stat multiple files, one compound request each.
@@ -4078,7 +4098,7 @@ mod tests {
     }
 
     use crate::client::test_helpers::{
-        build_query_info_error_response, build_query_info_response,
+        build_close_error_response, build_query_info_error_response, build_query_info_response,
         build_query_info_response_with_status, build_set_info_response,
     };
 
@@ -4552,6 +4572,183 @@ mod tests {
         assert!(result.is_err());
         // Compound frame + standalone CLOSE = 2 messages sent.
         assert_eq!(mock.sent_count(), 2);
+    }
+
+    // ── Stat with identity ──────────────────────────────────────────
+
+    /// Every sub-request of the compound `mock` sent `index`-th: its command,
+    /// and for a QUERY_INFO the info type and class it asked for.
+    fn sent_compound(mock: &MockTransport, index: usize) -> Vec<(Command, Option<(InfoType, u8)>)> {
+        let sent = mock.sent_message(index).unwrap();
+        let mut ops = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let mut cursor = ReadCursor::new(&sent[offset..]);
+            let header = Header::unpack(&mut cursor).unwrap();
+            let class = (header.command == Command::QueryInfo).then(|| {
+                let req = QueryInfoRequest::unpack(&mut cursor).unwrap();
+                (req.info_type, req.file_info_class)
+            });
+            ops.push((header.command, class));
+            if header.next_command == 0 {
+                return ops;
+            }
+            offset += header.next_command as usize;
+        }
+    }
+
+    const STAT_FILE: FileId = FileId {
+        persistent: 0xEE,
+        volatile: 0xFF,
+    };
+
+    fn stat_tree() -> Tree {
+        Tree {
+            pin: None,
+            tree_id: TreeId(10),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+            dfs_origin: None,
+        }
+    }
+
+    fn stat_basic() -> Vec<u8> {
+        build_query_info_response(build_file_basic_info(1, 2, 3, 4, 0x20))
+    }
+
+    fn stat_standard() -> Vec<u8> {
+        build_query_info_response(build_file_standard_info(4096, 2048, 1, false, false))
+    }
+
+    fn index_answer(n: u64) -> Vec<u8> {
+        build_query_info_response(n.to_le_bytes().to_vec())
+    }
+
+    /// `FileFsVolumeInformation`: creation time, then the serial.
+    fn volume_answer(serial: u32) -> Vec<u8> {
+        let mut out = vec![0u8; 8];
+        out.extend_from_slice(&serial.to_le_bytes());
+        out.extend_from_slice(&[0u8; 6]);
+        build_query_info_response(out)
+    }
+
+    const BASIC: Option<(InfoType, u8)> = Some((InfoType::File, FILE_BASIC_INFORMATION));
+    const STANDARD: Option<(InfoType, u8)> = Some((InfoType::File, FILE_STANDARD_INFORMATION));
+
+    #[tokio::test]
+    async fn plain_stat_stays_four_ops_with_no_identity_query() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            stat_basic(),
+            stat_standard(),
+            build_close_response(),
+        ]));
+        let mut conn = setup_connection(&mock);
+        stat_tree().stat(&mut conn, "doc.txt").await.unwrap();
+
+        assert_eq!(
+            sent_compound(&mock, 0),
+            vec![
+                (Command::Create, None),
+                (Command::QueryInfo, BASIC),
+                (Command::QueryInfo, STANDARD),
+                (Command::Close, None),
+            ]
+        );
+        assert_eq!(mock.sent_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stat_with_identity_asks_for_it_after_the_metadata_in_one_compound() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            stat_basic(),
+            stat_standard(),
+            index_answer(0x77),
+            volume_answer(0xBEEF),
+            build_close_response(),
+        ]));
+        let mut conn = setup_connection(&mock);
+        let (info, identity) = stat_tree()
+            .stat_with_identity(&mut conn, "doc.txt")
+            .await
+            .unwrap();
+
+        assert_eq!((info.size, info.changed), (2048, FileTime(4)));
+        assert_eq!(
+            identity,
+            Some(FileIdentity {
+                volume_serial: 0xBEEF,
+                index_number: 0x77,
+            })
+        );
+        // Pitfall 31: the optional queries go after the required ones, so a
+        // server that cascades a refusal can't take the metadata down.
+        assert_eq!(
+            sent_compound(&mock, 0),
+            vec![
+                (Command::Create, None),
+                (Command::QueryInfo, BASIC),
+                (Command::QueryInfo, STANDARD),
+                (Command::QueryInfo, Some((InfoType::File, 6))),
+                (Command::QueryInfo, Some((InfoType::Filesystem, 1))),
+                (Command::Close, None),
+            ]
+        );
+        assert_eq!(mock.sent_count(), 1, "one round trip");
+    }
+
+    #[tokio::test]
+    async fn a_refused_identity_still_stats_and_closes_the_handle_the_cascade_left_open() {
+        // MS-SMB2 § 3.3.5.2.7.2: a server may fail every related op after a
+        // failed one, CLOSE included, which leaves the handle open.
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            stat_basic(),
+            stat_standard(),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
+            build_close_error_response(NtStatus::NOT_SUPPORTED),
+        ]));
+        mock.queue_response(build_close_response());
+        let mut conn = setup_connection(&mock);
+        let (info, identity) = stat_tree()
+            .stat_with_identity(&mut conn, "doc.txt")
+            .await
+            .unwrap();
+
+        assert_eq!(info.size, 2048);
+        assert_eq!(identity, None);
+        assert_eq!(mock.sent_count(), 2, "compound + standalone CLOSE");
+        assert_eq!(sent_compound(&mock, 1), vec![(Command::Close, None)]);
+    }
+
+    #[tokio::test]
+    async fn an_identity_with_either_half_zero_is_none() {
+        // The same rule a checkpoint uses (`FileIdentity::is_proof`), so a
+        // stat's identity and a writer's for the same file compare equal.
+        for (index, serial) in [(0x77, 0), (0, 0xBEEF), (0, 0)] {
+            let mock = Arc::new(MockTransport::new());
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(STAT_FILE, 0),
+                stat_basic(),
+                stat_standard(),
+                index_answer(index),
+                volume_answer(serial),
+                build_close_response(),
+            ]));
+            let mut conn = setup_connection(&mock);
+            let (_, identity) = stat_tree()
+                .stat_with_identity(&mut conn, "doc.txt")
+                .await
+                .unwrap();
+            assert_eq!(identity, None, "index {index:#x}, serial {serial:#x}");
+        }
     }
 
     // ── Batch stat tests ──────────────────────────────────────────────

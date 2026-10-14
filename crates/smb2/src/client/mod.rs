@@ -1591,6 +1591,23 @@ impl SmbClient {
         .map(|(value, _)| value)
     }
 
+    /// [`stat`](Self::stat), plus the file's [`FileIdentity`] in the same
+    /// round trip, or `None` when the server won't say in full. See
+    /// [`Tree::stat_with_identity`].
+    ///
+    /// Follows a DFS link and replays after a reconnect, like `stat`.
+    pub async fn stat_with_identity(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+    ) -> Result<(FileInfo, Option<FileIdentity>)> {
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.stat_with_identity(&mut conn, &path).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
     /// Ask the server which file `path` names, and what it calls it: the
     /// stored path (case and 8.3 aliases resolved), the metadata `stat`
     /// returns, and the file's identity. See [`Tree::resolve`].
