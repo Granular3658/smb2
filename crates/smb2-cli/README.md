@@ -85,6 +85,8 @@ smb2 rm //raspi/PiHDD/junk.txt
 smb2 rmdir //raspi/PiHDD/empty-dir
 ```
 
+`ls` prints as the server answers, a batch of a few hundred entries at a time, in the order the server lists them. So a folder of 100,000 files starts showing up after one round trip, and `smb2 ls … | head` stops listing as soon as `head` has enough. Pass `--sort` to get the rows sorted by path instead; that waits for the whole listing first. `--json` is always sorted, since a JSON array is only useful once it's complete. `-R` lists each directory to the end before going into its subdirectories. Measured against a QNAP NAS on a LAN, `ls -R` over 15,250 photos printed its first line after 0.15 s instead of 7.6 s, and finished in the same time as before.
+
 `stat` shows four times: created, modified, accessed, and changed. `changed` moves on any change to the file, its attributes and timestamps included, so it catches an edit `modified` doesn't. `ls --json` carries `changed` too.
 
 `realpath` prints the path the way the server stores it: its casing, and long names in place of 8.3 aliases like `PROGRA~1`. It needs SMB 3.1.1 (Samba, or Windows 10 / Server v1803 and later) and says so when the server can't answer.

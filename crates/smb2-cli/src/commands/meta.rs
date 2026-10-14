@@ -2,17 +2,35 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use smb2::{DirectoryEntry, SmbClient, Tree};
 
 use crate::auth::Credentials;
 use crate::output;
 use crate::pool::{self, Job, Outcome};
 use crate::target::Target;
 
+/// How `ls` prints its rows.
+#[derive(Clone, Copy)]
+pub struct LsFormat {
+    /// `-l`: type, size, and modification time before the name.
+    pub long: bool,
+    /// `-R`: descend into subdirectories, and print share-relative paths.
+    pub recursive: bool,
+    /// `--sort`: wait for the whole listing and sort it by path.
+    pub sort: bool,
+}
+
+/// List a directory.
+///
+/// Text output streams: each server batch is printed as it arrives, in the
+/// server's order, so the first rows of a 100,000-entry folder show up after
+/// one round trip and `| head` stops the listing early. `--sort` and `--json`
+/// wait for everything and sort by path; a JSON array is no use to a parser
+/// until its last row anyway, and a stable order keeps it diffable.
 pub async fn ls(
     target: &Target,
     credentials: &Credentials,
-    long: bool,
-    recursive: bool,
+    format: LsFormat,
     as_json: bool,
 ) -> Result<()> {
     let (mut client, mut tree) = pool::connect_all(target, credentials, 1)
@@ -20,26 +38,38 @@ pub async fn ls(
         .pop()
         .expect("connect_all returns one connection");
 
+    let result = if format.sort || as_json {
+        ls_sorted(&mut client, &mut tree, target, format, as_json).await
+    } else {
+        ls_streaming(&mut client, &mut tree, target, format).await
+    };
+
+    let _ = client.disconnect_share(&tree).await;
+    result
+}
+
+/// Every row, then sorted output.
+async fn ls_sorted(
+    client: &mut SmbClient,
+    tree: &mut Tree,
+    target: &Target,
+    format: LsFormat,
+    as_json: bool,
+) -> Result<()> {
     let mut pending = vec![target.path.clone()];
     let mut rows = Vec::new();
     while let Some(path) = pending.pop() {
         let entries = client
-            .list_directory(&mut tree, &path)
+            .list_directory(tree, &path)
             .await
             .with_context(|| format!("listing {}", target.with_path(&path).display()))?;
         for entry in entries {
-            if entry.name == "." || entry.name == ".." {
-                continue;
+            if let Some(full) = child_path(&path, &entry) {
+                if format.recursive && entry.is_directory {
+                    pending.push(full.clone());
+                }
+                rows.push((full, entry));
             }
-            let full = if path.is_empty() {
-                entry.name.clone()
-            } else {
-                format!("{path}/{}", entry.name)
-            };
-            if recursive && entry.is_directory {
-                pending.push(full.clone());
-            }
-            rows.push((full, entry));
         }
     }
     rows.sort_by(|a, b| a.0.cmp(&b.0));
@@ -60,25 +90,101 @@ pub async fn ls(
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&items)?);
-    } else {
-        for (path, entry) in &rows {
-            let name = if recursive { path } else { &entry.name };
-            if long {
-                println!(
-                    "{}  {:>15}  {}  {}",
-                    if entry.is_directory { "d" } else { "-" },
-                    output::bytes(entry.size),
-                    output::timestamp(entry.modified),
-                    name,
-                );
-            } else {
-                println!("{name}");
+        return Ok(());
+    }
+    let mut text = String::new();
+    for (path, entry) in &rows {
+        push_row(&mut text, path, entry, format);
+    }
+    match write_stdout(&text) {
+        Err(error) if error.kind() != std::io::ErrorKind::BrokenPipe => Err(error.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Each batch printed as it arrives. A recursive walk lists a directory to
+/// the end before descending, so one reader is open at a time.
+async fn ls_streaming(
+    client: &mut SmbClient,
+    tree: &mut Tree,
+    target: &Target,
+    format: LsFormat,
+) -> Result<()> {
+    let mut pending = vec![target.path.clone()];
+    while let Some(path) = pending.pop() {
+        let listing = || format!("listing {}", target.with_path(&path).display());
+        let mut reader = client
+            .open_directory_reader(tree, &path)
+            .await
+            .with_context(listing)?;
+        let mut subdirectories = Vec::new();
+        // An error closes the reader by itself.
+        while let Some(batch) = reader.next_batch().await.with_context(listing)? {
+            let mut text = String::new();
+            for entry in &batch {
+                if let Some(full) = child_path(&path, entry) {
+                    push_row(&mut text, &full, entry, format);
+                    if format.recursive && entry.is_directory {
+                        subdirectories.push(full);
+                    }
+                }
+            }
+            if let Err(error) = write_stdout(&text) {
+                // `| head` has what it wanted: stop listing, quietly.
+                let _ = reader.close().await;
+                return match error.kind() {
+                    std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(error.into()),
+                };
             }
         }
+        // Reversed onto the stack, so subdirectories come out in the order
+        // the server listed them.
+        pending.extend(subdirectories.into_iter().rev());
     }
-
-    let _ = client.disconnect_share(&tree).await;
     Ok(())
+}
+
+/// The share-relative path of `entry` inside `parent`, or `None` for `.` and
+/// `..`.
+fn child_path(parent: &str, entry: &DirectoryEntry) -> Option<String> {
+    if entry.name == "." || entry.name == ".." {
+        return None;
+    }
+    Some(if parent.is_empty() {
+        entry.name.clone()
+    } else {
+        format!("{parent}/{}", entry.name)
+    })
+}
+
+/// One text row. The columns are fixed-width, so a row never depends on the
+/// rows around it, which is what lets `-l` stream.
+fn push_row(text: &mut String, path: &str, entry: &DirectoryEntry, format: LsFormat) {
+    use std::fmt::Write;
+    let name = if format.recursive { path } else { &entry.name };
+    if format.long {
+        let _ = writeln!(
+            text,
+            "{}  {:>15}  {}  {}",
+            if entry.is_directory { "d" } else { "-" },
+            output::bytes(entry.size),
+            output::timestamp(entry.modified),
+            name,
+        );
+    } else {
+        let _ = writeln!(text, "{name}");
+    }
+}
+
+/// Write `text` to stdout and flush it, so a batch shows up as soon as it's
+/// listed and not when a buffer fills. Errors come back (a closed pipe is
+/// `BrokenPipe`) where `print!` would panic.
+fn write_stdout(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
 }
 
 pub async fn stat(

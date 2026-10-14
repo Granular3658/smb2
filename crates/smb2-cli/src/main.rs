@@ -44,7 +44,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List a directory.
+    /// List a directory, printing entries in the server's order as they arrive.
     Ls {
         /// Target like //host/share/path.
         target: String,
@@ -54,6 +54,10 @@ enum Commands {
         /// Descend into subdirectories.
         #[arg(short = 'R', long)]
         recursive: bool,
+        /// Sort by path. Waits for the whole listing before printing anything.
+        /// `--json` is always sorted.
+        #[arg(long)]
+        sort: bool,
     },
     /// Show metadata for one or more paths.
     Stat {
@@ -142,9 +146,15 @@ async fn main() -> Result<()> {
             target,
             long,
             recursive,
+            sort,
         } => {
             let target = Target::parse(target)?;
-            commands::meta::ls(&target, &credentials, *long, *recursive, cli.json).await
+            let format = commands::meta::LsFormat {
+                long: *long,
+                recursive: *recursive,
+                sort: *sort,
+            };
+            commands::meta::ls(&target, &credentials, format, cli.json).await
         }
         Commands::Stat {
             targets,

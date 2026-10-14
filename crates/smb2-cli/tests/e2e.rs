@@ -929,6 +929,70 @@ fn mv_refuses_to_cross_shares() {
     assert!(stderr.contains("within one share"), "{stderr:?}");
 }
 
+// ── ls ───────────────────────────────────────────────────────────────
+
+/// Lines as a sorted list, for comparing listings whose order isn't promised.
+fn sorted_lines(stdout: &str) -> Vec<String> {
+    let mut lines: Vec<String> = stdout.lines().map(str::to_string).collect();
+    lines.sort();
+    lines
+}
+
+/// `ls` prints in the server's order as batches arrive; `--sort` waits for
+/// the whole listing and sorts by path. Both list exactly the same rows, in
+/// every mode.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn ls_streams_in_server_order_and_sorts_on_request() {
+    let share = Fixture::new("ls-order");
+    // Written in an order no sort produces, so a sorted listing can't be an
+    // accident of creation order.
+    for name in ["m.txt", "b.txt", "z.txt", "a.txt", "k.txt"] {
+        share.write(name, b"x");
+    }
+    share.mkdir("sub");
+    share.write("sub/inner.txt", b"y");
+
+    for flags in [&[][..], &["-l"], &["-R"], &["-l", "-R"]] {
+        let mut args: Vec<&str> = vec!["ls"];
+        args.extend_from_slice(flags);
+        let target = share.target("");
+        args.push(&target);
+        let streamed = ok(&args);
+
+        args.insert(1, "--sort");
+        let sorted = ok(&args);
+
+        assert_eq!(
+            sorted_lines(&streamed),
+            sorted_lines(&sorted),
+            "`ls {flags:?}` and `ls --sort {flags:?}` list different rows"
+        );
+        // `-l` rows start with the type column, so sort on the name, which
+        // is the last field.
+        let names: Vec<&str> = sorted
+            .lines()
+            .map(|line| line.rsplit(' ').next().unwrap())
+            .collect();
+        let mut expected = names.clone();
+        expected.sort();
+        assert_eq!(names, expected, "`ls --sort {flags:?}` isn't sorted");
+    }
+
+    let plain = ok(&["ls", "--sort", &share.target("")]);
+    assert_eq!(
+        plain.lines().collect::<Vec<_>>(),
+        ["a.txt", "b.txt", "k.txt", "m.txt", "sub", "z.txt"]
+    );
+    let recursive = ok(&["ls", "-R", &share.target("")]);
+    assert!(
+        recursive
+            .lines()
+            .any(|line| line == share.path("sub/inner.txt")),
+        "{recursive}"
+    );
+}
+
 // ── JSON, which is the contract ──────────────────────────────────────
 
 /// `--json` keys are a breaking change to touch, so they get asserted by name.
