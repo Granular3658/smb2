@@ -210,6 +210,24 @@ impl Server {
         runtime.block_on(async { kind_of(client, tree, path).await })
     }
 
+    /// The file's index number, as `stat_with_identity` reports it.
+    fn index_number(&mut self, path: &str) -> u64 {
+        let Self {
+            runtime,
+            client,
+            tree,
+        } = self;
+        runtime.block_on(async {
+            client
+                .stat_with_identity(tree, path)
+                .await
+                .unwrap_or_else(|error| panic!("stat {path}: {error}"))
+                .1
+                .unwrap_or_else(|| panic!("no identity for {path}"))
+                .index_number
+        })
+    }
+
     /// The names directly inside `path`, sorted, without `.` and `..`.
     fn names(&mut self, path: &str) -> Vec<String> {
         let Self {
@@ -324,6 +342,10 @@ impl Fixture {
 
     fn names(&self, relative: &str) -> Vec<String> {
         server().names(&self.path(relative))
+    }
+
+    fn index_number(&self, relative: &str) -> u64 {
+        server().index_number(&self.path(relative))
     }
 }
 
@@ -991,6 +1013,49 @@ fn ls_streams_in_server_order_and_sorts_on_request() {
             .any(|line| line == share.path("sub/inner.txt")),
         "{recursive}"
     );
+}
+
+/// `ls -i` shows each entry's index number, the one the server reports for
+/// that file on its own, in both forms; without `-i`, JSON has no such key.
+#[test]
+#[ignore = "needs the smb-auth container"]
+fn ls_i_shows_the_index_number_the_server_reports_for_each_file() {
+    let share = Fixture::new("ls-index");
+    share.write("a.txt", b"a");
+    share.mkdir("sub");
+    let expected = [
+        ("a.txt", share.index_number("a.txt")),
+        ("sub", share.index_number("sub")),
+    ];
+
+    let items: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(&["--json", "ls", "-i", &share.target("")])).unwrap();
+    for (name, index) in expected {
+        let item = items.iter().find(|i| i["name"] == name).unwrap();
+        assert_eq!(item["indexNumber"], index, "{item:#?}");
+    }
+    let plain: Vec<serde_json::Value> =
+        serde_json::from_str(&ok(&["--json", "ls", &share.target("")])).unwrap();
+    assert!(plain.iter().all(|i| i.get("indexNumber").is_none()));
+
+    for flags in [&["-i"][..], &["-i", "-l"]] {
+        let mut args = vec!["ls"];
+        args.extend_from_slice(flags);
+        let target = share.target("");
+        args.push(&target);
+        let text = ok(&args);
+        for (name, index) in expected {
+            let line = text
+                .lines()
+                .find(|line| line.ends_with(&format!(" {name}")))
+                .unwrap_or_else(|| panic!("{name} missing from:\n{text}"));
+            assert!(
+                line.split_whitespace()
+                    .any(|field| field == index.to_string()),
+                "`ls {flags:?}`: {index} missing from {line:?}"
+            );
+        }
+    }
 }
 
 // ── JSON, which is the contract ──────────────────────────────────────

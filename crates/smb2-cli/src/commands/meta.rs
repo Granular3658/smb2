@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::json;
-use smb2::{DirectoryEntry, SmbClient, Tree};
+use smb2::{DirectoryEntry, ListOptions, SmbClient, Tree};
 
 use crate::auth::Credentials;
 use crate::output;
@@ -18,6 +18,17 @@ pub struct LsFormat {
     pub recursive: bool,
     /// `--sort`: wait for the whole listing and sort it by path.
     pub sort: bool,
+    /// `-i`: each entry's index number (the file system's file ID), before
+    /// the rest of the row.
+    pub index: bool,
+}
+
+impl LsFormat {
+    /// What to ask the server for: index numbers only when they're shown, so
+    /// a plain `ls` sends exactly the default listing.
+    fn list_options(self) -> ListOptions {
+        ListOptions::new().index_numbers(self.index)
+    }
 }
 
 /// List a directory.
@@ -60,7 +71,7 @@ async fn ls_sorted(
     let mut rows = Vec::new();
     while let Some(path) = pending.pop() {
         let entries = client
-            .list_directory(tree, &path)
+            .list_directory_with(tree, &path, format.list_options())
             .await
             .with_context(|| format!("listing {}", target.with_path(&path).display()))?;
         for entry in entries {
@@ -78,7 +89,7 @@ async fn ls_sorted(
         let items: Vec<_> = rows
             .iter()
             .map(|(path, entry)| {
-                json!({
+                let mut item = json!({
                     "path": path,
                     "name": entry.name,
                     "isDirectory": entry.is_directory,
@@ -86,7 +97,12 @@ async fn ls_sorted(
                     "modified": output::unix_seconds(entry.modified),
                     "created": output::unix_seconds(entry.created),
                     "changed": output::unix_seconds(entry.changed),
-                })
+                });
+                if format.index {
+                    // `null` when the server has no file ID for it.
+                    item["indexNumber"] = json!(entry.index_number);
+                }
+                item
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&items)?);
@@ -114,7 +130,7 @@ async fn ls_streaming(
     while let Some(path) = pending.pop() {
         let listing = || format!("listing {}", target.with_path(&path).display());
         let mut reader = client
-            .open_directory_reader(tree, &path)
+            .open_directory_reader_with(tree, &path, format.list_options())
             .await
             .with_context(listing)?;
         let mut subdirectories = Vec::new();
@@ -163,6 +179,14 @@ fn child_path(parent: &str, entry: &DirectoryEntry) -> Option<String> {
 fn push_row(text: &mut String, path: &str, entry: &DirectoryEntry, format: LsFormat) {
     use std::fmt::Write;
     let name = if format.recursive { path } else { &entry.name };
+    if format.index {
+        // Fixed width like the other columns, so a row still never waits on
+        // the rest. A longer number widens only its own row.
+        let index = entry
+            .index_number
+            .map_or_else(|| "-".to_string(), |n| n.to_string());
+        let _ = write!(text, "{index:>12}  ");
+    }
     if format.long {
         let _ = writeln!(
             text,

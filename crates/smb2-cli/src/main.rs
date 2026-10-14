@@ -58,6 +58,10 @@ enum Commands {
         /// `--json` is always sorted.
         #[arg(long)]
         sort: bool,
+        /// Show each entry's index number (the file system's file ID, like an
+        /// inode number), or `-` when the server has none.
+        #[arg(short = 'i', long = "inode")]
+        index: bool,
     },
     /// Show metadata for one or more paths.
     Stat {
@@ -147,12 +151,14 @@ async fn main() -> Result<()> {
             long,
             recursive,
             sort,
+            index,
         } => {
             let target = Target::parse(target)?;
             let format = commands::meta::LsFormat {
                 long: *long,
                 recursive: *recursive,
                 sort: *sort,
+                index: *index,
             };
             commands::meta::ls(&target, &credentials, format, cli.json).await
         }
