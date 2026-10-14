@@ -294,7 +294,8 @@ struct EmbeddedFile {
     relative_path: &'static str,
     /// File contents.
     contents: &'static str,
-    /// Whether the file should be executable (shell scripts).
+    /// Whether the file should be executable (shell scripts). Only Unix has the mode bit to set.
+    #[cfg_attr(not(unix), allow(dead_code))]
     executable: bool,
 }
 
