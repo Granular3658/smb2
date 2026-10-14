@@ -5,6 +5,16 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.29.1] - 2026-10-14
+
+### Fixed
+
+- **A project on Rust 1.85 or 1.86 builds again.** `ctutils` 0.4.3, a patch release, raised its minimum Rust to 1.87, and a fresh resolve picked it up unless the project declared its own `rust-version`. `ctutils` is now capped below 0.4.3, the way `aes` is capped for the same reason.
+
+### Changed
+
+- Dependencies updated: `futures-util` 0.3.34, `log` 0.4.34, `thiserror` 2.0.21, `tokio` 1.53.2.
+
 ## [0.29.0] - 2026-10-14
 
 ### Breaking
