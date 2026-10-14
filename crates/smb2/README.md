@@ -353,7 +353,8 @@ For when you want to do one thing and get the result:
 - `client.write_file(&share, path, data)`: Upload a file
 - `client.delete_file(&share, path)`: Delete a file
 - `client.delete_files(&share, &paths)`: Delete many files, one result each
-- `client.stat(&mut share, path)`: Get file metadata
+- `client.stat(&mut share, path)`: Get file metadata: size, attributes, and the creation, modification, access, and
+  change times (`changed` moves on a metadata-only change that `modified` misses)
 - `client.stat_files(&share, &paths)`: Batch stat
 - `client.set_times(&share, path, FileTimes::new().set_modified(t))`: Set a file's timestamps, leaving the ones you
   don't name alone. On a writer you're about to finish, `writer.set_times(...)` instead, so its close can't restamp

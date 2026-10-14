@@ -367,7 +367,7 @@ pub(crate) fn build_file_both_dir_info(
     // LastWriteTime (8)
     buf.extend_from_slice(&133_000_000_000_000_000u64.to_le_bytes());
     // ChangeTime (8)
-    buf.extend_from_slice(&133_000_000_000_000_000u64.to_le_bytes());
+    buf.extend_from_slice(&133_100_000_000_000_000u64.to_le_bytes());
     // EndOfFile (8)
     buf.extend_from_slice(&size.to_le_bytes());
     // AllocationSize (8)

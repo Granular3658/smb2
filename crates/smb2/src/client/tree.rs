@@ -153,6 +153,10 @@ pub struct DirectoryEntry {
     pub created: FileTime,
     /// The last modification time.
     pub modified: FileTime,
+    /// When the contents or the metadata last changed (`ChangeTime`). Moves on
+    /// a metadata-only change too (attributes, timestamps, security), which
+    /// `modified` misses, so a sync tool compares it to catch those.
+    pub changed: FileTime,
     /// The entry's attributes: Hidden, Read-only, Directory, and the rest.
     pub attributes: FileAttributes,
 }
@@ -235,6 +239,10 @@ pub struct FileInfo {
     pub modified: FileTime,
     /// The last access time.
     pub accessed: FileTime,
+    /// When the contents or the metadata last changed (`ChangeTime`). Moves on
+    /// a metadata-only change too (attributes, timestamps, security), which
+    /// `modified` misses, so a sync tool compares it to catch those.
+    pub changed: FileTime,
     /// The file's attributes: Hidden, Read-only, Directory, and the rest.
     pub attributes: FileAttributes,
 }
@@ -3406,6 +3414,7 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
     let created = FileTime(u64::from_le_bytes(basic_buf[0..8].try_into().unwrap()));
     let accessed = FileTime(u64::from_le_bytes(basic_buf[8..16].try_into().unwrap()));
     let modified = FileTime(u64::from_le_bytes(basic_buf[16..24].try_into().unwrap()));
+    let changed = FileTime(u64::from_le_bytes(basic_buf[24..32].try_into().unwrap()));
     let attributes = FileAttributes::new(u32::from_le_bytes(basic_buf[32..36].try_into().unwrap()));
 
     let std_resp = QueryInfoResponse::unpack(&mut ReadCursor::new(std_body))?;
@@ -3425,6 +3434,7 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
         created,
         modified,
         accessed,
+        changed,
         attributes,
     })
 }
@@ -3440,6 +3450,7 @@ pub(crate) fn file_info_from_create(resp: &CreateResponse) -> FileInfo {
         created: resp.creation_time,
         modified: resp.last_write_time,
         accessed: resp.last_access_time,
+        changed: resp.change_time,
         attributes,
     }
 }
@@ -3480,7 +3491,7 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
         let creation_time = FileTime::unpack(&mut cursor)?;
         let _last_access_time = FileTime::unpack(&mut cursor)?;
         let last_write_time = FileTime::unpack(&mut cursor)?;
-        let _change_time = FileTime::unpack(&mut cursor)?;
+        let change_time = FileTime::unpack(&mut cursor)?;
         let end_of_file = cursor.read_u64_le()?;
         let _allocation_size = cursor.read_u64_le()?;
         let attributes = FileAttributes::new(cursor.read_u32_le()?);
@@ -3505,6 +3516,7 @@ fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
             is_directory: attributes.is_directory(),
             created: creation_time,
             modified: last_write_time,
+            changed: change_time,
             attributes,
         });
 
@@ -3952,6 +3964,8 @@ mod tests {
         assert_eq!(entries[0].name, "test.txt");
         assert_eq!(entries[0].size, 42);
         assert!(!entries[0].is_directory);
+        assert_eq!(entries[0].modified, FileTime(133_000_000_000_000_000));
+        assert_eq!(entries[0].changed, FileTime(133_100_000_000_000_000));
     }
 
     #[test]
@@ -4366,7 +4380,7 @@ mod tests {
             132_000_000_000_000_000,
             132_100_000_000_000_000,
             133_000_000_000_000_000,
-            133_000_000_000_000_000,
+            133_200_000_000_000_000,
             0x20, // ARCHIVE
         );
         let basic_resp = build_query_info_response(basic);
@@ -4394,6 +4408,7 @@ mod tests {
         assert_eq!(info.created, FileTime(132_000_000_000_000_000));
         assert_eq!(info.modified, FileTime(133_000_000_000_000_000));
         assert_eq!(info.accessed, FileTime(132_100_000_000_000_000));
+        assert_eq!(info.changed, FileTime(133_200_000_000_000_000));
         assert_eq!(
             info.attributes,
             FileAttributes::new(FileAttributes::ARCHIVE)
@@ -8182,10 +8197,16 @@ mod tests {
             .clone();
         assert_eq!(download.collect().await.unwrap(), [7, 8, 9]);
 
-        let [created, accessed, modified, _] = CREATE_TIMES;
+        let [created, accessed, modified, changed] = CREATE_TIMES;
         assert_eq!(
-            (info.size, info.created, info.modified, info.accessed),
-            (3, created, modified, accessed)
+            (
+                info.size,
+                info.created,
+                info.modified,
+                info.accessed,
+                info.changed
+            ),
+            (3, created, modified, accessed, changed)
         );
     }
 
