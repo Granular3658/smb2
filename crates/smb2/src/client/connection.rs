@@ -2163,13 +2163,9 @@ impl Inner {
     /// 3. The connection dies: `CreditPool::close` wakes every waiter.
     /// 4. Otherwise the deadline from
     ///    [`Connection::set_credit_wait_timeout`] applies.
-    async fn reserve_credits(
-        &self,
-        charge: u16,
-        command: Command,
-    ) -> Result<CreditReservation<'_>> {
-        if self.credits.try_reserve(charge) {
-            return Ok(CreditReservation::new(&self.credits, charge));
+    async fn reserve_credits(&self, charge: u16, command: Command) -> Result<CreditReservation> {
+        if let Some(reservation) = self.credits.try_reserve(charge) {
+            return Ok(reservation);
         }
         if self.credits.is_closed() || self.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -2207,14 +2203,14 @@ impl Inner {
             match select(reserving, recheck).await {
                 Either::Left((res, _)) => {
                     return match res {
-                        Ok(()) => {
+                        Ok(reservation) => {
                             debug!(
                                 "credits: {:?} acquired {} credit(s) after {:?}",
                                 command,
                                 charge,
                                 started.elapsed()
                             );
-                            Ok(CreditReservation::new(&self.credits, charge))
+                            Ok(reservation)
                         }
                         // The pool only closes on connection teardown.
                         Err(_) => Err(Error::Disconnected),
@@ -3796,7 +3792,7 @@ impl Connection {
         body: &dyn Pack,
         tree_id: Option<TreeId>,
         charge: u16,
-        mut reservation: CreditReservation<'_>,
+        mut reservation: CreditReservation,
     ) -> Result<WaiterGuard> {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
@@ -3902,7 +3898,7 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return ProbeOutcome::Broken;
         }
-        if !self.inner.credits.try_reserve(1) {
+        let Some(reservation) = self.inner.credits.try_reserve(1) else {
             self.inner
                 .metrics
                 .keepalive_probes_skipped
@@ -3912,8 +3908,7 @@ impl Connection {
                  liveness signal until a grant comes back"
             );
             return ProbeOutcome::Skipped;
-        }
-        let reservation = CreditReservation::new(&self.inner.credits, 1);
+        };
         // No `tree_id`: ECHO is connection-scoped and needs no share. It does
         // carry the session id and gets signed like anything else, because a
         // session that requires signing rejects what isn't signed.

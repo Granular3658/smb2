@@ -213,17 +213,73 @@ pub(crate) const DEFAULT_CREDIT_WAIT: Duration = Duration::from_secs(30);
 /// the caller (see `Inner::reserve_credits`), so a server that stops granting
 /// produces an error rather than a wait that never ends.
 pub(crate) struct CreditPool {
-    /// The live budget. Behind a `Mutex<Arc<..>>` rather than owned outright
-    /// because a closed `Semaphore` can never reopen (tokio makes closing
-    /// terminal), and a connection revived in place needs a budget again.
-    /// [`reset`](Self::reset) swaps in a fresh one; whoever still holds the old
-    /// `Arc` is parked on a generation that is never coming back and sees
-    /// `Err` from the close that killed it.
-    permits: Mutex<Arc<Semaphore>>,
+    /// The live session's budget. Behind a `Mutex<Arc<..>>` rather than owned
+    /// outright because a closed `Semaphore` can never reopen (tokio makes
+    /// closing terminal), and a connection revived in place needs a budget
+    /// again. [`reset`](Self::reset) swaps in a fresh one; whoever still holds
+    /// the old `Arc` is parked on a generation that is never coming back and
+    /// sees `Err` from the close that killed it.
+    budget: Mutex<Arc<Budget>>,
     /// The reserve deadline in milliseconds, tunable per connection.
     wait_ms: AtomicU64,
+}
+
+/// One session's credits: the unspent ones, and the whole window.
+///
+/// Together, because a [`CreditReservation`] refunds into the budget it was
+/// taken from, permits and window alike. A reservation that outlives a
+/// [`reset`](CreditPool::reset) (a send that waited through a revival, then
+/// gave up unsent) would otherwise hand the dead session's credits to the new
+/// one, which can then out-spend the server's window (AGENTS.md pitfall 14),
+/// and settle its MessageIds in the new window, where the counter started from
+/// zero again and the same id is a live request.
+struct Budget {
+    /// One permit per unspent credit.
+    permits: Semaphore,
     /// The whole window, in flight included, and its ceiling.
     window: Mutex<Window>,
+}
+
+impl Budget {
+    fn empty() -> Arc<Self> {
+        Arc::new(Self {
+            permits: Semaphore::new(0),
+            window: Mutex::new(Window::default()),
+        })
+    }
+
+    fn available(&self) -> u16 {
+        self.permits.available_permits().min(u16::MAX as usize) as u16
+    }
+
+    fn put_back(&self, credits: u16) {
+        if credits > 0 {
+            self.permits.add_permits(credits as usize);
+        }
+    }
+
+    /// How many credits to request on a request charging `charge`.
+    ///
+    /// Always at least the charge, so the window can't shrink under a steady
+    /// load, plus enough to climb back to [`CREDIT_TARGET`].
+    fn request_for(&self, charge: u16) -> u16 {
+        charge.saturating_add(CREDIT_TARGET.saturating_sub(self.available()))
+    }
+
+    /// Hand back credits reserved for a request whose bytes never reached the
+    /// wire (a signing failure, a transport error). Once the bytes are out,
+    /// the credits are the server's and only a grant returns them.
+    ///
+    /// The window doesn't move: those credits never left the client.
+    fn refund(&self, charge: u16, expected: &[MessageId]) {
+        if !expected.is_empty() {
+            let mut window = self.window.lock().unwrap();
+            for msg_id in expected {
+                window.settle(*msg_id);
+            }
+        }
+        self.put_back(charge);
+    }
 }
 
 impl CreditPool {
@@ -237,15 +293,14 @@ impl CreditPool {
     /// instead and put a frame on the wire the server funded nothing for.
     pub(crate) fn new() -> Self {
         Self {
-            permits: Mutex::new(Arc::new(Semaphore::new(0))),
+            budget: Mutex::new(Budget::empty()),
             wait_ms: AtomicU64::new(DEFAULT_CREDIT_WAIT.as_millis() as u64),
-            window: Mutex::new(Window::default()),
         }
     }
 
     /// The budget as of right now.
-    fn current(&self) -> Arc<Semaphore> {
-        Arc::clone(&self.permits.lock().unwrap())
+    fn current(&self) -> Arc<Budget> {
+        Arc::clone(&self.budget.lock().unwrap())
     }
 
     /// Throw the spent budget away and start again from empty, the way a
@@ -257,15 +312,14 @@ impl CreditPool {
     /// them over would let the first burst after a reconnect out-spend the
     /// server exactly the way the original wedge did.
     pub(crate) fn reset(&self) {
-        *self.permits.lock().unwrap() = Arc::new(Semaphore::new(0));
-        *self.window.lock().unwrap() = Window::default();
+        *self.budget.lock().unwrap() = Budget::empty();
     }
 
     /// Credits on hand: granted by the server and not reserved by a request.
     ///
     /// Saturates at `u16::MAX`; no server grants a window that wide.
     pub(crate) fn available(&self) -> u16 {
-        self.current().available_permits().min(u16::MAX as usize) as u16
+        self.current().available()
     }
 
     /// Bank a grant no request settles, the way [`answer`](Self::answer)
@@ -273,27 +327,23 @@ impl CreditPool {
     /// one, or the response to NEGOTIATE.
     #[cfg(test)]
     pub(crate) fn grant(&self, credits: u16) {
-        self.window.lock().unwrap().size += i64::from(credits);
-        self.put_back(credits);
+        let budget = self.current();
+        budget.window.lock().unwrap().size += i64::from(credits);
+        budget.put_back(credits);
     }
 
     /// Bank the `CreditResponse` from a response to `msg_id`, settling that
     /// request's share of the window.
     pub(crate) fn answer(&self, msg_id: MessageId, credits: u16) {
-        self.window.lock().unwrap().answer(msg_id, credits);
-        self.put_back(credits);
-    }
-
-    fn put_back(&self, credits: u16) {
-        if credits > 0 {
-            self.current().add_permits(credits as usize);
-        }
+        let budget = self.current();
+        budget.window.lock().unwrap().answer(msg_id, credits);
+        budget.put_back(credits);
     }
 
     /// Where the server's window stopped growing, or `None` while it may
     /// still grow. See the module docs.
     pub(crate) fn ceiling(&self) -> Option<u16> {
-        self.window.lock().unwrap().ceiling
+        self.current().window.lock().unwrap().ceiling
     }
 
     /// Whether `charge` is wider than a window the server has stopped
@@ -315,14 +365,14 @@ impl CreditPool {
     }
 
     /// Take `charge` credits if they are on hand right now.
-    pub(crate) fn try_reserve(&self, charge: u16) -> bool {
-        match self.current().try_acquire_many(u32::from(charge)) {
-            Ok(permit) => {
-                permit.forget();
-                true
-            }
-            Err(_) => false,
-        }
+    pub(crate) fn try_reserve(&self, charge: u16) -> Option<CreditReservation> {
+        let budget = self.current();
+        budget
+            .permits
+            .try_acquire_many(u32::from(charge))
+            .ok()?
+            .forget();
+        Some(CreditReservation::new(budget, charge))
     }
 
     /// Wait for `charge` credits. Resolves once they are reserved, or with
@@ -333,36 +383,22 @@ impl CreditPool {
     ///
     /// Binds to the budget as it is when the wait starts, so a reset mid-wait
     /// resolves the waiter with `Err` (the pool it was queued on was closed)
-    /// rather than silently migrating it onto the new session's budget.
-    pub(crate) async fn reserve(&self, charge: u16) -> Result<(), AcquireError> {
-        self.current()
-            .acquire_many_owned(u32::from(charge))
+    /// rather than silently migrating it onto the new session's budget. The
+    /// reservation stays bound to that budget too, refund included.
+    pub(crate) async fn reserve(&self, charge: u16) -> Result<CreditReservation, AcquireError> {
+        let budget = self.current();
+        budget
+            .permits
+            .acquire_many(u32::from(charge))
             .await?
             .forget();
-        Ok(())
+        Ok(CreditReservation::new(budget, charge))
     }
 
-    /// Hand back credits reserved for a request whose bytes never reached the
-    /// wire (a signing failure, a transport error). Once the bytes are out,
-    /// the credits are the server's and only a grant returns them.
-    ///
-    /// The window doesn't move: those credits never left the client.
-    fn refund(&self, charge: u16, expected: &[MessageId]) {
-        if !expected.is_empty() {
-            let mut window = self.window.lock().unwrap();
-            for msg_id in expected {
-                window.settle(*msg_id);
-            }
-        }
-        self.put_back(charge);
-    }
-
-    /// How many credits to request on a request charging `charge`.
-    ///
-    /// Always at least the charge, so the window can't shrink under a steady
-    /// load, plus enough to climb back to [`CREDIT_TARGET`].
+    /// [`Budget::request_for`] on the live budget.
+    #[cfg(test)]
     pub(crate) fn request_for(&self, charge: u16) -> u16 {
-        charge.saturating_add(CREDIT_TARGET.saturating_sub(self.available()))
+        self.current().request_for(charge)
     }
 
     /// How long [`Inner::reserve_credits`](crate::client::connection) waits
@@ -381,25 +417,26 @@ impl CreditPool {
     /// task parked on credits fails immediately instead of waiting out the
     /// full deadline for a server that will never answer again.
     pub(crate) fn close(&self) {
-        self.current().close();
+        self.current().permits.close();
     }
 
     /// Whether [`close`](Self::close) has been called.
     pub(crate) fn is_closed(&self) -> bool {
-        self.current().is_closed()
+        self.current().permits.is_closed()
     }
 
     /// Force the pool to exactly `credits`, for tests that need to stage a
     /// specific window without a full negotiate exchange.
     #[cfg(test)]
     pub(crate) fn set_ceiling(&self, ceiling: u16) {
-        self.window.lock().unwrap().ceiling = Some(ceiling);
+        self.current().window.lock().unwrap().ceiling = Some(ceiling);
     }
 
     #[cfg(test)]
     pub(crate) fn set_available(&self, credits: u16) {
-        self.window.lock().unwrap().size = i64::from(credits);
-        let permits = self.current();
+        let budget = self.current();
+        budget.window.lock().unwrap().size = i64::from(credits);
+        let permits = &budget.permits;
         let have = permits.available_permits();
         let want = usize::from(credits);
         match want.cmp(&have) {
@@ -418,20 +455,23 @@ impl CreditPool {
 ///
 /// Dropping without [`commit`](Self::commit) refunds them — that is the path
 /// for a request that failed to sign, encrypt, or reach the transport, and for
-/// a caller whose future is dropped before the send.
+/// a caller whose future is dropped before the send. Only
+/// [`CreditPool::try_reserve`] and [`CreditPool::reserve`] make one, so it
+/// always holds the budget it debited, and refunds into that one even after a
+/// revival swapped in another (see [`Budget`]).
 #[must_use = "dropping the reservation refunds the credits without sending"]
-pub(crate) struct CreditReservation<'a> {
-    pool: Option<&'a CreditPool>,
+pub(crate) struct CreditReservation {
+    budget: Option<Arc<Budget>>,
     charge: u16,
     /// The requests [`stamp`](Self::stamp) entered in the window, forgotten
     /// again if they never reach the wire.
     stamped: Vec<MessageId>,
 }
 
-impl<'a> CreditReservation<'a> {
-    pub(crate) fn new(pool: &'a CreditPool, charge: u16) -> Self {
+impl CreditReservation {
+    fn new(budget: Arc<Budget>, charge: u16) -> Self {
         Self {
-            pool: Some(pool),
+            budget: Some(budget),
             charge,
             stamped: Vec::new(),
         }
@@ -450,7 +490,7 @@ impl<'a> CreditReservation<'a> {
     /// never coming.
     pub(crate) fn exempt() -> Self {
         Self {
-            pool: None,
+            budget: None,
             charge: 0,
             stamped: Vec::new(),
         }
@@ -465,13 +505,14 @@ impl<'a> CreditReservation<'a> {
     /// of can't be settled. A compound stamps each of its requests on one
     /// reservation.
     pub(crate) fn stamp(&mut self, header: &mut Header, charge: u16) {
-        let Some(pool) = self.pool else {
+        let Some(budget) = &self.budget else {
             return;
         };
-        let requested = pool.request_for(charge);
+        let requested = budget.request_for(charge);
         header.credit_charge = CreditCharge(charge);
         header.credits = requested;
-        pool.window
+        budget
+            .window
             .lock()
             .unwrap()
             .expect(header.message_id, Expected { charge, requested });
@@ -480,14 +521,14 @@ impl<'a> CreditReservation<'a> {
 
     /// The bytes are on the wire: the credits belong to the server now.
     pub(crate) fn commit(mut self) {
-        self.pool = None;
+        self.budget = None;
     }
 }
 
-impl Drop for CreditReservation<'_> {
+impl Drop for CreditReservation {
     fn drop(&mut self) {
-        if let Some(pool) = self.pool {
-            pool.refund(self.charge, &self.stamped);
+        if let Some(budget) = &self.budget {
+            budget.refund(self.charge, &self.stamped);
         }
     }
 }
@@ -501,10 +542,9 @@ mod tests {
         let pool = CreditPool::new();
         pool.set_available(10);
 
-        assert!(pool.try_reserve(4));
+        let reservation = pool.try_reserve(4).unwrap();
         assert_eq!(pool.available(), 6);
 
-        let reservation = CreditReservation::new(&pool, 4);
         drop(reservation);
         assert_eq!(
             pool.available(),
@@ -518,8 +558,7 @@ mod tests {
         let pool = CreditPool::new();
         pool.set_available(10);
 
-        assert!(pool.try_reserve(4));
-        CreditReservation::new(&pool, 4).commit();
+        pool.try_reserve(4).unwrap().commit();
 
         assert_eq!(
             pool.available(),
@@ -533,7 +572,7 @@ mod tests {
         let pool = CreditPool::new();
         pool.set_available(3);
 
-        assert!(!pool.try_reserve(4));
+        assert!(pool.try_reserve(4).is_none());
         assert_eq!(pool.available(), 3, "a failed reserve takes nothing");
     }
 
@@ -570,7 +609,10 @@ mod tests {
         );
 
         pool.grant(4);
-        waiting.await.expect("the grant satisfies the waiter");
+        waiting
+            .await
+            .expect("the grant satisfies the waiter")
+            .commit();
         assert_eq!(pool.available(), 0);
     }
 
@@ -598,7 +640,7 @@ mod tests {
 
         assert_eq!(pool.available(), 0);
         assert!(
-            !pool.try_reserve(1),
+            pool.try_reserve(1).is_none(),
             "a credit the server never granted must not be spendable: \
              NEGOTIATE is exempt from the window, and an exemption is not a \
              permit anything else can take"
@@ -626,7 +668,7 @@ mod tests {
              client holds nothing"
         );
         assert!(
-            !pool.try_reserve(1),
+            pool.try_reserve(1).is_none(),
             "a request racing the revival must wait for a real grant rather \
              than spend the handshake's exemption"
         );
@@ -664,8 +706,7 @@ mod tests {
     /// Send one request charging `charge` out of `pool`, entered in the window
     /// under `msg_id` with whatever it asks the server for.
     fn send(pool: &CreditPool, msg_id: u64, charge: u16) {
-        assert!(pool.try_reserve(charge));
-        let mut reservation = CreditReservation::new(pool, charge);
+        let mut reservation = pool.try_reserve(charge).unwrap();
         let mut header = Header::new_request(crate::types::Command::Echo);
         header.message_id = MessageId(msg_id);
         reservation.stamp(&mut header, charge);
@@ -806,8 +847,7 @@ mod tests {
         let pool = CreditPool::new();
         pool.set_available(64);
 
-        assert!(pool.try_reserve(8));
-        let mut reservation = CreditReservation::new(&pool, 8);
+        let mut reservation = pool.try_reserve(8).unwrap();
         let mut header = Header::new_request(crate::types::Command::Echo);
         header.message_id = MessageId(1);
         reservation.stamp(&mut header, 8);
@@ -822,8 +862,49 @@ mod tests {
             "a refund puts credits back in the pool, not new ones in the window"
         );
         assert!(
-            pool.window.lock().unwrap().awaiting.is_empty(),
+            pool.current().window.lock().unwrap().awaiting.is_empty(),
             "an unsent request has no answer coming to settle it"
+        );
+    }
+
+    /// A request that waited for credits through a revival, then gave up
+    /// unsent (a handle refused because its session is gone, a caller
+    /// dropped), drops its reservation after `reset`. Its credits were the
+    /// dead session's, and its MessageId was counted from that session's
+    /// zero, so the same id can be a live request in the new window.
+    #[test]
+    fn a_reservation_from_before_a_reset_refunds_nothing_into_the_new_session() {
+        let pool = CreditPool::new();
+        pool.set_available(10);
+        let mut stale = pool.try_reserve(4).unwrap();
+        let mut header = Header::new_request(crate::types::Command::Read);
+        header.message_id = MessageId(0);
+        stale.stamp(&mut header, 4);
+
+        pool.close();
+        pool.reset();
+        pool.grant(2);
+        // The new session's first request: MessageId 0 again.
+        send(&pool, 0, 1);
+        assert_eq!(pool.available(), 1);
+
+        drop(stale);
+
+        assert_eq!(
+            pool.available(),
+            1,
+            "the dead session's credits must stay in its budget, or the new \
+             connection can out-spend the server's window"
+        );
+        assert!(
+            pool.current()
+                .window
+                .lock()
+                .unwrap()
+                .awaiting
+                .contains_key(&0),
+            "the new session's request 0 is still in flight; the stale refund \
+             must not settle it"
         );
     }
 
@@ -845,10 +926,10 @@ mod tests {
         let pool = CreditPool::new();
         assert_eq!(pool.comfortable_charge(), None);
 
-        pool.window.lock().unwrap().ceiling = Some(64);
+        pool.current().window.lock().unwrap().ceiling = Some(64);
         assert_eq!(pool.comfortable_charge(), Some(32));
 
-        pool.window.lock().unwrap().ceiling = Some(1);
+        pool.current().window.lock().unwrap().ceiling = Some(1);
         assert_eq!(pool.comfortable_charge(), Some(1));
     }
 
