@@ -372,7 +372,8 @@ For when you want to do one thing and get the result:
 - `client.upload(&share, path, data)`: Streaming upload with progress
 - `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)
 - `client.create_file_writer(&share, path)`: A writer you push chunks into at your own pace. `writer.flush_checkpoint()`
-  makes everything so far durable without closing it and returns a `WriteCheckpoint` to persist
+  makes everything so far durable without closing it and returns a `WriteCheckpoint` to persist (with the `serde` feature it's
+  `Serialize` + `Deserialize`)
 - `client.resume_file_writer(&share, path, &checkpoint)`: Carry on an interrupted upload after a crash or a reconnect.
   It proves the file is still the one the checkpoint names and still that long before writing anything, and refuses
   with `ErrorKind::ResumeRefused` otherwise (start over then)

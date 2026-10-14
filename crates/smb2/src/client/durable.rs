@@ -104,6 +104,7 @@ const FS_VOLUME_SERIAL_OFFSET: usize = 8;
 /// the server, which is what makes it usable as the client-side half of
 /// proving a reclaimed handle has not moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FileIdentity {
     /// The serial number of the volume the file lives on
     /// (`FileFsVolumeInformation`), or `0` on a server that will not say.

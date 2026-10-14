@@ -1182,6 +1182,7 @@ pub struct FileWriter {
 /// for as long as you like: the resume proves the file is still the one it
 /// names before writing anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
 pub struct WriteCheckpoint {
     /// Every byte before this offset reached the file and was flushed (SMB2

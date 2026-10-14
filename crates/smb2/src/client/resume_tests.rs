@@ -577,3 +577,23 @@ fn a_refused_resume_is_its_own_kind_and_not_worth_retrying() {
         "the same checkpoint can only be refused again"
     );
 }
+
+/// A checkpoint is persisted between runs, so with the `serde` feature it has
+/// to load back as the same checkpoint, identity included.
+#[cfg(feature = "serde")]
+#[test]
+fn a_checkpoint_round_trips_through_json() {
+    let identities = [
+        Some(FileIdentity {
+            volume_serial: 0xBEEF,
+            index_number: u64::MAX,
+        }),
+        None,
+    ];
+    for identity in identities {
+        let checkpoint = WriteCheckpoint::new(1 << 40, identity);
+        let json = serde_json::to_string(&checkpoint).expect("serialize");
+        let loaded: WriteCheckpoint = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(loaded, checkpoint, "{json}");
+    }
+}
