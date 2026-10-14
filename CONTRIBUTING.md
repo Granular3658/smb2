@@ -36,6 +36,8 @@ just msrv                         # Check MSRV compatibility
 
 This catches issues that only appear on older Rust versions. CI runs this check, so `just msrv` locally saves a round-trip.
 
+The MSRV covers what consumers compile: the library (every feature) and the CLI binary. Tests and dev-dependencies only need stable Rust, so a dev-dependency may require a newer toolchain. A library dependency may not; when one raises its MSRV in a patch release, we cap it in `crates/smb2/Cargo.toml` (see `aes` and `ctutils`) with a matching rule in `renovate.json`.
+
 ## Project structure
 
 This is a Cargo workspace with two published crates: the `smb2` library and the `smb2-cli` command-line client built

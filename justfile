@@ -112,7 +112,8 @@ doc:
     @cargo doc --no-deps --quiet
     @echo "[+] Docs built"
 
-# Check MSRV compatibility (requires rustup with 1.85 toolchain)
+# Check MSRV compatibility (requires rustup with 1.85 toolchain). Covers what consumers compile (the library with
+# every feature, and the CLI binary), not tests or dev-dependencies, which only need stable. Same steps as CI's `msrv` job.
 msrv:
     @echo "[*] Checking MSRV (1.85) compatibility..."
     @if ! rustup run 1.85.0 rustc --version &> /dev/null; then \
@@ -120,8 +121,8 @@ msrv:
         exit 1; \
     fi
     @RUSTFLAGS="-D warnings" cargo +1.85.0 check --quiet
+    @RUSTFLAGS="-D warnings" cargo +1.85.0 check -p smb2 --all-features --quiet
     @RUSTFLAGS="-D warnings" cargo +1.85.0 check -p smb2 --no-default-features --features smol --quiet
-    @cargo +1.85.0 clippy --all-targets --quiet -- -D warnings
     @echo "[+] MSRV check passed"
 
 # Run security audit (requires cargo-audit)

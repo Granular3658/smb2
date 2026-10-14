@@ -17,7 +17,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-2025]
-        rust: ["1.85", stable]
+        # Tests, examples, and lints run on stable only, so dev-dependencies are free to need newer Rust.
+        # What consumers build is checked on the MSRV by the `msrv` job.
+        rust: [stable]
 
     steps:
       - name: Checkout repository
@@ -136,9 +138,15 @@ jobs:
         if: always()
         run: ./crates/smb2/tests/docker/stop.sh
 
+  # The MSRV promise covers what a consumer compiles: the library (every feature) and the CLI binary. Tests and
+  # dev-dependencies are ours alone, so they're held to stable, not to the MSRV. Each OS, for the `cfg`-gated code.
   msrv:
-    name: Verify MSRV (1.85)
-    runs-on: ubuntu-latest
+    name: Verify MSRV (1.85, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-2025]
 
     steps:
       - name: Checkout repository
@@ -154,6 +162,11 @@ jobs:
 
       - name: Check compilation on MSRV
         run: cargo check
+        env:
+          RUSTFLAGS: "-D warnings"
+
+      - name: Check every library feature on MSRV
+        run: cargo check -p smb2 --all-features
         env:
           RUSTFLAGS: "-D warnings"
 

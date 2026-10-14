@@ -38,11 +38,6 @@
       "allowedVersions": "<0.4.3"
     },
     {
-      "description": "proptest 1.12 needs rustc 1.88 and our MSRV is 1.85. It's a dev-dependency, so Cargo.lock alone holds it at 1.11 (consumers never resolve it) and only this rule stops Renovate moving it. Lift it when the MSRV moves to 1.88+.",
-      "matchPackageNames": ["proptest"],
-      "allowedVersions": "<1.12.0"
-    },
-    {
       "description": "dist generates this workflow and its plan job fails if it drifts from what dist would generate. Its actions move when `cargo-dist-version` is bumped and `dist generate` re-run.",
       "matchFileNames": [".github/workflows/smb2-cli-release.yml"],
       "enabled": false
