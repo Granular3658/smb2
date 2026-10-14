@@ -52,7 +52,7 @@ pub use diagnostics::{
     DfsCacheEntry, Diagnostics, EncryptionInfo, InboundProgress, Liveness, MetricsSnapshot,
     NegotiatedSummary, SessionDiagnostics, SigningInfo,
 };
-pub use directory::DirectoryReader;
+pub use directory::{DirectoryReader, ListOptions};
 pub use durable::{DurableHandle, DurableOpen, FileIdentity};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use resolve::Resolved;
@@ -1401,8 +1401,30 @@ impl SmbClient {
         tree: &mut Tree,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
+        self.list_directory_with(tree, path, ListOptions::new())
+            .await
+    }
+
+    /// [`list_directory`](Self::list_directory), asking the server for what
+    /// `options` names as well (see [`ListOptions`]).
+    ///
+    /// ```no_run
+    /// # async fn example(client: &mut smb2::SmbClient, share: &mut smb2::Tree) -> Result<(), smb2::Error> {
+    /// let options = smb2::ListOptions::new().index_numbers(true);
+    /// for entry in client.list_directory_with(share, "photos", options).await? {
+    ///     println!("{} {:?}", entry.name, entry.index_number);
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn list_directory_with(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        options: ListOptions,
+    ) -> Result<Vec<DirectoryEntry>> {
         self.replaying(tree, path, |mut conn, tree, path| async move {
-            tree.list_directory(&mut conn, &path).await
+            tree.list_directory_with(&mut conn, &path, options).await
         })
         .await
         .map(|(value, _)| value)
@@ -1422,8 +1444,20 @@ impl SmbClient {
         tree: &mut Tree,
         path: &str,
     ) -> Result<DirectoryReader> {
+        self.open_directory_reader_with(tree, path, ListOptions::new())
+            .await
+    }
+
+    /// [`open_directory_reader`](Self::open_directory_reader), asking the
+    /// server for what `options` names as well (see [`ListOptions`]).
+    pub async fn open_directory_reader_with(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+        options: ListOptions,
+    ) -> Result<DirectoryReader> {
         self.replaying(tree, path, |conn, tree, path| async move {
-            tree.open_directory_reader(conn, &path).await
+            tree.open_directory_reader_with(conn, &path, options).await
         })
         .await
         .map(|(reader, _)| reader)
@@ -3113,6 +3147,7 @@ mod tests {
         send(client.download(tree, "f"));
         send(client.watch(tree, "f", false));
         send(client.open_directory_reader(tree, "f"));
+        send(client.list_directory_with(tree, "f", ListOptions::new()));
         send(client.create_file_writer(tree, "f"));
         send(client.resume_file_writer(tree, "f", &resumable_checkpoint()));
         send(client.delete_files(tree, &["f"]));

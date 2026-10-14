@@ -101,6 +101,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fuzz_directory_entries_parse"
+path = "fuzz_targets/fuzz_directory_entries_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "fuzz_error_context_walk"
 path = "fuzz_targets/fuzz_error_context_walk.rs"
 test = false

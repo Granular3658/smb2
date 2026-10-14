@@ -12,7 +12,7 @@ use log::{debug, info, trace, warn};
 
 use crate::client::connection::{CompoundOp, Connection, Frame, SessionPin, WaiterGuard};
 use crate::client::credits;
-use crate::client::directory::DirectoryReader;
+use crate::client::directory::{DirectoryReader, ListOptions};
 use crate::client::durable::FileIdentity;
 use crate::client::stream::{FileDownload, Progress};
 use crate::client::write_pipe::WritePipe;
@@ -21,6 +21,7 @@ use crate::msg::close::CloseRequest;
 use crate::msg::create::{
     CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
 };
+use crate::msg::directory_info;
 use crate::msg::flush::FlushRequest;
 use crate::msg::query_directory::{
     FileInformationClass, QueryDirectoryFlags, QueryDirectoryRequest, QueryDirectoryResponse,
@@ -172,6 +173,14 @@ pub struct DirectoryEntry {
     pub changed: FileTime,
     /// The entry's attributes: Hidden, Read-only, Directory, and the rest.
     pub attributes: FileAttributes,
+    /// The file system's 64-bit file ID for this entry, the same number
+    /// [`FileIdentity::index_number`](crate::FileIdentity) carries. Only a
+    /// listing that asked for it fills it in
+    /// ([`ListOptions::index_numbers`](crate::ListOptions::index_numbers)),
+    /// and only when the server sends a non-zero one. It identifies a file
+    /// within one volume; a listing doesn't say which volume, so it isn't a
+    /// whole `FileIdentity` on its own.
+    pub index_number: Option<u64>,
 }
 
 /// One QUERY_DIRECTORY round trip within a directory listing, captured by
@@ -502,20 +511,40 @@ impl Tree {
         conn: Connection,
         path: &str,
     ) -> Result<DirectoryReader> {
-        let buffer_len = Self::default_query_buffer_len(&conn);
-        self.open_directory_reader_sized(conn, path, buffer_len)
+        self.open_directory_reader_with(conn, path, ListOptions::new())
             .await
     }
 
-    /// [`open_directory_reader`](Self::open_directory_reader) asking for
-    /// `buffer_len` bytes of entries per QUERY_DIRECTORY.
+    /// [`open_directory_reader`](Self::open_directory_reader), asking the
+    /// server for what `options` names as well (see [`ListOptions`]).
+    pub async fn open_directory_reader_with(
+        &self,
+        conn: Connection,
+        path: &str,
+        options: ListOptions,
+    ) -> Result<DirectoryReader> {
+        let buffer_len = Self::default_query_buffer_len(&conn);
+        self.open_directory_reader_sized(conn, path, buffer_len, options)
+            .await
+    }
+
+    /// [`open_directory_reader_with`](Self::open_directory_reader_with) asking
+    /// for `buffer_len` bytes of entries per QUERY_DIRECTORY.
     async fn open_directory_reader_sized(
         &self,
         conn: Connection,
         path: &str,
         buffer_len: u32,
+        options: ListOptions,
     ) -> Result<DirectoryReader> {
         trace!("tree: open_directory_reader path={}", path);
+        // A server that refused class 37 once on this connection is listed
+        // the default way from the start.
+        let class = if options.index_numbers && !conn.listing_ids_refused() {
+            FileInformationClass::FileIdBothDirectoryInformation
+        } else {
+            FileInformationClass::FileBothDirectoryInformation
+        };
         // Pinned before the CREATE, so a revival that lands before the answer
         // leaves the handle pinned to the session it belongs to.
         let mut conn = self.pinned_conn(&conn).pinned_to_session();
@@ -525,6 +554,7 @@ impl Tree {
             conn,
             file_id,
             buffer_len,
+            class,
         ))
     }
 
@@ -540,11 +570,25 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
+        self.list_directory_with(conn, path, ListOptions::new())
+            .await
+    }
+
+    /// [`list_directory`](Self::list_directory), asking the server for what
+    /// `options` names as well (see [`ListOptions`]).
+    pub async fn list_directory_with(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        options: ListOptions,
+    ) -> Result<Vec<DirectoryEntry>> {
         // TRACE, not DEBUG: a recursive scan calls list_directory once per directory
         // (millions of times on a large share), so at DEBUG it dominates a consumer's
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
         trace!("tree: list_directory path={}", path);
-        let mut reader = self.open_directory_reader(conn.clone(), path).await?;
+        let mut reader = self
+            .open_directory_reader_with(conn.clone(), path, options)
+            .await?;
         let mut entries = Vec::new();
         // An error has already closed the handle; the reader says so.
         while let Some(batch) = reader.next_batch().await? {
@@ -576,7 +620,7 @@ impl Tree {
 
         let create_start = Instant::now();
         let mut reader = self
-            .open_directory_reader_sized(conn.clone(), path, buffer_len)
+            .open_directory_reader_sized(conn.clone(), path, buffer_len, ListOptions::new())
             .await?;
         let create = create_start.elapsed();
 
@@ -2932,6 +2976,8 @@ impl Tree {
     /// and [`list_directory_instrumented`](Self::list_directory_instrumented)
     /// collect through one.
     ///
+    /// `class` is one of the two listing classes `msg::directory_info` speaks.
+    ///
     /// `output_buffer_length` above 65536 needs a matching multi-credit charge;
     /// this computes it as ceil(len / 65536).
     pub(crate) async fn query_directory_step(
@@ -2940,10 +2986,11 @@ impl Tree {
         file_id: FileId,
         restart: bool,
         output_buffer_length: u32,
+        class: FileInformationClass,
     ) -> Result<QueryStepOutcome> {
         let conn = &mut self.pinned_conn(conn);
         let req = QueryDirectoryRequest {
-            file_information_class: FileInformationClass::FileBothDirectoryInformation,
+            file_information_class: class,
             flags: QueryDirectoryFlags(if restart {
                 QueryDirectoryFlags::RESTART_SCANS
             } else {
@@ -2982,8 +3029,7 @@ impl Tree {
         let resp = QueryDirectoryResponse::unpack(&mut cursor)?;
         let bytes = resp.output_buffer.len();
 
-        // Parse FileBothDirectoryInformation entries from the output buffer.
-        let entries = parse_file_both_directory_info(&resp.output_buffer)?;
+        let entries = parse_directory_entries(class, &resp.output_buffer)?;
         for e in &entries {
             trace!(
                 "tree: dir_entry name={}, size={}, is_dir={}",
@@ -3448,78 +3494,34 @@ pub(crate) fn file_info_from_create(resp: &CreateResponse) -> FileInfo {
     }
 }
 
-/// Parse `FileBothDirectoryInformation` entries from raw bytes.
-///
-/// Each entry has:
-/// - NextEntryOffset (4 bytes)
-/// - FileIndex (4 bytes)
-/// - CreationTime (8 bytes)
-/// - LastAccessTime (8 bytes)
-/// - LastWriteTime (8 bytes)
-/// - ChangeTime (8 bytes)
-/// - EndOfFile (8 bytes)
-/// - AllocationSize (8 bytes)
-/// - FileAttributes (4 bytes)
-/// - FileNameLength (4 bytes)
-/// - EaSize (4 bytes)
-/// - ShortNameLength (1 byte)
-/// - Reserved (1 byte)
-/// - ShortName (24 bytes)
-/// - FileName (variable, FileNameLength bytes)
-fn parse_file_both_directory_info(data: &[u8]) -> Result<Vec<DirectoryEntry>> {
-    let mut entries = Vec::new();
-    let mut offset = 0usize;
-
-    loop {
-        if offset + 94 > data.len() {
-            // Not enough data for the fixed part.
-            break;
-        }
-
-        let entry_data = &data[offset..];
-        let mut cursor = ReadCursor::new(entry_data);
-
-        let next_entry_offset = cursor.read_u32_le()? as usize;
-        let _file_index = cursor.read_u32_le()?;
-        let creation_time = FileTime::unpack(&mut cursor)?;
-        let _last_access_time = FileTime::unpack(&mut cursor)?;
-        let last_write_time = FileTime::unpack(&mut cursor)?;
-        let change_time = FileTime::unpack(&mut cursor)?;
-        let end_of_file = cursor.read_u64_le()?;
-        let _allocation_size = cursor.read_u64_le()?;
-        let attributes = FileAttributes::new(cursor.read_u32_le()?);
-        let file_name_length = cursor.read_u32_le()? as usize;
-        let _ea_size = cursor.read_u32_le()?;
-        let _short_name_length = cursor.read_u8()?;
-        let _reserved = cursor.read_u8()?;
-        // ShortName: 24 bytes (fixed, null-padded).
-        cursor.skip(24)?;
-        // FileName: FileNameLength bytes in UTF-16LE. A single component, so
-        // it decodes with `decode_name`, not `decode_path`: a `\` that comes
-        // back here is a character in the name (see `crate::name`).
-        let name = if file_name_length > 0 {
-            crate::name::decode_name(&cursor.read_utf16_le(file_name_length)?).into_owned()
-        } else {
-            String::new()
-        };
-
-        entries.push(DirectoryEntry {
-            name,
-            size: end_of_file,
-            is_directory: attributes.is_directory(),
-            created: creation_time,
-            modified: last_write_time,
-            changed: change_time,
-            attributes,
-        });
-
-        if next_entry_offset == 0 {
-            break;
-        }
-        offset += next_entry_offset;
-    }
-
-    Ok(entries)
+/// The entries in a QUERY_DIRECTORY output buffer of `class`, as callers see
+/// them. Both listing classes come through here, so a name maps back the same
+/// way whichever one carried it.
+pub(crate) fn parse_directory_entries(
+    class: FileInformationClass,
+    data: &[u8],
+) -> Result<Vec<DirectoryEntry>> {
+    Ok(directory_info::parse_entries(class, data)?
+        .into_iter()
+        .map(|entry| {
+            let attributes = FileAttributes::new(entry.file_attributes);
+            DirectoryEntry {
+                // A single component, so `decode_name`, not `decode_path`: a
+                // `\` that comes back here is a character in the name (see
+                // `crate::name`).
+                name: crate::name::decode_name(&entry.file_name).into_owned(),
+                size: entry.end_of_file,
+                is_directory: attributes.is_directory(),
+                created: entry.creation_time,
+                modified: entry.last_write_time,
+                changed: entry.change_time,
+                attributes,
+                // 0 is "this file system has none" (MS-FSCC § 2.4.22), and
+                // what a server MAY send for `..`.
+                index_number: entry.file_id.filter(|&id| id != 0),
+            }
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -3891,7 +3893,9 @@ mod tests {
     #[tokio::test]
     async fn directory_listings_decode_private_use_area_names() {
         let data = build_file_both_dir_info("a\u{F025}b", 7, false, 0);
-        let entries = parse_file_both_directory_info(&data).unwrap();
+        let entries =
+            parse_directory_entries(FileInformationClass::FileBothDirectoryInformation, &data)
+                .unwrap();
         assert_eq!(entries[0].name, "a?b");
     }
 
@@ -3952,7 +3956,9 @@ mod tests {
     #[tokio::test]
     async fn parse_file_both_dir_info_single_entry() {
         let data = build_file_both_dir_info("test.txt", 42, false, 0);
-        let entries = parse_file_both_directory_info(&data).unwrap();
+        let entries =
+            parse_directory_entries(FileInformationClass::FileBothDirectoryInformation, &data)
+                .unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "test.txt");
         assert_eq!(entries[0].size, 42);
@@ -3969,14 +3975,19 @@ mod tests {
         let attrs = FileAttributes::HIDDEN | FileAttributes::READONLY | FileAttributes::ARCHIVE;
         data[56..60].copy_from_slice(&attrs.to_le_bytes());
 
-        let entries = parse_file_both_directory_info(&data).unwrap();
+        let entries =
+            parse_directory_entries(FileInformationClass::FileBothDirectoryInformation, &data)
+                .unwrap();
         assert_eq!(entries[0].attributes, FileAttributes::new(attrs));
         assert!(entries[0].attributes.is_hidden());
         assert!(entries[0].attributes.is_readonly());
         assert!(!entries[0].is_directory);
 
-        let dir =
-            parse_file_both_directory_info(&build_file_both_dir_info("d", 0, true, 0)).unwrap();
+        let dir = parse_directory_entries(
+            FileInformationClass::FileBothDirectoryInformation,
+            &build_file_both_dir_info("d", 0, true, 0),
+        )
+        .unwrap();
         assert!(dir[0].is_directory && dir[0].attributes.is_directory());
     }
 

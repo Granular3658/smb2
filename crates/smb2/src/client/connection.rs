@@ -1873,6 +1873,12 @@ struct Inner {
     /// `Tree::write_file_compound`. Erased on a revival with the rest of what
     /// the old server told us.
     flush_must_end_compound: AtomicBool,
+    /// Whether this server refused `FileIdBothDirectoryInformation` (class 37)
+    /// in a QUERY_DIRECTORY, so a listing that opts into index numbers asks
+    /// for the default class from the start instead of paying the refusal on
+    /// every directory. Learned like `flush_must_end_compound`, and erased on a
+    /// revival the same way.
+    listing_ids_refused: AtomicBool,
     /// How late READ answers came for the last download on this connection,
     /// and when: what the next download's learned headroom starts from.
     /// Same expiry and revival rules as the rate. See [`RATE_HINT_TTL`].
@@ -1997,6 +2003,7 @@ impl Inner {
             read_rate_hint: StdMutex::new(None),
             write_rate_hint: StdMutex::new(None),
             flush_must_end_compound: AtomicBool::new(false),
+            listing_ids_refused: AtomicBool::new(false),
             read_lateness_hint: StdMutex::new(None),
             write_lateness_hint: StdMutex::new(None),
             compression_enabled: AtomicBool::new(false),
@@ -3428,6 +3435,19 @@ impl Connection {
     pub(crate) fn note_flush_must_end_compound(&self) {
         self.inner
             .flush_must_end_compound
+            .store(true, Ordering::Release);
+    }
+
+    /// Whether this server has refused a listing in
+    /// `FileIdBothDirectoryInformation` (see `ListOptions::index_numbers`).
+    pub(crate) fn listing_ids_refused(&self) -> bool {
+        self.inner.listing_ids_refused.load(Ordering::Acquire)
+    }
+
+    /// Record that this server refuses `FileIdBothDirectoryInformation`.
+    pub(crate) fn note_listing_ids_refused(&self) {
+        self.inner
+            .listing_ids_refused
             .store(true, Ordering::Release);
     }
 
@@ -5421,6 +5441,7 @@ impl Connection {
         inner
             .flush_must_end_compound
             .store(false, Ordering::Release);
+        inner.listing_ids_refused.store(false, Ordering::Release);
         // ❌ `send_queue_depth` is deliberately NOT reset: a caller parked
         // between its increment and its decrement would underflow the gauge
         // into a nonsense number. It drains on its own.

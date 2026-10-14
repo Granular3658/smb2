@@ -20,10 +20,12 @@ use std::path::{Path, PathBuf};
 use smb2::msg::create::{
     CreateAction, CreateDisposition, CreateRequest, CreateResponse, ImpersonationLevel, ShareAccess,
 };
+use smb2::msg::directory_info::{pack_entries, DirectoryInfoEntry};
 use smb2::msg::header::Header;
 use smb2::msg::negotiate::{
     NegotiateContext, NegotiateRequest, NegotiateResponse, HASH_ALGORITHM_SHA512,
 };
+use smb2::msg::query_directory::FileInformationClass;
 use smb2::msg::query_info::QueryInfoResponse;
 use smb2::msg::transform::{CompressionTransformHeader, TransformHeader};
 use smb2::pack::{FileTime, Guid, Pack, WriteCursor};
@@ -488,6 +490,54 @@ fn generate_fuzz_seeds() {
             output_buffer: Vec::new(),
         }),
     );
+
+    // ── fuzz_directory_entries_parse ────────────────────────────────
+    // A chain of several entries in each class (`.`, `..`, a mapped name, a
+    // directory), plus a single entry, so the walk starts from both layouts
+    // and from a buffer with and without a `NextEntryOffset` to follow.
+    {
+        let entry = |name: &str, attributes: u32, file_id: Option<u64>| DirectoryInfoEntry {
+            creation_time: FileTime(132_000_000_000_000_000),
+            last_write_time: FileTime(133_000_000_000_000_000),
+            change_time: FileTime(133_100_000_000_000_000),
+            end_of_file: 42,
+            allocation_size: 4096,
+            file_attributes: attributes,
+            file_id,
+            file_name: name.to_string(),
+            ..Default::default()
+        };
+        for (class, seed, file_id) in [
+            (
+                FileInformationClass::FileBothDirectoryInformation,
+                "both",
+                None,
+            ),
+            (
+                FileInformationClass::FileIdBothDirectoryInformation,
+                "id_both",
+                Some(0x1234),
+            ),
+        ] {
+            let chain = [
+                entry(".", 0x10, file_id),
+                entry("..", 0x10, file_id.map(|_| 0)),
+                // "what?.txt" as macOS writes it (`?` is U+F03F).
+                entry("what\u{F03F}.txt", 0x20, file_id),
+                entry("sub", 0x10, file_id),
+            ];
+            write_seed(
+                "fuzz_directory_entries_parse",
+                &format!("{seed}_chain"),
+                &pack_entries(class, &chain).unwrap(),
+            );
+            write_seed(
+                "fuzz_directory_entries_parse",
+                &format!("{seed}_single"),
+                &pack_entries(class, &chain[2..3]).unwrap(),
+            );
+        }
+    }
 
     // ── fuzz_error_context_walk ─────────────────────────────────────
     // One context carrying SMB2_ERROR_ID_SHARE_REDIRECT, and one carrying the

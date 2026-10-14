@@ -22,6 +22,8 @@
 //! - [`fuzz_create_request_parse`] / [`fuzz_create_response_parse`]
 //!   -- CreateContext list lives inside these bodies.
 //! - [`fuzz_query_info_response_parse`] -- opaque output buffer sharp edge.
+//! - [`fuzz_directory_entries_parse`] -- a QUERY_DIRECTORY output buffer, as
+//!   both listing classes, chained by server-supplied offsets.
 //! - [`fuzz_error_context_walk`] -- a server-controlled chain of lengths
 //!   whose wrong answer is a wrong classification, not a crash.
 //! - [`fuzz_dfs_referral_response_parse`] -- manual offset arithmetic,
@@ -179,6 +181,19 @@ pub fn fuzz_create_response_parse(data: &[u8]) {
 pub fn fuzz_query_info_response_parse(data: &[u8]) {
     let mut cursor = ReadCursor::new(data);
     let _ = crate::msg::query_info::QueryInfoResponse::unpack(&mut cursor);
+}
+
+/// Fuzz the directory-listing entry parser, as both classes a listing asks
+/// for, through the name decode a listing applies. The chain is walked by
+/// server-supplied `NextEntryOffset` and `FileNameLength` values.
+pub fn fuzz_directory_entries_parse(data: &[u8]) {
+    use crate::msg::query_directory::FileInformationClass;
+    for class in [
+        FileInformationClass::FileBothDirectoryInformation,
+        FileInformationClass::FileIdBothDirectoryInformation,
+    ] {
+        let _ = crate::client::tree::parse_directory_entries(class, data);
+    }
 }
 
 /// Fuzz the DFS referral response parser. Manual offset arithmetic makes

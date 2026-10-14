@@ -26,8 +26,45 @@ use log::{debug, trace};
 use crate::client::connection::Connection;
 use crate::client::tree::{DirectoryEntry, QueryStep, QueryStepOutcome, Tree};
 use crate::error::Result;
-use crate::types::FileId;
+use crate::msg::query_directory::FileInformationClass;
+use crate::types::status::NtStatus;
+use crate::types::{Command, FileId};
 use crate::Error;
+
+/// What a listing asks the server for, beyond the default. For
+/// [`Tree::open_directory_reader_with`] and [`Tree::list_directory_with`]
+/// (and the `SmbClient` methods of the same names).
+///
+/// ```
+/// let options = smb2::ListOptions::new().index_numbers(true);
+/// assert!(options.index_numbers);
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ListOptions {
+    /// Fill in each entry's [`DirectoryEntry::index_number`], by listing with
+    /// `FileIdBothDirectoryInformation` (MS-FSCC § 2.4.22) in place of the
+    /// default `FileBothDirectoryInformation`. Same round trips, 10 bytes
+    /// more per entry. A server that doesn't know that class is listed the
+    /// default way on the same handle, with every `index_number` `None`, and
+    /// the connection remembers so later listings don't ask again.
+    pub index_numbers: bool,
+}
+
+impl ListOptions {
+    /// The default listing, exactly what [`Tree::list_directory`] sends.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask for each entry's index number (see the field).
+    #[must_use]
+    pub fn index_numbers(mut self, index_numbers: bool) -> Self {
+        self.index_numbers = index_numbers;
+        self
+    }
+}
 
 /// A directory listed one QUERY_DIRECTORY answer at a time.
 ///
@@ -71,6 +108,10 @@ pub struct DirectoryReader {
     conn: Connection,
     file_id: FileId,
     buffer_len: u32,
+    /// The information class every query asks for. Starts as class 37 when
+    /// the caller opted into index numbers, and drops to class 3 for good if
+    /// the server refuses it.
+    class: FileInformationClass,
     state: State,
     /// What [`Tree::list_directory_instrumented`] reports, when it asked.
     timings: Option<Timings>,
@@ -83,9 +124,12 @@ enum State {
     /// to start the scan over, which only the first query does.
     Ready { restart: bool },
     /// A QUERY_DIRECTORY, sent (or about to be, on its first poll).
+    /// `restart` says it asked for the start of the scan, so nothing has been
+    /// handed out yet.
     Querying {
         query: BoxFuture<'static, Result<QueryStepOutcome>>,
         started: Instant,
+        restart: bool,
     },
     /// The CLOSE, and the error to report once it's done: a failed query
     /// closes the handle too, and its error outranks the CLOSE's.
@@ -108,12 +152,19 @@ pub(crate) struct Timings {
 impl DirectoryReader {
     /// Wrap a directory handle `conn` opened. `conn` must already be pinned to
     /// that session.
-    pub(crate) fn new(tree: Arc<Tree>, conn: Connection, file_id: FileId, buffer_len: u32) -> Self {
+    pub(crate) fn new(
+        tree: Arc<Tree>,
+        conn: Connection,
+        file_id: FileId,
+        buffer_len: u32,
+        class: FileInformationClass,
+    ) -> Self {
         Self {
             tree,
             conn,
             file_id,
             buffer_len,
+            class,
             state: State::Ready { restart: true },
             timings: None,
         }
@@ -149,7 +200,12 @@ impl DirectoryReader {
                     let restart = *restart;
                     self.start_query(restart);
                 }
-                State::Querying { query, started } => {
+                State::Querying {
+                    query,
+                    started,
+                    restart,
+                } => {
+                    let restart = *restart;
                     let outcome = query.as_mut().await;
                     let elapsed = started.elapsed();
                     // Nothing below awaits until the state has moved on, so a
@@ -169,6 +225,18 @@ impl DirectoryReader {
                         Ok(QueryStepOutcome::NoMoreFiles { bytes }) => {
                             self.note_query(elapsed, 0, bytes, true);
                             self.start_close(None);
+                        }
+                        Err(e) if restart && self.refuses_the_class(&e) => {
+                            // Nothing was handed out, so the default class can
+                            // start the scan over on the same handle.
+                            self.note_query(elapsed, 0, 0, false);
+                            debug!(
+                                "directory: server refused FileIdBothDirectoryInformation ({e}), \
+                                 listing without index numbers from now on"
+                            );
+                            self.conn.note_listing_ids_refused();
+                            self.class = FileInformationClass::FileBothDirectoryInformation;
+                            self.start_query(true);
                         }
                         Err(e) => self.start_close(Some(e)),
                     }
@@ -208,14 +276,29 @@ impl DirectoryReader {
     fn start_query(&mut self, restart: bool) {
         let tree = Arc::clone(&self.tree);
         let mut conn = self.conn.clone();
-        let (file_id, buffer_len) = (self.file_id, self.buffer_len);
+        let (file_id, buffer_len, class) = (self.file_id, self.buffer_len, self.class);
         self.state = State::Querying {
             query: Box::pin(async move {
-                tree.query_directory_step(&mut conn, file_id, restart, buffer_len)
+                tree.query_directory_step(&mut conn, file_id, restart, buffer_len, class)
                     .await
             }),
             started: Instant::now(),
+            restart,
         };
+    }
+
+    /// Whether `error` is the server saying it doesn't speak class 37
+    /// (MS-SMB2 § 3.3.5.18: `STATUS_INVALID_INFO_CLASS` for a class it doesn't
+    /// know, `STATUS_NOT_SUPPORTED` for one it doesn't implement).
+    fn refuses_the_class(&self, error: &Error) -> bool {
+        self.class == FileInformationClass::FileIdBothDirectoryInformation
+            && matches!(
+                error,
+                Error::Protocol {
+                    status: NtStatus::INVALID_INFO_CLASS | NtStatus::NOT_SUPPORTED,
+                    command: Command::QueryDirectory,
+                }
+            )
     }
 
     fn start_close(&mut self, then: Option<Error>) {
@@ -281,13 +364,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use super::ListOptions;
     use crate::client::test_helpers::{
         build_close_response, build_create_response, build_file_both_dir_info,
         build_query_directory_response, setup_connection,
     };
     use crate::client::tree::Tree;
+    use crate::msg::directory_info::{pack_entries, DirectoryInfoEntry};
     use crate::msg::header::Header;
-    use crate::msg::query_directory::{QueryDirectoryFlags, QueryDirectoryRequest};
+    use crate::msg::query_directory::{
+        FileInformationClass, QueryDirectoryFlags, QueryDirectoryRequest,
+    };
     use crate::pack::{ReadCursor, Unpack};
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -547,6 +634,206 @@ mod tests {
             "the CLOSE already out is the one awaited"
         );
         mock.assert_fully_consumed();
+    }
+
+    /// The QUERY_DIRECTORY requests the mock saw, decoded.
+    fn queries(mock: &MockTransport) -> Vec<QueryDirectoryRequest> {
+        mock.sent_messages()
+            .iter()
+            .filter(|bytes| {
+                Header::unpack(&mut ReadCursor::new(bytes)).unwrap().command
+                    == Command::QueryDirectory
+            })
+            .map(|bytes| {
+                QueryDirectoryRequest::unpack(&mut ReadCursor::new(&bytes[Header::SIZE..])).unwrap()
+            })
+            .collect()
+    }
+
+    /// One class 37 answer: a file per `(name, file id)`, names in wire form.
+    fn id_batch(entries: &[(&str, u64)]) -> Vec<u8> {
+        let entries: Vec<DirectoryInfoEntry> = entries
+            .iter()
+            .map(|(name, id)| DirectoryInfoEntry {
+                file_attributes: 0x20,
+                file_id: Some(*id),
+                file_name: crate::name::encode_name(name).into_owned(),
+                ..Default::default()
+            })
+            .collect();
+        build_query_directory_response(
+            NtStatus::SUCCESS,
+            pack_entries(
+                FileInformationClass::FileIdBothDirectoryInformation,
+                &entries,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn with_index_numbers() -> ListOptions {
+        ListOptions::new().index_numbers(true)
+    }
+
+    #[tokio::test]
+    async fn the_default_listing_asks_for_class_3_and_reports_no_index() {
+        // Opting in must cost the default listing nothing: same class, same
+        // pattern, same buffer, same flags as before the option existed.
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(DIR, 0));
+        mock.queue_response(batch(&["a.txt"]));
+        mock.queue_response(no_more_files());
+        mock.queue_response(build_close_response());
+
+        let mut conn = setup_connection(&mock);
+        let entries = test_tree().list_directory(&mut conn, "d").await.unwrap();
+        assert_eq!(entries[0].index_number, None);
+
+        let expected = |restart| QueryDirectoryRequest {
+            file_information_class: FileInformationClass::FileBothDirectoryInformation,
+            flags: QueryDirectoryFlags(if restart {
+                QueryDirectoryFlags::RESTART_SCANS
+            } else {
+                0
+            }),
+            file_index: 0,
+            file_id: DIR,
+            output_buffer_length: 65536,
+            file_name: "*".to_string(),
+        };
+        assert_eq!(queries(&mock), [expected(true), expected(false)]);
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::QueryDirectory,
+                Command::QueryDirectory,
+                Command::Close
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn opting_in_asks_for_class_37_and_carries_each_index() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(DIR, 0));
+        // `..` with a 0 is the spec's "no file ID here" (MS-FSCC § 2.4.22).
+        mock.queue_response(id_batch(&[("..", 0), ("what?.txt", 0xABCD)]));
+        mock.queue_response(no_more_files());
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let mut reader = test_tree()
+            .open_directory_reader_with(conn, "d", with_index_numbers())
+            .await
+            .unwrap();
+        let entries = reader.next_batch().await.unwrap().unwrap();
+        assert!(reader.next_batch().await.unwrap().is_none());
+
+        // The name maps back exactly as in a default listing (pitfall 23).
+        assert_eq!(names(&entries), ["..", "what?.txt"]);
+        assert_eq!(entries[0].index_number, None);
+        assert_eq!(entries[1].index_number, Some(0xABCD));
+        assert!(queries(&mock)
+            .iter()
+            .all(|q| q.file_information_class
+                == FileInformationClass::FileIdBothDirectoryInformation));
+        mock.assert_fully_consumed();
+    }
+
+    #[tokio::test]
+    async fn a_server_refusing_class_37_is_listed_on_the_same_handle_without_indexes() {
+        for refusal in [NtStatus::INVALID_INFO_CLASS, NtStatus::NOT_SUPPORTED] {
+            let mock = Arc::new(MockTransport::new());
+            mock.queue_response(build_create_response(DIR, 0));
+            mock.queue_response(build_query_directory_response(refusal, vec![]));
+            mock.queue_response(batch(&["a.txt"]));
+            mock.queue_response(no_more_files());
+            mock.queue_response(build_close_response());
+
+            let conn = setup_connection(&mock);
+            let mut reader = test_tree()
+                .open_directory_reader_with(conn.clone(), "d", with_index_numbers())
+                .await
+                .unwrap();
+            let entries = reader.next_batch().await.unwrap().unwrap();
+            assert!(reader.next_batch().await.unwrap().is_none());
+
+            assert_eq!(names(&entries), ["a.txt"], "{refusal}");
+            assert_eq!(entries[0].index_number, None);
+            assert_eq!(
+                sent_commands(&mock),
+                [
+                    Command::Create,
+                    Command::QueryDirectory,
+                    Command::QueryDirectory,
+                    Command::QueryDirectory,
+                    Command::Close,
+                ],
+                "{refusal}: one handle, no second CREATE"
+            );
+            let classes: Vec<_> = queries(&mock)
+                .iter()
+                .map(|q| q.file_information_class)
+                .collect();
+            assert_eq!(
+                classes,
+                [
+                    FileInformationClass::FileIdBothDirectoryInformation,
+                    FileInformationClass::FileBothDirectoryInformation,
+                    FileInformationClass::FileBothDirectoryInformation,
+                ]
+            );
+            assert_eq!(
+                query_restarts(&mock),
+                [true, true, false],
+                "the fallback starts the scan over"
+            );
+
+            // The connection remembers, so the next opted-in listing doesn't
+            // pay the refusal again.
+            mock.queue_response(build_create_response(DIR, 0));
+            mock.queue_response(no_more_files());
+            mock.queue_response(build_close_response());
+            let mut again = test_tree()
+                .open_directory_reader_with(conn, "d", with_index_numbers())
+                .await
+                .unwrap();
+            assert!(again.next_batch().await.unwrap().is_none());
+            assert_eq!(
+                queries(&mock).last().unwrap().file_information_class,
+                FileInformationClass::FileBothDirectoryInformation
+            );
+            mock.assert_fully_consumed();
+        }
+    }
+
+    #[tokio::test]
+    async fn any_other_refusal_of_class_37_is_the_listings_error() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(DIR, 0));
+        mock.queue_response(build_query_directory_response(
+            NtStatus::ACCESS_DENIED,
+            vec![],
+        ));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let mut reader = test_tree()
+            .open_directory_reader_with(conn, "d", with_index_numbers())
+            .await
+            .unwrap();
+        assert!(matches!(
+            reader.next_batch().await,
+            Err(Error::Protocol {
+                status: NtStatus::ACCESS_DENIED,
+                ..
+            })
+        ));
+        assert_eq!(
+            sent_commands(&mock),
+            [Command::Create, Command::QueryDirectory, Command::Close]
+        );
     }
 
     #[tokio::test]

@@ -78,6 +78,7 @@ src/
     oplock_break.rs       # OplockBreakNotification/Acknowledgment
     transform.rs          # TransformHeader (encryption), CompressionTransformHeader
     dfs.rs                # DFS referral request/response wire format
+    directory_info.rs     # QUERY_DIRECTORY entries: FileBothDirectoryInformation, FileIdBothDirectoryInformation
 
   transport/              # Transport abstraction
     mod.rs                # Transport trait (split send/receive)

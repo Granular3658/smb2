@@ -4505,6 +4505,99 @@ async fn guest_stat_with_identity_names_the_same_file_a_writer_checkpoint_does()
         .expect("disconnect failed");
 }
 
+/// A listing that opts into index numbers reports, for each entry, the very
+/// number `stat_with_identity` gives for that path: the same file ID, read
+/// two ways. Without the option every entry's `index_number` stays `None`.
+#[tokio::test]
+#[ignore]
+async fn guest_a_listings_index_numbers_are_the_ones_stat_with_identity_reports() {
+    let _ = env_logger::try_init();
+
+    let mut client = guest_client().await;
+    let mut tree = client
+        .connect_share("public")
+        .await
+        .expect("connect_share failed");
+    let dir = "smb2_test_listing_index";
+    let _ = client.delete_file(&tree, &format!("{dir}/a.txt")).await;
+    let _ = client.delete_file(&tree, &format!("{dir}/b.txt")).await;
+    let _ = client.delete_directory(&tree, &format!("{dir}/sub")).await;
+    let _ = client.delete_directory(&tree, dir).await;
+    client.create_directory(&tree, dir).await.unwrap();
+    client
+        .create_directory(&tree, &format!("{dir}/sub"))
+        .await
+        .unwrap();
+    for name in ["a.txt", "b.txt"] {
+        client
+            .write_file(&tree, &format!("{dir}/{name}"), name.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    let options = smb2::ListOptions::new().index_numbers(true);
+    let listed = client
+        .list_directory_with(&mut tree, dir, options)
+        .await
+        .expect("list_directory_with failed");
+    let mut seen = Vec::new();
+    for entry in listed.iter().filter(|e| e.name != "." && e.name != "..") {
+        let (_, identity) = client
+            .stat_with_identity(&mut tree, &format!("{dir}/{}", entry.name))
+            .await
+            .unwrap();
+        let identity = identity.expect("Samba identifies a file");
+        assert_eq!(
+            entry.index_number,
+            Some(identity.index_number),
+            "{}: the listing and the stat disagree on which file it is",
+            entry.name
+        );
+        seen.push(entry.name.clone());
+    }
+    seen.sort();
+    assert_eq!(seen, ["a.txt", "b.txt", "sub"]);
+
+    // The reader the listing collects through reports the same.
+    let mut reader = client
+        .open_directory_reader_with(&mut tree, dir, options)
+        .await
+        .unwrap();
+    let mut from_reader = Vec::new();
+    while let Some(batch) = reader.next_batch().await.unwrap() {
+        from_reader.extend(batch.into_iter().map(|e| (e.name, e.index_number)));
+    }
+    let mut from_listing: Vec<_> = listed
+        .iter()
+        .map(|e| (e.name.clone(), e.index_number))
+        .collect();
+    from_reader.sort();
+    from_listing.sort();
+    assert_eq!(from_reader, from_listing);
+
+    let plain = client.list_directory(&mut tree, dir).await.unwrap();
+    assert!(plain.iter().all(|e| e.index_number.is_none()), "{plain:?}");
+
+    for name in ["a.txt", "b.txt"] {
+        client
+            .delete_file(&tree, &format!("{dir}/{name}"))
+            .await
+            .expect("cleanup failed");
+    }
+    client
+        .delete_directory(&tree, &format!("{dir}/sub"))
+        .await
+        .expect("cleanup failed");
+    client
+        .delete_directory(&tree, dir)
+        .await
+        .expect("cleanup failed");
+    client
+        .disconnect_share(&tree)
+        .await
+        .expect("disconnect failed");
+}
+
 /// Resume `checkpoint` at `path`, waiting out the moment after a crash when
 /// the dead connection's open still holds the file (a writer shares nothing,
 /// so the server answers `STATUS_SHARING_VIOLATION` until it has noticed).
@@ -6094,6 +6187,44 @@ async fn weirdnames_listing_decodes_every_character_in_the_table() {
             "missing {expected:?} in {names:?}"
         );
     }
+
+    client.disconnect_share(&tree).await.expect("disconnect");
+}
+
+/// A listing with index numbers carries names in a different layout
+/// (`FileIdBothDirectoryInformation`), and they must map back exactly as the
+/// default listing's do, or the two would disagree about what the share holds
+/// (AGENTS.md pitfall 23).
+#[tokio::test]
+#[ignore]
+async fn weirdnames_a_listing_with_index_numbers_maps_names_the_same_way() {
+    let _ = env_logger::try_init();
+
+    let mut client = weirdnames_client().await;
+    let mut tree = client.connect_share("public").await.expect("connect_share");
+    let mut plain: Vec<String> = client
+        .list_directory(&mut tree, "")
+        .await
+        .expect("list_directory")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let with_index = client
+        .list_directory_with(&mut tree, "", smb2::ListOptions::new().index_numbers(true))
+        .await
+        .expect("list_directory_with");
+    assert!(
+        with_index
+            .iter()
+            .filter(|e| e.name != "..")
+            .all(|e| e.index_number.is_some()),
+        "Samba sends a file ID for every entry: {with_index:?}"
+    );
+    let mut indexed: Vec<String> = with_index.into_iter().map(|e| e.name).collect();
+    plain.sort();
+    indexed.sort();
+    assert_eq!(indexed, plain);
+    assert!(indexed.iter().any(|n| n == "all\"*:<>?\\|chars"));
 
     client.disconnect_share(&tree).await.expect("disconnect");
 }
