@@ -160,7 +160,7 @@ impl Watcher {
     pub(crate) fn new(tree: Tree, conn: Connection, file_id: FileId, recursive: bool) -> Self {
         Watcher {
             tree,
-            conn,
+            conn: conn.pinned_to_session(),
             file_id,
             recursive,
             pending: None,
@@ -365,9 +365,15 @@ impl Watcher {
     /// issues a CLOSE on the file handle. If `close` is not called explicitly,
     /// the `Drop` impl still deregisters, but the server-side handle leaks
     /// until the session ends (there is no async drop in Rust).
+    ///
+    /// A watcher whose session has ended (a reconnect) sends nothing and
+    /// returns `Ok`: the server let go of the handle with the session.
     pub async fn close(mut self) -> Result<()> {
         self.pending.take();
-        self.tree.close_handle(&mut self.conn, self.file_id).await
+        match self.tree.close_handle(&mut self.conn, self.file_id).await {
+            Err(Error::HandleInvalidated { .. }) => Ok(()),
+            result => result,
+        }
     }
 }
 

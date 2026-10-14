@@ -144,6 +144,41 @@ pub enum Error {
         reason: DurableLoss,
     },
 
+    /// A file handle outlived the session that opened it, so the request was
+    /// refused before it reached the wire.
+    ///
+    /// A reconnect revives a [`Connection`](crate::client::connection::Connection)
+    /// in place, so a handle that owns a clone of it ([`FileReader`](crate::client::stream::FileReader),
+    /// [`FileWriter`](crate::FileWriter), [`FileDownload`](crate::FileDownload),
+    /// [`FileUpload`](crate::FileUpload), [`Watcher`](crate::Watcher)) still
+    /// holds a working connection afterwards. Its tree id and file id don't
+    /// work, though: they belong to the session that died, and the new session
+    /// numbers its own from scratch, so the same ids can name a different file
+    /// or share there. Sending them would read or write the wrong file, so
+    /// every request from such a handle fails with this instead.
+    ///
+    /// `opened_on` and `current` are
+    /// [`Connection::generation`](crate::client::connection::Connection::generation)s.
+    /// They're equal when a second `Session::setup` replaced the session on the
+    /// same socket, without a reconnect.
+    ///
+    /// The handle is finished: open the file again. Closing it sends nothing,
+    /// since the server let go of it with the session. Classifies as
+    /// [`ErrorKind::ConnectionLost`] and reports as retryable, like
+    /// [`DurableHandleLost`](Self::DurableHandleLost): this handle can't be
+    /// saved, and running the transfer again on a new one is the intended
+    /// response.
+    #[error(
+        "this file handle belongs to a session that has ended (opened on connection \
+         generation {opened_on}, now on {current}); open the file again"
+    )]
+    HandleInvalidated {
+        /// The connection's generation when the handle was opened.
+        opened_on: u64,
+        /// The connection's generation when the request was refused.
+        current: u64,
+    },
+
     /// The path requires DFS referral resolution.
     ///
     /// The server returned `STATUS_PATH_NOT_COVERED`, meaning this path
@@ -377,6 +412,7 @@ impl Error {
                 | Error::ServerUnresponsive { .. }
                 | Error::ReconnectFailed { .. }
                 | Error::DurableHandleLost { .. }
+                | Error::HandleInvalidated { .. }
                 | Error::DfsNoReachableTarget { .. }
                 | Error::ConnectFailed { .. }
                 | Error::Protocol {
@@ -566,6 +602,9 @@ impl Error {
             // consumer that wants to explain why.
             Error::ReconnectFailed { .. } => ErrorKind::ConnectionLost,
             Error::DurableHandleLost { .. } => ErrorKind::ConnectionLost,
+            // The session the handle was opened on is the connection that was
+            // lost; the revived one can't use it.
+            Error::HandleInvalidated { .. } => ErrorKind::ConnectionLost,
             Error::Protocol { status, .. } => classify_status(*status),
         }
     }

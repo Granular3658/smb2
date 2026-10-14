@@ -9,6 +9,7 @@
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::marker::PhantomData;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -101,7 +102,12 @@ impl Progress {
 pub struct FileDownload<'a> {
     /// Borrowed from the caller, or owned when a DFS link led elsewhere.
     tree: Cow<'a, Tree>,
-    conn: &'a mut Connection,
+    /// Pinned to the session the file was opened on, so nothing this download
+    /// sends can reach the next one (see `Connection::pinned_to_session`).
+    conn: Connection,
+    /// The caller's connection stays borrowed for the download's life, as the
+    /// constructors' signatures have always said.
+    _caller: PhantomData<&'a mut Connection>,
     file_id: FileId,
     file_size: u64,
     /// What the CREATE said about the file; `None` for a handle the caller
@@ -163,8 +169,10 @@ impl<'a> FileDownload<'a> {
     /// uses [`ReadAhead::Adaptive`] unless told otherwise.
     ///
     /// The caller is responsible for making sure `file_id` belongs to `tree`
-    /// and was opened with read access. The `FileDownload` will CLOSE the
-    /// handle when the last chunk arrives.
+    /// and was opened with read access, on the session `conn` has now. The
+    /// `FileDownload` will CLOSE the handle when the last chunk arrives. Once
+    /// that session ends (a reconnect), every read fails with
+    /// [`Error::HandleInvalidated`].
     pub fn new(
         tree: &'a Tree,
         conn: &'a mut Connection,
@@ -172,15 +180,23 @@ impl<'a> FileDownload<'a> {
         file_size: u64,
         chunk_size: u32,
     ) -> Self {
-        Self::with_tree(Cow::Borrowed(tree), conn, file_id, file_size, chunk_size)
+        Self::with_tree(
+            Cow::Borrowed(tree),
+            conn.pinned_to_session(),
+            file_id,
+            file_size,
+            chunk_size,
+        )
     }
 
     /// A download of a file [`Tree::open_file`] just opened, reading
     /// [`DOWNLOAD_CHUNK_SIZE`](crate::DOWNLOAD_CHUNK_SIZE) at a time (or
     /// `MaxReadSize`, if that's smaller).
+    ///
+    /// `conn` is the clone the file was opened on, pinned before the CREATE.
     pub(crate) fn of_open_file(
         tree: Cow<'a, Tree>,
-        conn: &'a mut Connection,
+        conn: Connection,
         file_id: FileId,
         info: FileInfo,
     ) -> Self {
@@ -193,14 +209,15 @@ impl<'a> FileDownload<'a> {
 
     fn with_tree(
         tree: Cow<'a, Tree>,
-        conn: &'a mut Connection,
+        conn: Connection,
         file_id: FileId,
         file_size: u64,
         chunk_size: u32,
     ) -> Self {
         Self {
             tree,
-            conn,
+            conn: conn.pinned_to_session(),
+            _caller: PhantomData,
             file_id,
             file_size,
             info: None,
@@ -377,8 +394,14 @@ impl<'a> FileDownload<'a> {
         // The rest of a short read goes out first: it's the next chunk due.
         if let Some(front) = self.in_flight.front_mut() {
             if front.guard.is_none() {
-                let guard =
-                    send_read(self.conn, &self.tree, self.file_id, front.offset, front.len).await?;
+                let guard = send_read(
+                    &self.conn,
+                    &self.tree,
+                    self.file_id,
+                    front.offset,
+                    front.len,
+                )
+                .await?;
                 let now = Instant::now();
                 front.guard = Some(guard);
                 front.dispatched_at = now;
@@ -399,7 +422,7 @@ impl<'a> FileDownload<'a> {
                 Dispatch::AfterHead => return Ok(None),
             }
             let offset = self.next_offset;
-            let guard = send_read(self.conn, &self.tree, self.file_id, offset, len).await?;
+            let guard = send_read(&self.conn, &self.tree, self.file_id, offset, len).await?;
             let now = Instant::now();
             self.in_flight.push_back(InFlightRead {
                 offset,
@@ -499,7 +522,7 @@ impl<'a> FileDownload<'a> {
 
     fn window(&mut self) -> &mut Window {
         let (read_ahead, chunk) = (self.read_ahead, self.chunk_size);
-        let conn = &*self.conn;
+        let conn = &self.conn;
         self.window
             .get_or_insert_with(|| Window::new(read_ahead, chunk, conn.read_link_hint()))
     }
@@ -579,8 +602,12 @@ impl<'a> FileDownload<'a> {
         // answers them first; their responses are discarded once the guards
         // drop here.
         self.abandon_in_flight();
-        let guard = self.tree.dispatch_close(self.conn, self.file_id).await?;
-        self.closing = Some(guard);
+        match self.tree.dispatch_close(&self.conn, self.file_id).await {
+            Ok(guard) => self.closing = Some(guard),
+            // The server let go of the handle with its session: closed.
+            Err(Error::HandleInvalidated { .. }) => {}
+            Err(e) => return Err(e),
+        }
         Ok(())
     }
 
@@ -632,7 +659,8 @@ async fn send_read(
 
 impl Drop for FileDownload<'_> {
     fn drop(&mut self) {
-        if !self.done {
+        // A handle whose session ended went with it, so nothing leaks.
+        if !self.done && self.conn.pinned_session_is_current() {
             debug!(
                 "stream: FileDownload dropped before completion, file handle may leak \
                  (bytes_received={}/{})",
@@ -702,13 +730,10 @@ pub struct FileReader {
 /// [`Tree::open_file_reader`] are thin convenience wrappers; reach for them when
 /// you already hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
 /// connection clone.
-pub async fn open_file_reader(
-    tree: Arc<Tree>,
-    mut conn: Connection,
-    path: &str,
-) -> Result<FileReader> {
+pub async fn open_file_reader(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileReader> {
     trace!("stream: open_file_reader path={}", path);
 
+    let mut conn = conn.pinned_to_session();
     let (created, resolved_path) = tree
         .open_and_name(&mut conn, path, &tree.read_open_request(path), true)
         .await?;
@@ -739,7 +764,7 @@ impl FileReader {
     ) -> Self {
         Self {
             tree,
-            conn,
+            conn: conn.pinned_to_session(),
             file_id,
             info,
             max_read,
@@ -852,15 +877,22 @@ impl FileReader {
     /// Consumes `self` so read-after-close is a compile error. Call this on
     /// every reader; a dropped-without-close reader leaks the handle (see the
     /// type-level note).
+    ///
+    /// A reader whose session has ended (a reconnect) sends nothing and
+    /// returns `Ok`: the server let go of the handle with the session.
     pub async fn close(mut self) -> Result<()> {
         self.closed = true;
-        self.tree.close_handle(&mut self.conn, self.file_id).await
+        match self.tree.close_handle(&mut self.conn, self.file_id).await {
+            Err(Error::HandleInvalidated { .. }) => Ok(()),
+            result => result,
+        }
     }
 }
 
 impl Drop for FileReader {
     fn drop(&mut self) {
-        if !self.closed {
+        // A handle whose session ended went with it, so nothing leaks.
+        if !self.closed && self.conn.pinned_session_is_current() {
             debug!(
                 "stream: FileReader dropped without close(), file handle may leak \
                  until session teardown"
@@ -908,7 +940,11 @@ impl Drop for FileReader {
 pub struct FileUpload<'a> {
     /// Borrowed from the caller, or owned when a DFS link led elsewhere.
     tree: Cow<'a, Tree>,
-    conn: &'a mut Connection,
+    /// Pinned to the session the file was opened on, so nothing this upload
+    /// sends can reach the next one (see `Connection::pinned_to_session`).
+    conn: Connection,
+    /// The caller's connection stays borrowed for the upload's life.
+    _caller: PhantomData<&'a mut Connection>,
     file_id: FileId,
     data: &'a [u8],
     total_bytes: u64,
@@ -922,19 +958,22 @@ pub struct FileUpload<'a> {
 impl<'a> FileUpload<'a> {
     /// Create a streaming upload for a large file (data larger than one chunk).
     ///
-    /// Opens the file for writing. The caller then drives the upload with
-    /// [`write_next_chunk`](FileUpload::write_next_chunk).
+    /// The caller then drives the upload with
+    /// [`write_next_chunk`](FileUpload::write_next_chunk). `conn` is the clone
+    /// the file was opened on, pinned before the CREATE.
     pub(crate) fn new(
         tree: Cow<'a, Tree>,
-        conn: &'a mut Connection,
+        conn: Connection,
         file_id: FileId,
         data: &'a [u8],
         max_write: u32,
     ) -> Self {
+        let conn = conn.pinned_to_session();
         let pipe = WritePipe::new(conn.clone(), tree.tree_id, file_id, max_write);
         Self {
             tree,
             conn,
+            _caller: PhantomData,
             file_id,
             data,
             total_bytes: data.len() as u64,
@@ -946,14 +985,11 @@ impl<'a> FileUpload<'a> {
 
     /// Create a "done" upload for small files that were already written
     /// via compound in the constructor.
-    pub(crate) fn new_done(
-        tree: Cow<'a, Tree>,
-        conn: &'a mut Connection,
-        total_bytes: u64,
-    ) -> Self {
+    pub(crate) fn new_done(tree: Cow<'a, Tree>, conn: Connection, total_bytes: u64) -> Self {
         Self {
             tree,
             conn,
+            _caller: PhantomData,
             file_id: FileId::SENTINEL,
             data: &[],
             total_bytes,
@@ -1033,7 +1069,7 @@ impl<'a> FileUpload<'a> {
                 ..
             }
         ) {
-            let _ = self.tree.close_handle(self.conn, self.file_id).await;
+            let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
         }
         e
     }
@@ -1046,15 +1082,16 @@ impl<'a> FileUpload<'a> {
         self.done = true;
 
         // Flush to ensure data is persisted.
-        self.tree.flush_handle(self.conn, self.file_id).await?;
+        self.tree.flush_handle(&mut self.conn, self.file_id).await?;
         // Close the handle.
-        self.tree.close_handle(self.conn, self.file_id).await
+        self.tree.close_handle(&mut self.conn, self.file_id).await
     }
 }
 
 impl Drop for FileUpload<'_> {
     fn drop(&mut self) {
-        if !self.done {
+        // A handle whose session ended went with it, so nothing leaks.
+        if !self.done && self.conn.pinned_session_is_current() {
             debug!(
                 "stream: FileUpload dropped before completion, file handle may leak \
                  (bytes_written={}/{})",
@@ -1131,13 +1168,10 @@ pub struct FileWriter {
 /// thin convenience wrappers around this; reach for them when you already
 /// hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
 /// connection clone.
-pub async fn open_file_writer(
-    tree: Arc<Tree>,
-    mut conn: Connection,
-    path: &str,
-) -> Result<FileWriter> {
+pub async fn open_file_writer(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileWriter> {
     trace!("stream: open_file_writer path={}", path);
 
+    let mut conn = conn.pinned_to_session();
     let (file_id, resolved_path) =
         open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOverwriteIf).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -1156,11 +1190,12 @@ pub async fn open_file_writer(
 /// callers want.
 pub async fn open_file_writer_exclusive(
     tree: Arc<Tree>,
-    mut conn: Connection,
+    conn: Connection,
     path: &str,
 ) -> Result<FileWriter> {
     trace!("stream: open_file_writer_exclusive path={}", path);
 
+    let mut conn = conn.pinned_to_session();
     let (file_id, resolved_path) =
         open_for_writer(&tree, &mut conn, path, CreateDisposition::FileCreate).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -1197,7 +1232,7 @@ pub async fn open_file_writer_exclusive(
 /// ```
 pub async fn open_file_writer_at(
     tree: Arc<Tree>,
-    mut conn: Connection,
+    conn: Connection,
     path: &str,
     offset: u64,
 ) -> Result<FileWriter> {
@@ -1207,6 +1242,7 @@ pub async fn open_file_writer_at(
         offset
     );
 
+    let mut conn = conn.pinned_to_session();
     let (file_id, resolved_path) =
         open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOpenIf).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -1250,6 +1286,7 @@ impl FileWriter {
         file_id: FileId,
         max_write_size: u32,
     ) -> Self {
+        let conn = conn.pinned_to_session();
         let pipe = WritePipe::new(conn.clone(), tree.tree_id, file_id, max_write_size);
         Self {
             tree,
@@ -1434,13 +1471,16 @@ impl FileWriter {
 
         // 3. Skip flush_handle() — that's the whole point of abort().
 
-        // 4. Best-effort CLOSE. If it fails, log and move on.
-        if let Err(e) = self.tree.close_handle(&mut self.conn, self.file_id).await {
-            debug!(
+        // 4. Best-effort CLOSE. If it fails, log and move on. A writer whose
+        //    session ended has nothing to close: the server let go of the
+        //    handle with the session.
+        match self.tree.close_handle(&mut self.conn, self.file_id).await {
+            Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
+            Err(e) => debug!(
                 "stream: FileWriter::abort() best-effort CLOSE failed, handle may leak \
                  server-side until session teardown: {}",
                 e
-            );
+            ),
         }
 
         // 5. Silence the Drop warning — we finalized cleanly.
@@ -1543,7 +1583,8 @@ impl FileWriter {
 
 impl Drop for FileWriter {
     fn drop(&mut self) {
-        if !self.done {
+        // A handle whose session ended went with it, so nothing leaks.
+        if !self.done && self.conn.pinned_session_is_current() {
             debug!(
                 "stream: FileWriter dropped without finish(), file handle may leak \
                  (bytes_written={})",

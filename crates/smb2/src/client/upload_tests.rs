@@ -510,7 +510,7 @@ async fn a_step_by_step_upload_paces_like_a_writer() {
     use crate::client::stream::FileUpload;
 
     let mock = Arc::new(MockTransport::new());
-    let mut conn = connection_with_max_write(&mock, 8 * MIB);
+    let conn = connection_with_max_write(&mock, 8 * MIB);
     conn.set_estimated_rtt(Some(Duration::from_millis(1)));
     answer_writes(&mock, 4, 512 * KIB);
     answer_finish(&mock);
@@ -519,7 +519,7 @@ async fn a_step_by_step_upload_paces_like_a_writer() {
 
     let mut upload = FileUpload::new(
         std::borrow::Cow::Borrowed(&tree),
-        &mut conn,
+        conn.clone(),
         test_file_id(),
         &data,
         8 * MIB,

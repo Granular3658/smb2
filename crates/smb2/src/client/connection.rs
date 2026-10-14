@@ -1084,6 +1084,7 @@ async fn keepalive_loop(weak: Weak<Inner>) {
 
         let conn = Connection {
             inner: Arc::clone(&inner),
+            pin: None,
         };
         // An answer refreshes `last_frame_at` on its way through the receiver
         // task, which is the whole product of this loop: a request on a
@@ -2698,6 +2699,24 @@ pub struct Connection {
     /// Shared state (credits, waiters, crypto, transport sender, negotiated
     /// params, receiver task) behind `Arc<Inner>`. `clone()` bumps this.
     inner: Arc<Inner>,
+    /// `Some` on a clone a file handle owns: the session it may send on. See
+    /// [`pinned_to_session`](Self::pinned_to_session). Per clone, unlike
+    /// everything in `inner`.
+    pin: Option<SessionPin>,
+}
+
+/// The session a [`Connection`] clone was pinned to: the generation and the
+/// session id it had at the time.
+///
+/// Both, because neither covers the other. The generation ticks only once a
+/// WHOLE revival has succeeded, so it still matches through the new session's
+/// NEGOTIATE and SESSION_SETUP; the session id is wiped at the start of a
+/// revival, so it catches that window. And a second `Session::setup` on the
+/// same socket replaces the session id without a revival at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SessionPin {
+    generation: u64,
+    session_id: SessionId,
 }
 
 impl Connection {
@@ -2710,7 +2729,61 @@ impl Connection {
         let (write_tx, write_rx) = mpsc::channel(WRITE_QUEUE_DEPTH);
         let inner = Arc::new(Inner::new(write_tx, server_name.into()));
         spawn_plumbing(&inner, sender, receiver, write_rx);
-        Self { inner }
+        Self { inner, pin: None }
+    }
+
+    /// A clone that sends only on the session this connection has right now,
+    /// and refuses every request with [`Error::HandleInvalidated`] once that
+    /// session is gone.
+    ///
+    /// For anything holding a tree id or file id across awaits: a revival
+    /// happens in place, so the clone keeps a working connection, but the new
+    /// session numbers its handles from scratch and the same ids can name a
+    /// different file there. Take the pin BEFORE the CREATE, and send
+    /// everything the handle does through that one clone.
+    ///
+    /// Pinning a pinned clone keeps the original pin, so a stale clone can't
+    /// be pinned again into looking current.
+    pub(crate) fn pinned_to_session(&self) -> Connection {
+        let pin = self.pin.unwrap_or_else(|| SessionPin {
+            generation: self.generation(),
+            session_id: self.session_id(),
+        });
+        Connection {
+            inner: Arc::clone(&self.inner),
+            pin: Some(pin),
+        }
+    }
+
+    /// Whether this clone may still send: always on an unpinned one, and on a
+    /// pinned one while its session is the current one.
+    pub(crate) fn pinned_session_is_current(&self) -> bool {
+        self.session_for_request().is_ok()
+    }
+
+    /// The session id a request from this clone goes out with, or the
+    /// refusal of a pinned clone whose session is gone.
+    ///
+    /// Read once and stamped into the header, never re-read: if a revival
+    /// slips in after this check, the request still carries the dead session's
+    /// id, which the new session refuses. Re-reading would hand the stale tree
+    /// and file ids the new session's credentials.
+    fn session_for_request(&self) -> Result<SessionId> {
+        let current = self.session_id();
+        let Some(pin) = self.pin else {
+            return Ok(current);
+        };
+        let generation = self.generation();
+        if pin.generation == generation
+            && pin.session_id == current
+            && pin.session_id != SessionId(0)
+        {
+            return Ok(pin.session_id);
+        }
+        Err(Error::HandleInvalidated {
+            opened_on: pin.generation,
+            current: generation,
+        })
     }
 
     /// Connect to an SMB server over TCP.
@@ -3453,14 +3526,16 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
+        self.session_for_request()?;
         let charge = credit_charge.0.max(1);
         let mut reservation = self.inner.reserve_credits(charge, command).await?;
+        let session_id = self.session_for_request()?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
         reservation.stamp(&mut header, charge);
-        header.session_id = self.session_id();
+        header.session_id = session_id;
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
         }
@@ -3557,18 +3632,22 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
+        // Checked before spending credits, and again once they're spent: the
+        // wait for them can outlast a revival.
+        self.session_for_request()?;
         let charge = credit_charge.0.max(1);
         // Spend the credits BEFORE allocating a MessageId: the two advance
         // together (MS-SMB2 § 3.2.4.1.6 consumes `CreditCharge` sequence
         // numbers per request), and a reservation that has to wait must not
         // leave a hole in the sequence window meanwhile.
         let mut reservation = self.inner.reserve_credits(charge, command).await?;
+        let session_id = self.session_for_request()?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
         reservation.stamp(&mut header, charge);
-        header.session_id = self.session_id();
+        header.session_id = session_id;
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
         }
@@ -3696,6 +3775,7 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
+        self.session_for_request()?;
         let charge = credit_charge.0.max(1);
         let reservation = self.inner.reserve_credits(charge, command).await?;
         self.dispatch_reserved(command, body, tree_id, charge, reservation)
@@ -3721,12 +3801,13 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
+        let session_id = self.session_for_request()?;
         let msg_id = self.allocate_msg_id(charge as u64);
 
         let mut header = Header::new_request(command);
         header.message_id = msg_id;
         reservation.stamp(&mut header, charge);
-        header.session_id = self.session_id();
+        header.session_id = session_id;
         if let Some(tid) = tree_id {
             header.tree_id = Some(tid);
         }
@@ -3942,6 +4023,7 @@ impl Connection {
         if self.inner.disconnected.load(Ordering::Acquire) {
             return Err(Error::Disconnected);
         }
+        self.session_for_request()?;
 
         let (should_sign, should_encrypt) = {
             let c = self.inner.crypto.lock().unwrap();
@@ -3960,7 +4042,7 @@ impl Connection {
             .reserve_credits(total_charge, ops[0].command)
             .await?;
 
-        let session_id = self.session_id();
+        let session_id = self.session_for_request()?;
         let mut message_ids: Vec<MessageId> = Vec::with_capacity(ops.len());
         let mut sub_requests: Vec<Vec<u8>> = Vec::with_capacity(ops.len());
 
@@ -4118,6 +4200,16 @@ impl Connection {
             );
             return Ok(());
         }
+        // A pinned clone whose session is gone: the same "died with its
+        // session" as above, caught by the session id when no revival moved
+        // the generation.
+        let Ok(session_id) = self.session_for_request() else {
+            debug!(
+                "send_cancel: skipping the CANCEL for msg_id={} -- this handle's session is gone",
+                original_msg_id.0
+            );
+            return Ok(());
+        };
 
         self.inner
             .metrics
@@ -4128,7 +4220,6 @@ impl Connection {
             let c = self.inner.crypto.lock().unwrap();
             (c.should_sign, c.should_encrypt)
         };
-        let session_id = self.session_id();
 
         let mut header = Header::new_request(Command::Cancel);
         header.message_id = original_msg_id;
@@ -9502,6 +9593,7 @@ fn acknowledge_oplock_break(
 
     let conn = Connection {
         inner: Arc::clone(inner),
+        pin: None,
     };
     rt::spawn(async move {
         let ack = OplockBreak {

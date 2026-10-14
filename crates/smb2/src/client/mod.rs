@@ -25,6 +25,8 @@ pub mod shares;
 mod smol_runtime_tests;
 #[cfg(test)]
 mod socket_lifecycle_tests;
+#[cfg(test)]
+mod stale_handle_tests;
 pub mod stream;
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -1288,7 +1290,12 @@ impl SmbClient {
     /// target is not the primary one.
     fn session_is_gone(&self, tree: &Tree, err: &Error) -> bool {
         self.config.auto_reconnect
-            && matches!(err, Error::Disconnected | Error::ServerUnresponsive { .. })
+            && matches!(
+                err,
+                Error::Disconnected
+                    | Error::ServerUnresponsive { .. }
+                    | Error::HandleInvalidated { .. }
+            )
             && self
                 .connections
                 .for_tree_ref(tree)
@@ -1685,13 +1692,16 @@ impl SmbClient {
         tree: &'a Tree,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let ((file_id, info), moved_to) = self
-            .beside_tree(tree, path, |mut conn, tree, path| async move {
-                tree.open_for_read(&mut conn, &path).await
+        // Pinned before the open, and handed out with the handle: the
+        // download sends only on the session its handle belongs to.
+        let ((file_id, info, conn), moved_to) = self
+            .beside_tree(tree, path, |conn, tree, path| async move {
+                let mut conn = conn.pinned_to_session();
+                let (file_id, info) = tree.open_for_read(&mut conn, &path).await?;
+                Ok((file_id, info, conn))
             })
             .await?;
         let tree = moved_to.map_or(Cow::Borrowed(tree), |link| Cow::Owned(link.tree));
-        let conn = self.connections.for_tree(&tree)?;
         Ok(FileDownload::of_open_file(tree, conn, file_id, info))
     }
 
@@ -1738,21 +1748,24 @@ impl SmbClient {
         // `Some(handle)` for a file too big for one frame, `None` for one the
         // compound already wrote. Decided on the connection the write lands
         // on, which behind a link is the target's.
-        let (opened, moved_to) = self
-            .beside_tree(tree, path, |mut conn, tree, path| async move {
+        // Pinned before the open, and handed out with the handle: the upload
+        // sends only on the session its handle belongs to.
+        let ((opened, conn), moved_to) = self
+            .beside_tree(tree, path, |conn, tree, path| async move {
+                let mut conn = conn.pinned_to_session();
                 if data.len() as u64 <= conn.compound_write_limit() {
                     // The limit is `max_write`, lowered to what the credit
                     // window funds. A refused compound CREATE fails the WRITE
                     // with it, so a retry behind a link writes nothing twice.
                     tree.write_file_compound(&mut conn, &path, data).await?;
-                    Ok(None)
+                    Ok((None, conn))
                 } else {
-                    tree.open_file_for_write(&mut conn, &path).await.map(Some)
+                    let file_id = tree.open_file_for_write(&mut conn, &path).await?;
+                    Ok((Some(file_id), conn))
                 }
             })
             .await?;
         let tree = moved_to.map_or(Cow::Borrowed(tree), |link| Cow::Owned(link.tree));
-        let conn = self.connections.for_tree(&tree)?;
         Ok(match opened {
             None => stream::FileUpload::new_done(tree, conn, data.len() as u64),
             Some(file_id) => {
@@ -1883,14 +1896,17 @@ impl SmbClient {
     {
         // Only the open goes through the link helper, so no progress is
         // reported before the file is open wherever it lives.
-        let ((file_id, file_size), moved_to) = self
-            .beside_tree(tree, path, |mut conn, tree, path| async move {
-                tree.open_file(&mut conn, &path).await
+        // Pinned before the open, so the reads after it can't reach a newer
+        // session.
+        let ((file_id, file_size, mut conn), moved_to) = self
+            .beside_tree(tree, path, |conn, tree, path| async move {
+                let mut conn = conn.pinned_to_session();
+                let (file_id, file_size) = tree.open_file(&mut conn, &path).await?;
+                Ok((file_id, file_size, conn))
             })
             .await?;
         let tree = moved_to.as_ref().map_or(tree, |link| &link.tree);
-        let conn = self.connections.for_tree(tree)?;
-        tree.read_open_file_with_progress(conn, path, file_id, file_size, on_progress)
+        tree.read_open_file_with_progress(&mut conn, path, file_id, file_size, on_progress)
             .await
     }
 
@@ -1915,9 +1931,11 @@ impl SmbClient {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
-        // Open the file for writing.
-        let (file_id, moved_to) = self
+        // Open the file for writing, pinned first, so the writes after it
+        // can't reach a newer session.
+        let ((file_id, mut conn), moved_to) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
+                let conn = conn.pinned_to_session();
                 let req = crate::msg::create::CreateRequest {
                     requested_oplock_level: crate::types::OplockLevel::None,
                     impersonation_level: crate::msg::create::ImpersonationLevel::Impersonation,
@@ -1946,12 +1964,13 @@ impl SmbClient {
                 }
 
                 let mut cursor = crate::pack::ReadCursor::new(&frame.body);
-                Ok(crate::msg::create::CreateResponse::unpack(&mut cursor)?.file_id)
+                let file_id = crate::msg::create::CreateResponse::unpack(&mut cursor)?.file_id;
+                Ok((file_id, conn))
             })
             .await?;
         // The rest runs where the file was opened: the link's target, if any.
         let tree = moved_to.as_ref().map_or(tree, |link| &link.tree);
-        let conn = self.connections.for_tree(tree)?;
+        let conn = &mut conn;
 
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = write_pipe::WritePipe::new(conn.clone(), tree.tree_id, file_id, max_write);
@@ -2042,15 +2061,18 @@ impl SmbClient {
     {
         // Only the open goes through the link helper, so no chunk is pulled
         // before the file is open wherever it lives.
-        let (file_id, moved_to) = self
-            .beside_tree(tree, path, |mut conn, tree, path| async move {
-                tree.open_file_for_write(&mut conn, &path).await
+        // Pinned before the open, so the writes after it can't reach a newer
+        // session.
+        let ((file_id, mut conn), moved_to) = self
+            .beside_tree(tree, path, |conn, tree, path| async move {
+                let mut conn = conn.pinned_to_session();
+                let file_id = tree.open_file_for_write(&mut conn, &path).await?;
+                Ok((file_id, conn))
             })
             .await?;
         // The rest runs where the file was opened: the link's target, if any.
         let tree = moved_to.as_ref().map_or(tree, |link| &link.tree);
-        let conn = self.connections.for_tree(tree)?;
-        tree.write_open_file_streamed(conn, file_id, next_chunk)
+        tree.write_open_file_streamed(&mut conn, file_id, next_chunk)
             .await
     }
 

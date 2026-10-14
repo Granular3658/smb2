@@ -5,6 +5,16 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A file handle from before a reconnect can no longer read or write the wrong file.** A reconnect revives the connection in place, so a `FileReader`, `FileWriter`, `FileDownload`, `FileUpload`, or `Watcher` opened earlier kept a working connection and went on sending its old file id into the new session, which numbers its handles from scratch and may have given that id to a different file. Now every request from such a handle fails with the new `Error::HandleInvalidated` before it reaches the wire, and closing or aborting one sends nothing and succeeds, since the server let go of it with the session. The same guard covers the calls that hold a handle across many round trips (`list_directory`, the pipelined and streamed reads and writes, `write_file_with_progress`, and the server-side copies). Based on [#4](https://github.com/vdavid/smb2/pull/4) by @kalicyh.
+
+### Added
+
+- `Error::HandleInvalidated { opened_on, current }`, carrying the connection generations involved. It classifies as `ErrorKind::ConnectionLost` and is retryable: open the file again.
+
 ## [0.29.1] - 2026-10-14
 
 ### Fixed

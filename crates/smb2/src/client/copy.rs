@@ -499,6 +499,9 @@ impl Tree {
             "copy: server-side copy {} -> {} (truncate_dest={})",
             source_path, dest_path, truncate_dest
         );
+        // Both handles are used across many round trips, so every request
+        // goes out pinned to the session that opened them.
+        let conn = &mut conn.pinned_to_session();
 
         let (src_id, src_size) = self.open_file(conn, source_path).await?;
 

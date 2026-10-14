@@ -414,6 +414,9 @@ impl Tree {
         // (millions of times on a large share), so at DEBUG it dominates a consumer's
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
         trace!("tree: list_directory path={}", path);
+        // Every request after the open carries its handle, so all of them go
+        // out pinned to the session that opened it.
+        let conn = &mut conn.pinned_to_session();
 
         // Open the directory.
         let file_id = self.open_directory(conn, path).await?;
@@ -450,6 +453,7 @@ impl Tree {
         query_buffer_len: Option<u32>,
     ) -> Result<(Vec<DirectoryEntry>, ListingTrace)> {
         let buffer_len = query_buffer_len.unwrap_or_else(|| Self::default_query_buffer_len(conn));
+        let conn = &mut conn.pinned_to_session();
 
         let create_start = Instant::now();
         let file_id = self.open_directory(conn, path).await?;
@@ -827,17 +831,21 @@ impl Tree {
             path, recursive, self.tree_id
         );
 
+        // Pinned before the open, so the watcher never subscribes on a
+        // session other than the one its handle belongs to.
+        let mut conn = conn.pinned_to_session();
+
         // Open the directory with FILE_LIST_DIRECTORY access (same as
         // FILE_READ_DATA = 0x0001). We need the handle to stay open for
         // the lifetime of the watcher.
-        let file_id = self.open_directory(conn, path).await?;
+        let file_id = self.open_directory(&mut conn, path).await?;
 
         // Hand the watcher an owned Tree clone and an owned Connection
         // clone so it can pipeline CHANGE_NOTIFY requests independently
         // of the caller's connection use.
         Ok(crate::client::watcher::Watcher::new(
             self.clone(),
-            conn.clone(),
+            conn,
             file_id,
             recursive,
         ))
@@ -1720,6 +1728,10 @@ impl Tree {
     /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
     /// The window is capped at 32 in-flight requests (2 MB).
     pub async fn read_file_pipelined(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
+        // Every request after the open carries its handle, so all of them go
+        // out pinned to the session that opened it.
+        let conn = &mut conn.pinned_to_session();
+
         // Open the file.
         let (file_id, file_size) = self.open_file(conn, path).await?;
 
@@ -1805,6 +1817,7 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        let conn = &mut conn.pinned_to_session();
         let (file_id, file_size) = self.open_file(conn, path).await?;
         self.read_open_file_with_progress(conn, path, file_id, file_size, on_progress)
             .await
@@ -1824,6 +1837,8 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        // A no-op when the caller pinned before the open, as it should.
+        let conn = &mut conn.pinned_to_session();
         if file_size == 0 {
             trace!(
                 "tree: read_file_pipelined_with_progress path={}, size=0 (empty file)",
@@ -1918,7 +1933,8 @@ impl Tree {
         conn: &'a mut Connection,
         path: &str,
     ) -> Result<FileDownload<'a>> {
-        let (file_id, info) = self.open_for_read(conn, path).await?;
+        let mut conn = conn.pinned_to_session();
+        let (file_id, info) = self.open_for_read(&mut conn, path).await?;
         Ok(FileDownload::of_open_file(
             std::borrow::Cow::Borrowed(self),
             conn,
@@ -1953,6 +1969,10 @@ impl Tree {
             // Still create the file (to match write_file behavior).
             return self.write_file_compound(conn, path, data).await;
         }
+
+        // Every request after the open carries its handle, so all of them go
+        // out pinned to the session that opened it.
+        let conn = &mut conn.pinned_to_session();
 
         // Open (or create) the file for writing.
         let req = CreateRequest {
@@ -2103,6 +2123,9 @@ impl Tree {
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
         trace!("tree: write_file_streamed path={}", path);
+        // Every request after the open carries its handle, so all of them go
+        // out pinned to the session that opened it.
+        let conn = &mut conn.pinned_to_session();
 
         // Open (or create) the file for writing.
         let file_id = self.open_file_for_write(conn, path).await?;
@@ -2121,6 +2144,8 @@ impl Tree {
     where
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
+        // A no-op when the caller pinned before the open, as it should.
+        let conn = &mut conn.pinned_to_session();
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
 
