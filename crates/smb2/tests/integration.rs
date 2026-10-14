@@ -485,10 +485,13 @@ async fn listing_and_stat_agree_on_attributes_on_nas() {
     for entry in entries.iter().filter(|e| e.name != "." && e.name != "..") {
         let a = entry.attributes;
         assert_eq!(a.is_directory(), entry.is_directory, "{}", entry.name);
-        let stat = tree
-            .stat(&mut conn, &entry.name)
-            .await
-            .unwrap_or_else(|e| panic!("stat {}: {e}", entry.name));
+        // Other tests create and delete scratch files in the root concurrently,
+        // so an entry can vanish between the listing and its `stat`.
+        let stat = match tree.stat(&mut conn, &entry.name).await {
+            Ok(stat) => stat,
+            Err(e) if e.kind() == smb2::ErrorKind::NotFound => continue,
+            Err(e) => panic!("stat {}: {e}", entry.name),
+        };
         let s = stat.attributes;
         assert_eq!(
             (s.is_hidden(), s.is_readonly(), s.is_directory()),
