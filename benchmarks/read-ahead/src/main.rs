@@ -136,6 +136,7 @@ pub(crate) async fn connect(addr: &str) -> SmbClient {
         dfs_enabled: false,
         dfs_target_overrides: Default::default(),
         connect_options: None,
+        ..Default::default()
     })
     .await
     .expect("connect")

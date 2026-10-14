@@ -151,6 +151,22 @@ pub struct ClientConfig {
     /// [`ConnectOptions`](crate::transport::ConnectOptions) for why a single deadline around
     /// `TcpStream::connect` is not enough.
     pub connect_options: Option<crate::transport::ConnectOptions>,
+    /// How long a request may go without any sign of life from the server
+    /// before it gives up with [`Error::Timeout`], or `None` to wait
+    /// indefinitely. The same knob as
+    /// [`Connection::set_response_timeout`], which documents the clock.
+    ///
+    /// The reason it is here as well: it is in force from the very first
+    /// request, the NEGOTIATE inside [`SmbClient::connect`], which no setter
+    /// can reach. That is what bounds a server that accepts the TCP
+    /// connection and then never answers, so with [`timeout`](Self::timeout)
+    /// bounding the TCP connect, a `connect` against a silent server gives up
+    /// within roughly `timeout` plus this. DFS target connections inherit
+    /// whatever the primary connection has at the time they are dialed, and
+    /// a reconnect keeps it.
+    ///
+    /// Default: 30 s, sized for a NAS waking a spun-down disk.
+    pub response_timeout: Option<Duration>,
 }
 
 impl ClientConfig {
@@ -192,6 +208,7 @@ impl Default for ClientConfig {
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
+            response_timeout: Some(connection::RESPONSE_TIMEOUT),
         }
     }
 }
@@ -463,6 +480,8 @@ impl SmbClient {
 
         let mut conn = Connection::connect_with(&config.addr, config.connect_options()).await?;
         conn.set_compression_requested(config.compression);
+        // Before NEGOTIATE, so the handshake itself is bounded by it.
+        conn.set_response_timeout(config.response_timeout);
         conn.negotiate().await?;
 
         let session = Session::setup(
@@ -1186,6 +1205,10 @@ impl SmbClient {
         // Create new connection to target.
         let mut conn = Connection::connect_with(target_addr, self.config.connect_options()).await?;
         conn.set_compression_requested(self.config.compression);
+        // The primary's deadline as it stands now, not the config's: the
+        // consumer may have tuned it since `connect`. Before NEGOTIATE, so a
+        // target that accepts and never answers can't hang the call.
+        conn.set_response_timeout(self.connections.primary().response_timeout());
         conn.negotiate().await?;
 
         // Authenticate with same credentials.
@@ -2091,6 +2114,7 @@ pub async fn connect(addr: &str, username: &str, password: &str) -> Result<SmbCl
         dfs_enabled: true,
         dfs_target_overrides: std::collections::HashMap::new(),
         connect_options: None,
+        ..Default::default()
     })
     .await
 }
@@ -2252,6 +2276,7 @@ mod tests {
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
+            ..Default::default()
         };
 
         SmbClient::from_parts(config, conn, session)
@@ -3848,6 +3873,7 @@ mod tests {
             dfs_enabled: true,
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
+            ..Default::default()
         };
 
         let client = SmbClient::from_parts(config, conn, session);
@@ -3940,5 +3966,71 @@ mod tests {
             assert!(!host.is_empty(), "empty host for {addr:?}");
             assert_ne!(host, "[", "the bracket-only bug is back for {addr:?}");
         }
+    }
+
+    /// A listener that accepts and then says nothing, ever: the server shape
+    /// behind cmdr#406. Returns its address; the accepted sockets stay open
+    /// for as long as the test runtime lives.
+    async fn silent_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        addr
+    }
+
+    /// `ClientConfig::response_timeout` is the only way to bound the NEGOTIATE
+    /// inside `SmbClient::connect`: no setter can reach a connection before
+    /// `connect` returns it.
+    #[tokio::test]
+    async fn connect_to_a_silent_server_gives_up_within_the_configured_response_timeout() {
+        let config = ClientConfig {
+            addr: silent_server().await,
+            response_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), SmbClient::connect(config))
+            .await
+            .expect("connect must give up on its own, not wait out the 30 s default");
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::Timeout) | Err(Error::ServerUnresponsive { .. })
+            ),
+            "expected a timeout, got {:?}",
+            result.err()
+        );
+    }
+
+    /// A DFS target connection is dialed long after `connect`, so it takes the
+    /// deadline the primary has NOW, including anything the consumer set on it
+    /// since, rather than falling back to the default.
+    #[tokio::test]
+    async fn a_dfs_target_connection_inherits_the_primary_response_timeout() {
+        let mock = Arc::new(MockTransport::new());
+        let mut client = make_mock_client(&mock, SessionId(0x1234)).await;
+        client
+            .connection()
+            .set_response_timeout(Some(Duration::from_millis(200)));
+        let target = silent_server().await;
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), client.ensure_connection(&target))
+                .await
+                .expect("dialing a DFS target must give up within the primary's deadline");
+
+        assert!(
+            matches!(
+                result,
+                Err(Error::Timeout) | Err(Error::ServerUnresponsive { .. })
+            ),
+            "expected a timeout, got {result:?}"
+        );
     }
 }

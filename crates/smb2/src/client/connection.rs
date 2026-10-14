@@ -274,7 +274,7 @@ const CREDIT_STARVATION_RECHECK: Duration = Duration::from_millis(250);
 /// saying anything: waking a spun-down NAS disk before it can answer the first
 /// CREATE, which runs 10–20 s on consumer hardware. Past that, waiting is no
 /// longer diagnosis, it is a frozen transfer nobody is watching recover.
-const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long one frame may take to reach the socket before its caller gives up
 /// with [`Error::SendTimeout`].
@@ -4737,6 +4737,12 @@ impl Connection {
     /// application imposes its own deadline.
     pub fn set_response_timeout(&self, after: Option<Duration>) {
         *self.inner.response_timeout.lock().unwrap() = after;
+    }
+
+    /// The response deadline currently in force. See
+    /// [`set_response_timeout`](Self::set_response_timeout).
+    pub fn response_timeout(&self) -> Option<Duration> {
+        *self.inner.response_timeout.lock().unwrap()
     }
 
     /// How long one frame may take to reach the socket before its caller

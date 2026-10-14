@@ -69,6 +69,7 @@ fn config(addr: &str, username: &str, password: &str) -> ClientConfig {
         dfs_enabled: true,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        ..Default::default()
     }
 }
 

@@ -49,6 +49,7 @@ let mut client = smb2::SmbClient::connect(smb2::ClientConfig {
     compression: true,
     dfs_enabled: true,
     dfs_target_overrides: std::collections::HashMap::new(),
+    ..Default::default()
 }).await?;
 ```
 

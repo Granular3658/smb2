@@ -167,6 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        ..Default::default()
     })
     .await?;
 
@@ -413,6 +414,7 @@ async fn spawn_watcher(cfg: &Config) -> Result<tokio::task::JoinHandle<()>, smb2
         dfs_enabled: false,
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
+        ..Default::default()
     })
     .await?;
     let tree = client.connect_share(&cfg.share).await?;
