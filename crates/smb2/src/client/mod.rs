@@ -11,6 +11,7 @@ pub mod copy;
 pub(crate) mod credits;
 pub(crate) mod dfs;
 pub mod diagnostics;
+pub mod directory;
 #[cfg(test)]
 mod download_tests;
 pub mod durable;
@@ -49,6 +50,7 @@ pub use diagnostics::{
     DfsCacheEntry, Diagnostics, EncryptionInfo, InboundProgress, Liveness, MetricsSnapshot,
     NegotiatedSummary, SessionDiagnostics, SigningInfo,
 };
+pub use directory::DirectoryReader;
 pub use durable::{DurableHandle, DurableOpen, FileIdentity};
 pub use pipeline::{Op, OpResult, Pipeline};
 pub use resolve::Resolved;
@@ -1402,6 +1404,27 @@ impl SmbClient {
         })
         .await
         .map(|(value, _)| value)
+    }
+
+    /// Open a directory on the given share for listing one server batch at a
+    /// time. See [`DirectoryReader`] and [`Tree::open_directory_reader`].
+    ///
+    /// A path behind a DFS link is listed on the link's target; `tree` stays on
+    /// its own share either way. A session found dead at the open is revived
+    /// and the open sent again, like [`list_directory`](Self::list_directory),
+    /// since nothing has been listed yet. A listing in progress is never
+    /// replayed: after a reconnect the reader fails with
+    /// [`Error::HandleInvalidated`], and the caller opens a new one.
+    pub async fn open_directory_reader(
+        &mut self,
+        tree: &mut Tree,
+        path: &str,
+    ) -> Result<DirectoryReader> {
+        self.replaying(tree, path, |conn, tree, path| async move {
+            tree.open_directory_reader(conn, &path).await
+        })
+        .await
+        .map(|(reader, _)| reader)
     }
 
     /// Read a file from the given share.
@@ -3010,6 +3033,7 @@ mod tests {
         fn send<T: Send>(_: T) {}
         send(client.download(tree, "f"));
         send(client.watch(tree, "f", false));
+        send(client.open_directory_reader(tree, "f"));
         send(client.create_file_writer(tree, "f"));
         send(client.delete_files(tree, &["f"]));
         send(client.read_file_with_progress(tree, "f", |_| ControlFlow::Continue(())));

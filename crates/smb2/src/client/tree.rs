@@ -12,6 +12,7 @@ use log::{debug, info, trace, warn};
 
 use crate::client::connection::{CompoundOp, Connection, Frame, SessionPin, WaiterGuard};
 use crate::client::credits;
+use crate::client::directory::DirectoryReader;
 use crate::client::stream::{FileDownload, Progress};
 use crate::client::write_pipe::WritePipe;
 use crate::error::Result;
@@ -208,7 +209,7 @@ impl ListingTrace {
 }
 
 /// Outcome of a single QUERY_DIRECTORY round trip.
-enum QueryStepOutcome {
+pub(crate) enum QueryStepOutcome {
     /// The server returned entries. `bytes` is the output-buffer length.
     Entries {
         entries: Vec<DirectoryEntry>,
@@ -453,36 +454,66 @@ impl Tree {
         }
     }
 
+    /// Open a directory for listing one server batch at a time.
+    ///
+    /// Sends the CREATE and hands back a [`DirectoryReader`] whose
+    /// [`next_batch`](DirectoryReader::next_batch) returns one QUERY_DIRECTORY
+    /// answer per call and closes the handle at the end of the listing. The
+    /// reader owns a clone of `conn` and of this tree, so it borrows nothing
+    /// and can move to another task.
+    pub async fn open_directory_reader(
+        &self,
+        conn: Connection,
+        path: &str,
+    ) -> Result<DirectoryReader> {
+        let buffer_len = Self::default_query_buffer_len(&conn);
+        self.open_directory_reader_sized(conn, path, buffer_len)
+            .await
+    }
+
+    /// [`open_directory_reader`](Self::open_directory_reader) asking for
+    /// `buffer_len` bytes of entries per QUERY_DIRECTORY.
+    async fn open_directory_reader_sized(
+        &self,
+        conn: Connection,
+        path: &str,
+        buffer_len: u32,
+    ) -> Result<DirectoryReader> {
+        trace!("tree: open_directory_reader path={}", path);
+        // Pinned before the CREATE, so a revival that lands before the answer
+        // leaves the handle pinned to the session it belongs to.
+        let mut conn = self.pinned_conn(&conn).pinned_to_session();
+        let file_id = self.open_directory(&mut conn, path).await?;
+        Ok(DirectoryReader::new(
+            Arc::new(self.clone()),
+            conn,
+            file_id,
+            buffer_len,
+        ))
+    }
+
     /// List files in a directory.
     ///
     /// Opens the directory with CREATE, queries entries with QUERY_DIRECTORY
-    /// (looping until STATUS_NO_MORE_FILES), then closes the handle.
+    /// (looping until STATUS_NO_MORE_FILES), then closes the handle. To handle
+    /// each server batch as it arrives instead, or to stop early, use
+    /// [`open_directory_reader`](Self::open_directory_reader): this collects
+    /// through one, so both send the same requests.
     pub async fn list_directory(
         &self,
         conn: &mut Connection,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
-        let conn = &mut self.pinned_conn(conn);
         // TRACE, not DEBUG: a recursive scan calls list_directory once per directory
         // (millions of times on a large share), so at DEBUG it dominates a consumer's
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
         trace!("tree: list_directory path={}", path);
-        // Every request after the open carries its handle, so all of them go
-        // out pinned to the session that opened it.
-        let conn = &mut conn.pinned_to_session();
-
-        // Open the directory.
-        let file_id = self.open_directory(conn, path).await?;
-
-        // Query directory entries.
-        let result = self.query_directory_loop(conn, file_id).await;
-
-        // Close the handle regardless of query result.
-        let close_result = self.close_handle(conn, file_id).await;
-
-        // Return the query result, or if it succeeded, check the close result.
-        let entries = result?;
-        close_result?;
+        let mut reader = self.open_directory_reader(conn.clone(), path).await?;
+        let mut entries = Vec::new();
+        // An error has already closed the handle; the reader says so.
+        while let Some(batch) = reader.next_batch().await? {
+            entries.extend(batch);
+        }
         trace!("tree: list_directory done, entries={}", entries.len());
         Ok(entries)
     }
@@ -505,62 +536,29 @@ impl Tree {
         path: &str,
         query_buffer_len: Option<u32>,
     ) -> Result<(Vec<DirectoryEntry>, ListingTrace)> {
-        let conn = &mut self.pinned_conn(conn);
         let buffer_len = query_buffer_len.unwrap_or_else(|| Self::default_query_buffer_len(conn));
-        let conn = &mut conn.pinned_to_session();
 
         let create_start = Instant::now();
-        let file_id = self.open_directory(conn, path).await?;
+        let mut reader = self
+            .open_directory_reader_sized(conn.clone(), path, buffer_len)
+            .await?;
         let create = create_start.elapsed();
 
-        let mut queries = Vec::new();
-        let mut all_entries = Vec::new();
-        let mut restart = true;
-        let query_result = loop {
-            let step_start = Instant::now();
-            match self
-                .query_directory_step(conn, file_id, restart, buffer_len)
-                .await
-            {
-                Ok(QueryStepOutcome::Entries { entries, bytes }) => {
-                    queries.push(QueryStep {
-                        elapsed: step_start.elapsed(),
-                        entries: entries.len(),
-                        bytes,
-                        no_more_files: false,
-                    });
-                    all_entries.extend(entries);
-                }
-                Ok(QueryStepOutcome::NoMoreFiles { bytes }) => {
-                    queries.push(QueryStep {
-                        elapsed: step_start.elapsed(),
-                        entries: 0,
-                        bytes,
-                        no_more_files: true,
-                    });
-                    break Ok(());
-                }
-                Err(e) => break Err(e),
-            }
-            restart = false;
-        };
-
-        // Close the handle regardless of query result, mirroring `list_directory`.
-        let close_start = Instant::now();
-        let close_result = self.close_handle(conn, file_id).await;
-        let close = close_start.elapsed();
-
-        query_result?;
-        close_result?;
+        reader.record_timings();
+        let mut entries = Vec::new();
+        while let Some(batch) = reader.next_batch().await? {
+            entries.extend(batch);
+        }
+        let timings = reader.take_timings();
 
         let trace = ListingTrace {
             create,
-            queries,
-            close,
+            queries: timings.queries,
+            close: timings.close,
             query_buffer_len: buffer_len,
-            entries: all_entries.len(),
+            entries: entries.len(),
         };
-        Ok((all_entries, trace))
+        Ok((entries, trace))
     }
 
     /// Read a small file using a compound CREATE+READ+CLOSE request.
@@ -2813,7 +2811,6 @@ impl Tree {
         Ok((resp.file_id, resp.end_of_file))
     }
 
-    /// Loop QUERY_DIRECTORY until STATUS_NO_MORE_FILES.
     /// Default per-QUERY_DIRECTORY output-buffer length.
     ///
     /// Capped at 65536 so that CreditCharge=1 is valid: the spec requires
@@ -2827,14 +2824,14 @@ impl Tree {
 
     /// Issue one QUERY_DIRECTORY round trip and parse its reply.
     ///
-    /// The single-source of the CREATE-less half of a listing: both
-    /// [`query_directory_loop`](Self::query_directory_loop) and
-    /// [`list_directory_instrumented`](Self::list_directory_instrumented) drive
-    /// this, so they always exercise the same wire request.
+    /// The one wire implementation of a listing's queries: every
+    /// [`DirectoryReader`] drives this, and [`list_directory`](Self::list_directory)
+    /// and [`list_directory_instrumented`](Self::list_directory_instrumented)
+    /// collect through one.
     ///
     /// `output_buffer_length` above 65536 needs a matching multi-credit charge;
     /// this computes it as ceil(len / 65536).
-    async fn query_directory_step(
+    pub(crate) async fn query_directory_step(
         &self,
         conn: &mut Connection,
         file_id: FileId,
@@ -2893,30 +2890,6 @@ impl Tree {
             );
         }
         Ok(QueryStepOutcome::Entries { entries, bytes })
-    }
-
-    async fn query_directory_loop(
-        &self,
-        conn: &mut Connection,
-        file_id: FileId,
-    ) -> Result<Vec<DirectoryEntry>> {
-        let conn = &mut self.pinned_conn(conn);
-        let output_buffer_length = Self::default_query_buffer_len(conn);
-        let mut all_entries = Vec::new();
-        let mut restart = true;
-
-        loop {
-            match self
-                .query_directory_step(conn, file_id, restart, output_buffer_length)
-                .await?
-            {
-                QueryStepOutcome::NoMoreFiles { .. } => break,
-                QueryStepOutcome::Entries { entries, .. } => all_entries.extend(entries),
-            }
-            restart = false;
-        }
-
-        Ok(all_entries)
     }
 
     /// Read file data in chunks.
@@ -3499,12 +3472,11 @@ mod tests {
     use crate::client::connection::pack_message;
     use crate::client::test_helpers::{
         build_close_response, build_create_error_response, build_create_response,
-        build_tree_connect_response, setup_connection, setup_connection_with_max_read,
-        setup_connection_without_credits,
+        build_file_both_dir_info, build_query_directory_response, build_tree_connect_response,
+        setup_connection, setup_connection_with_max_read, setup_connection_without_credits,
     };
     use crate::msg::create::{CreateAction, CreateResponse};
     use crate::msg::header::Header;
-    use crate::msg::query_directory::QueryDirectoryResponse;
     use crate::msg::tree_connect::ShareType;
     use crate::transport::MockTransport;
     use crate::types::status::NtStatus;
@@ -3559,29 +3531,6 @@ mod tests {
         pack_message(&h, &body)
     }
 
-    fn build_query_directory_response(status: NtStatus, entries_data: Vec<u8>) -> Vec<u8> {
-        let mut h = Header::new_request(Command::QueryDirectory);
-        h.flags.set_response();
-        h.credits = 32;
-        h.status = status;
-
-        if status == NtStatus::NO_MORE_FILES {
-            // Error response body for NO_MORE_FILES.
-            use crate::msg::header::ErrorResponse;
-            let body = ErrorResponse {
-                error_context_count: 0,
-                error_data: vec![],
-            };
-            return pack_message(&h, &body);
-        }
-
-        let body = QueryDirectoryResponse {
-            output_buffer: entries_data,
-        };
-
-        pack_message(&h, &body)
-    }
-
     fn build_read_response(status: NtStatus, data: Vec<u8>) -> Vec<u8> {
         let mut h = Header::new_request(Command::Read);
         h.flags.set_response();
@@ -3605,58 +3554,6 @@ mod tests {
         };
 
         pack_message(&h, &body)
-    }
-
-    /// Build a single FileBothDirectoryInformation entry.
-    fn build_file_both_dir_info(
-        name: &str,
-        size: u64,
-        is_directory: bool,
-        next_offset: u32,
-    ) -> Vec<u8> {
-        let name_u16: Vec<u16> = name.encode_utf16().collect();
-        let name_bytes_len = name_u16.len() * 2;
-
-        let mut buf = Vec::new();
-        // NextEntryOffset (4)
-        buf.extend_from_slice(&next_offset.to_le_bytes());
-        // FileIndex (4)
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        // CreationTime (8)
-        buf.extend_from_slice(&132_000_000_000_000_000u64.to_le_bytes());
-        // LastAccessTime (8)
-        buf.extend_from_slice(&132_000_000_000_000_000u64.to_le_bytes());
-        // LastWriteTime (8)
-        buf.extend_from_slice(&133_000_000_000_000_000u64.to_le_bytes());
-        // ChangeTime (8)
-        buf.extend_from_slice(&133_000_000_000_000_000u64.to_le_bytes());
-        // EndOfFile (8)
-        buf.extend_from_slice(&size.to_le_bytes());
-        // AllocationSize (8)
-        buf.extend_from_slice(&((size + 4095) & !4095).to_le_bytes());
-        // FileAttributes (4)
-        let attrs = if is_directory {
-            FileAttributes::DIRECTORY
-        } else {
-            0x00000020 // ARCHIVE
-        };
-        buf.extend_from_slice(&attrs.to_le_bytes());
-        // FileNameLength (4)
-        buf.extend_from_slice(&(name_bytes_len as u32).to_le_bytes());
-        // EaSize (4)
-        buf.extend_from_slice(&0u32.to_le_bytes());
-        // ShortNameLength (1)
-        buf.push(0);
-        // Reserved (1)
-        buf.push(0);
-        // ShortName (24 bytes, zero-padded)
-        buf.extend_from_slice(&[0u8; 24]);
-        // FileName (variable)
-        for &u in &name_u16 {
-            buf.extend_from_slice(&u.to_le_bytes());
-        }
-
-        buf
     }
 
     #[tokio::test]

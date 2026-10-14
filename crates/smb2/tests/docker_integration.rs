@@ -908,6 +908,78 @@ async fn fresh_dir(conn: &mut Connection, tree: &Tree, dir: &str) {
     }
 }
 
+/// A folder too big for one QUERY_DIRECTORY answer comes back in several
+/// batches that add up to exactly what `list_directory` returns, even when
+/// every batch's first call is dropped mid-flight.
+#[tokio::test]
+#[ignore]
+async fn guest_a_directory_reader_lists_a_big_folder_batch_by_batch() {
+    let (mut conn, tree) = connect_guest().await;
+    let dir = "dir-reader-batches";
+    fresh_dir(&mut conn, &tree, dir).await;
+    // ~336 bytes an entry at this name length, so ~195 fit one 64 KiB answer.
+    let files: Vec<String> = (0..450)
+        .map(|i| format!("{i:04}-{}", "x".repeat(115)))
+        .collect();
+    for name in &files {
+        tree.write_file(&mut conn, &format!("{dir}/{name}"), b"x")
+            .await
+            .expect("write a file into the folder");
+    }
+
+    let listed: Vec<String> = tree
+        .list_directory(&mut conn, dir)
+        .await
+        .expect("list_directory")
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert_eq!(listed.len(), files.len() + 2, "the files plus . and ..");
+
+    let mut reader = tree
+        .open_directory_reader(conn.clone(), dir)
+        .await
+        .expect("open_directory_reader");
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut drops = 0;
+    loop {
+        // A `select!` arm losing: one poll hands the query to the connection,
+        // then the call is dropped, and the answer lands while nobody waits.
+        // The next call must return that answer.
+        let batch = match futures_util::FutureExt::now_or_never(reader.next_batch()) {
+            Some(done) => done,
+            None => {
+                drops += 1;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                reader.next_batch().await
+            }
+        };
+        match batch.expect("next_batch") {
+            Some(batch) => batches.push(batch.into_iter().map(|e| e.name).collect()),
+            None => break,
+        }
+    }
+    assert!(
+        batches.len() >= 2,
+        "the folder should need several QUERY_DIRECTORY answers, got {}",
+        batches.len()
+    );
+    assert_eq!(batches.concat(), listed, "nothing skipped, nothing twice");
+    assert_eq!(
+        drops,
+        batches.len() + 1,
+        "every call, the last one included, was dropped first"
+    );
+
+    // Stopping early closes the handle, so the folder can be removed after.
+    let mut reader = tree
+        .open_directory_reader(conn.clone(), dir)
+        .await
+        .expect("open_directory_reader");
+    assert!(reader.next_batch().await.expect("first batch").is_some());
+    reader.close().await.expect("close part-way");
+}
+
 /// Without the option a rename refuses a taken name and touches neither file;
 /// with it the source's contents take the destination's name in one step.
 #[tokio::test]
@@ -3242,6 +3314,35 @@ async fn dfs_list_directory_through_link() {
         .disconnect_share(&tree)
         .await
         .expect("disconnect failed");
+}
+
+#[tokio::test]
+#[ignore]
+async fn dfs_a_directory_reader_lists_through_a_link() {
+    let _ = env_logger::try_init();
+
+    let mut client = dfs_client().await;
+    let mut tree = client
+        .connect_share("dfs")
+        .await
+        .expect("connect_share('dfs') failed");
+
+    let mut reader = client
+        .open_directory_reader(&mut tree, "data")
+        .await
+        .expect("open_directory_reader through the DFS link");
+    let mut names = Vec::new();
+    while let Some(batch) = reader.next_batch().await.expect("next_batch") {
+        names.extend(batch.into_iter().map(|e| e.name));
+    }
+    assert!(
+        names.iter().any(|n| n == "hello.txt") && names.iter().any(|n| n == "subdir"),
+        "expected the link target's entries, got {names:?}"
+    );
+    assert_eq!(
+        tree.share_name, "dfs",
+        "the caller's tree stays on its share"
+    );
 }
 
 /// Browsing into a link and back out on the same tree: the tree stays on the

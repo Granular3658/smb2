@@ -116,6 +116,7 @@ pub use client::copy::{
 };
 
 // Tree and file types
+pub use client::directory::DirectoryReader;
 pub use client::tree::{
     DfsOrigin, DirectoryEntry, FileInfo, FsInfo, ListingTrace, QueryStep, RenameOptions, Tree,
 };

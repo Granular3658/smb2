@@ -16,8 +16,8 @@ use crate::client::connection::{Connection, NegotiatedParams, SessionReviver};
 use crate::client::stream::FileUpload;
 use crate::client::test_helpers::{
     build_close_response, build_compound_response_frame, build_create_response,
-    build_flush_response, build_query_info_error_response, build_read_response,
-    build_write_response, setup_connection,
+    build_file_both_dir_info, build_flush_response, build_query_directory_response,
+    build_query_info_error_response, build_read_response, build_write_response, setup_connection,
 };
 use crate::client::tree::Tree;
 use crate::error::{Error, Result};
@@ -269,6 +269,46 @@ async fn a_watcher_from_before_a_reconnect_does_not_subscribe_with_a_dead_handle
         .await
         .expect("closing a handle the server already let go of has nothing to fail at");
     assert_eq!(fresh.sent_count(), 0, "nor a CLOSE");
+}
+
+/// A server cursor doesn't survive its session, so a listing can't resume
+/// across a reconnect: the caller opens a new reader.
+#[tokio::test]
+async fn a_directory_reader_from_before_a_reconnect_does_not_list_the_new_sessions_directory() {
+    let mock = Arc::new(MockTransport::new());
+    mock.queue_response(build_create_response(FILE, 0));
+    let conn = setup_connection(&mock);
+    let mut reader = test_tree()
+        .open_directory_reader(conn.clone(), "dir")
+        .await
+        .unwrap();
+
+    let someone_elses = build_query_directory_response(
+        NtStatus::SUCCESS,
+        build_file_both_dir_info("someone else's.txt", 1, false, 0),
+    );
+    let fresh = revive(&conn, vec![someone_elses, build_close_response()]).await;
+
+    assert_invalidated(
+        bounded("next_batch", reader.next_batch()).await,
+        "next_batch",
+    );
+    assert_eq!(
+        fresh.sent_count(),
+        0,
+        "no QUERY_DIRECTORY, and no CLOSE of somebody else's handle"
+    );
+    assert!(
+        bounded("next_batch", reader.next_batch())
+            .await
+            .unwrap()
+            .is_none(),
+        "the reader is finished after the error"
+    );
+    bounded("close", reader.close())
+        .await
+        .expect("closing a handle the server already let go of has nothing to fail at");
+    assert_eq!(fresh.sent_count(), 0);
 }
 
 /// A second `Session::setup` on the same socket replaces the session without

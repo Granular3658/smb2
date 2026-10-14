@@ -347,6 +347,8 @@ For when you want to do one thing and get the result:
 - `client.list_shares()`: List available shares
 - `client.connect_share()`: Connect to a share
 - `client.list_directory(&mut share, path)`: List a directory
+- `client.open_directory_reader(&mut share, path)`: List a directory one server batch at a time, so a huge folder
+  never sits in memory whole and you can stop early. `reader.next_batch()` is cancel-safe in a `select!`
 - `client.read_file(&mut share, path)`: Download a file
 - `client.write_file(&share, path, data)`: Upload a file
 - `client.delete_file(&share, path)`: Delete a file

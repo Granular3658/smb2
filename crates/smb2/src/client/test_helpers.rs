@@ -302,6 +302,85 @@ pub(crate) fn build_read_response(data: Vec<u8>) -> Vec<u8> {
     pack_message(&h, &body)
 }
 
+/// Build a QUERY_DIRECTORY response: `entries_data` as the output buffer on
+/// success, an error body (as `STATUS_NO_MORE_FILES` comes back) otherwise.
+pub(crate) fn build_query_directory_response(
+    status: crate::types::status::NtStatus,
+    entries_data: Vec<u8>,
+) -> Vec<u8> {
+    use crate::msg::header::ErrorResponse;
+    use crate::msg::query_directory::QueryDirectoryResponse;
+    let mut h = Header::new_request(Command::QueryDirectory);
+    h.flags.set_response();
+    h.credits = 32;
+    h.status = status;
+
+    if status != crate::types::status::NtStatus::SUCCESS {
+        let body = ErrorResponse {
+            error_context_count: 0,
+            error_data: vec![],
+        };
+        return pack_message(&h, &body);
+    }
+
+    let body = QueryDirectoryResponse {
+        output_buffer: entries_data,
+    };
+    pack_message(&h, &body)
+}
+
+/// Build a single `FileBothDirectoryInformation` entry (MS-FSCC § 2.4.8).
+pub(crate) fn build_file_both_dir_info(
+    name: &str,
+    size: u64,
+    is_directory: bool,
+    next_offset: u32,
+) -> Vec<u8> {
+    let name_u16: Vec<u16> = name.encode_utf16().collect();
+    let name_bytes_len = name_u16.len() * 2;
+
+    let mut buf = Vec::new();
+    // NextEntryOffset (4)
+    buf.extend_from_slice(&next_offset.to_le_bytes());
+    // FileIndex (4)
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // CreationTime (8)
+    buf.extend_from_slice(&132_000_000_000_000_000u64.to_le_bytes());
+    // LastAccessTime (8)
+    buf.extend_from_slice(&132_000_000_000_000_000u64.to_le_bytes());
+    // LastWriteTime (8)
+    buf.extend_from_slice(&133_000_000_000_000_000u64.to_le_bytes());
+    // ChangeTime (8)
+    buf.extend_from_slice(&133_000_000_000_000_000u64.to_le_bytes());
+    // EndOfFile (8)
+    buf.extend_from_slice(&size.to_le_bytes());
+    // AllocationSize (8)
+    buf.extend_from_slice(&((size + 4095) & !4095).to_le_bytes());
+    // FileAttributes (4)
+    let attrs = if is_directory {
+        crate::types::flags::FileAttributes::DIRECTORY
+    } else {
+        0x00000020 // ARCHIVE
+    };
+    buf.extend_from_slice(&attrs.to_le_bytes());
+    // FileNameLength (4)
+    buf.extend_from_slice(&(name_bytes_len as u32).to_le_bytes());
+    // EaSize (4)
+    buf.extend_from_slice(&0u32.to_le_bytes());
+    // ShortNameLength (1)
+    buf.push(0);
+    // Reserved (1)
+    buf.push(0);
+    // ShortName (24 bytes, zero-padded)
+    buf.extend_from_slice(&[0u8; 24]);
+    // FileName (variable)
+    for &u in &name_u16 {
+        buf.extend_from_slice(&u.to_le_bytes());
+    }
+
+    buf
+}
+
 /// Build a READ response with a non-success status (for error tests).
 pub(crate) fn build_read_error_response(status: crate::types::status::NtStatus) -> Vec<u8> {
     use crate::msg::header::ErrorResponse;

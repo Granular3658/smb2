@@ -126,7 +126,7 @@ src/
     write_pipe.rs         # WritePipe: the one engine every pipelined upload runs on
     download_tests.rs     # FileDownload against the mock (order, cancel safety, closing, adaptive timing, rate hint)
     upload_tests.rs       # Uploads against the mock (chunk size, adaptive timing, fixed windows, rate hint, cancel safety)
-    directory.rs          # Directory listing helpers
+    directory.rs          # DirectoryReader: a listing one server batch at a time, cancel-safe; list_directory collects through it
     shares.rs             # Share enumeration (IPC$ + srvsvc RPC)
     dfs.rs                # DFS referral IOCTL, DfsResolver with TTL cache
     copy.rs               # Server-side copy API (FSCTL_SRV_COPYCHUNK): resume-key + copychunk, batched convenience
