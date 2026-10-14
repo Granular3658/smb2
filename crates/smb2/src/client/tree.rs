@@ -141,7 +141,19 @@ const FILE_END_OF_FILE_INFORMATION: u8 = 20;
 const FILE_FS_FULL_SIZE_INFORMATION: u8 = 7;
 
 /// A directory entry returned by [`Tree::list_directory`].
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`, so a later release can report more about an entry
+/// without breaking anyone. To build one yourself (a test fixture for code
+/// that maps entries, say), start from [`Default`] and set the fields:
+///
+/// ```
+/// let mut entry = smb2::DirectoryEntry::default();
+/// entry.name = "report.pdf".to_string();
+/// entry.size = 1024;
+/// assert!(!entry.is_directory);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct DirectoryEntry {
     /// The file or directory name.
     pub name: String,
@@ -227,7 +239,19 @@ pub(crate) enum QueryStepOutcome {
 }
 
 /// File metadata returned by [`Tree::stat`].
-#[derive(Debug, Clone)]
+///
+/// `#[non_exhaustive]`, so a later release can report more about a file
+/// without breaking anyone. To build one yourself (a test fixture, say),
+/// start from [`Default`] and set the fields:
+///
+/// ```
+/// let mut info = smb2::FileInfo::default();
+/// info.size = 2048;
+/// info.modified = smb2::pack::FileTime(133_485_408_000_000_000);
+/// assert_eq!(info.changed, smb2::pack::FileTime::ZERO);
+/// ```
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct FileInfo {
     /// The file size in bytes.
     pub size: u64,

@@ -594,6 +594,7 @@ Decisions behind this shape (cited by ID from code, like decision E3), and what 
 - **One task owns each half of the socket**: the receiver routes, the writer (§ The send path) is the only thing that writes. Both exist for correctness, not speed: a dropped caller must not corrupt the next response, and a cancelled send must not leave half a frame on the wire.
 - **Compound reads as default**: One round-trip for small files. Saves 2 RTTs vs sequential CREATE/READ/CLOSE.
 - **512 KB pipeline chunks**: Balances between too many small requests (overhead) and too few large ones (credit starvation). Gives ~20 chunks per 10 MB file.
+- **`FileInfo` and `DirectoryEntry` are `#[non_exhaustive]` plus `Default`**: a new field is a minor release, and a consumer's test fixture builds one with `default()` and field assignment (clippy's `field_reassign_with_default` stays quiet on a non-exhaustive type from another crate). ❌ Don't drop `Default` to "force" a constructor: it's the one way outside code can make one. Fields a listing can't fill stay out of `DirectoryEntry` rather than coming back zeroed.
 - **Password stored in `SmbClient`**: Enables reconnect without re-prompting. Not encrypted in memory. Drop when done. `ClientConfig` and `Session` implement `Debug` by hand so `{:?}` prints `***` for the password and keys (`ClientConfig`'s impl destructures, so a new field fails to compile until it's printed or skipped on purpose); `ClientReviver` has no `Debug`.
 
 ## Gotchas

@@ -7,6 +7,10 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Breaking
+
+- **`FileInfo` and `DirectoryEntry` are `#[non_exhaustive]`, and both have a new `changed` field.** Marking them now, on the way to 1.0 ([#11](https://github.com/vdavid/smb2/issues/11)), means the next thing either one reports arrives in a minor release instead of breaking every struct literal again, the way `attributes` did in 0.28.0. Reading the fields is unchanged. Code that builds one by hand (a test fixture for code that maps entries, say) can no longer use a struct literal: both now implement `Default`, so start from `DirectoryEntry::default()` (or `FileInfo::default()`) and assign the fields you care about. Clippy's `field_reassign_with_default` doesn't fire on that for a `#[non_exhaustive]` type from another crate. A pattern that destructures either one needs a `..`.
+
 ### Fixed
 
 - **A file handle from before a reconnect can no longer read or write the wrong file.** A reconnect revives the connection in place, so a `FileReader`, `FileWriter`, `FileDownload`, `FileUpload`, or `Watcher` opened earlier kept a working connection and went on sending its old file id into the new session, which numbers its handles from scratch and may have given that id to a different file. Now every request from such a handle fails with the new `Error::HandleInvalidated` before it reaches the wire, and closing or aborting one sends nothing and succeeds, since the server let go of it with the session. The same guard covers the calls that hold a handle across many round trips (`list_directory`, the pipelined and streamed reads and writes, `write_file_with_progress`, and the server-side copies). Based on [#4](https://github.com/vdavid/smb2/pull/4) by @kalicyh.
