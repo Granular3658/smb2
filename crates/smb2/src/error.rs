@@ -144,7 +144,8 @@ pub enum Error {
         reason: DurableLoss,
     },
 
-    /// A file handle outlived the session that opened it, so the request was
+    /// A file handle or a [`Tree`](crate::Tree) outlived the session that
+    /// opened it, or was used on another connection, so the request was
     /// refused before it reached the wire.
     ///
     /// A reconnect revives a [`Connection`](crate::client::connection::Connection)
@@ -155,22 +156,28 @@ pub enum Error {
     /// work, though: they belong to the session that died, and the new session
     /// numbers its own from scratch, so the same ids can name a different file
     /// or share there. Sending them would read or write the wrong file, so
-    /// every request from such a handle fails with this instead.
+    /// every request from such a handle fails with this instead. A `Tree` is
+    /// the same: its tree id belongs to the session that connected it, and on
+    /// a new session (or on another connection, like a DFS target's tree sent
+    /// on the primary) the same id can be a different share.
     ///
     /// `opened_on` and `current` are
     /// [`Connection::generation`](crate::client::connection::Connection::generation)s.
     /// They're equal when a second `Session::setup` replaced the session on the
     /// same socket, without a reconnect.
     ///
-    /// The handle is finished: open the file again. Closing it sends nothing,
+    /// The handle is finished: open the file (or connect the share) again.
+    /// `SmbClient`'s replaying calls (listings, reads, `stat`) do that for a
+    /// stale tree themselves when `auto_reconnect` is on. Closing a handle sends nothing,
     /// since the server let go of it with the session. Classifies as
     /// [`ErrorKind::ConnectionLost`] and reports as retryable, like
     /// [`DurableHandleLost`](Self::DurableHandleLost): this handle can't be
     /// saved, and running the transfer again on a new one is the intended
     /// response.
     #[error(
-        "this file handle belongs to a session that has ended (opened on connection \
-         generation {opened_on}, now on {current}); open the file again"
+        "this handle belongs to a session that has ended or to another connection \
+         (opened on connection generation {opened_on}, now on {current}); open the file \
+         or connect the share again"
     )]
     HandleInvalidated {
         /// The connection's generation when the handle was opened.

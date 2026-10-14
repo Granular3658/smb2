@@ -178,6 +178,7 @@ mod tests {
 
     fn test_tree() -> Tree {
         Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),

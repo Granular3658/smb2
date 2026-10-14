@@ -216,6 +216,7 @@ impl Tree {
         conn: &mut Connection,
         source: FileId,
     ) -> Result<ResumeKey> {
+        let conn = &mut self.pinned_conn(conn);
         let req = IoctlRequest {
             ctl_code: FSCTL_SRV_REQUEST_RESUME_KEY,
             file_id: source,
@@ -271,6 +272,7 @@ impl Tree {
         source_key: &ResumeKey,
         chunks: &[CopyChunk],
     ) -> Result<CopyChunkOutcome> {
+        let conn = &mut self.pinned_conn(conn);
         let copy = SrvCopychunkCopy {
             source_key: source_key.0,
             chunks: chunks.iter().copied().map(SrvCopychunk::from).collect(),
@@ -353,6 +355,7 @@ impl Tree {
         dest_offset: u64,
         length: u64,
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         if length == 0 {
             return Ok(0);
         }
@@ -423,6 +426,7 @@ impl Tree {
         source_path: &str,
         dest_path: &str,
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         // Whole-file copy: truncate the destination and copy the entire source.
         self.copy_paths(conn, source_path, dest_path, true, 0, 0, None)
             .await
@@ -468,6 +472,7 @@ impl Tree {
         dest_offset: u64,
         length: u64,
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         self.copy_paths(
             conn,
             source_path,
@@ -495,6 +500,7 @@ impl Tree {
         dest_offset: u64,
         length: Option<u64>,
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         debug!(
             "copy: server-side copy {} -> {} (truncate_dest={})",
             source_path, dest_path, truncate_dest
@@ -650,6 +656,7 @@ mod tests {
 
     fn test_tree() -> Arc<Tree> {
         Arc::new(Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),

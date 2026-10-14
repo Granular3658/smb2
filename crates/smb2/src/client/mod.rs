@@ -1730,7 +1730,7 @@ impl SmbClient {
         // download sends only on the session its handle belongs to.
         let ((file_id, info, conn), moved_to) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
-                let mut conn = conn.pinned_to_session();
+                let mut conn = tree.pinned_conn(&conn).pinned_to_session();
                 let (file_id, info) = tree.open_for_read(&mut conn, &path).await?;
                 Ok((file_id, info, conn))
             })
@@ -1786,7 +1786,7 @@ impl SmbClient {
         // sends only on the session its handle belongs to.
         let ((opened, conn), moved_to) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
-                let mut conn = conn.pinned_to_session();
+                let mut conn = tree.pinned_conn(&conn).pinned_to_session();
                 if data.len() as u64 <= conn.compound_write_limit() {
                     // The limit is `max_write`, lowered to what the credit
                     // window funds. A refused compound CREATE fails the WRITE
@@ -1934,7 +1934,7 @@ impl SmbClient {
         // session.
         let ((file_id, file_size, mut conn), moved_to) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
-                let mut conn = conn.pinned_to_session();
+                let mut conn = tree.pinned_conn(&conn).pinned_to_session();
                 let (file_id, file_size) = tree.open_file(&mut conn, &path).await?;
                 Ok((file_id, file_size, conn))
             })
@@ -1969,7 +1969,7 @@ impl SmbClient {
         // can't reach a newer session.
         let ((file_id, mut conn), moved_to) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
-                let conn = conn.pinned_to_session();
+                let conn = tree.pinned_conn(&conn).pinned_to_session();
                 let req = crate::msg::create::CreateRequest {
                     requested_oplock_level: crate::types::OplockLevel::None,
                     impersonation_level: crate::msg::create::ImpersonationLevel::Impersonation,
@@ -2099,7 +2099,7 @@ impl SmbClient {
         // session.
         let ((file_id, mut conn), moved_to) = self
             .beside_tree(tree, path, |conn, tree, path| async move {
-                let mut conn = conn.pinned_to_session();
+                let mut conn = tree.pinned_conn(&conn).pinned_to_session();
                 let file_id = tree.open_file_for_write(&mut conn, &path).await?;
                 Ok((file_id, conn))
             })
@@ -2385,6 +2385,7 @@ mod tests {
 
     fn a_dfs_target_tree(addr: &str, share: &str) -> Tree {
         Tree {
+            pin: None,
             tree_id: TreeId(5),
             share_name: share.to_string(),
             server: addr.to_string(),
@@ -2554,6 +2555,7 @@ mod tests {
     /// The DFS root share the link tests start from, on the primary.
     fn a_dfs_root_tree() -> Tree {
         Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "dfs".to_string(),
             server: "test-server:445".to_string(),
@@ -3570,6 +3572,7 @@ mod tests {
             ..session_with_keys(SessionId(0x78))
         };
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "secret".to_string(),
             server: "test-server:445".to_string(),
@@ -3850,6 +3853,44 @@ mod tests {
              id belongs to a session that no longer exists"
         );
         assert_eq!(client.session().session_id, SessionId(0x2222));
+    }
+
+    /// A tree from before a revival somebody else already completed: the
+    /// connection is alive, so the read doesn't fail with `Disconnected`, it
+    /// fails with `HandleInvalidated` before the stale tree id leaves. That
+    /// still counts as a dead session for the replay, which reconnects the
+    /// share and reads on the new tree.
+    #[tokio::test]
+    async fn a_stale_tree_on_an_already_revived_connection_heals_in_a_replaying_read() {
+        let reviver = Arc::new(RevivedShare {
+            session_id: SessionId(0x2222),
+            tree_id: TreeId(77),
+            contents: b"healed".to_vec(),
+            dialed: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (mut client, mut tree) = client_on_a_dead_session(reviver.clone()).await;
+        client
+            .connections
+            .primary()
+            .reconnect_if_needed()
+            .await
+            .expect("another task revives the connection first");
+
+        let data = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.read_file_compound(&mut tree, "notes.txt"),
+        )
+        .await
+        .expect("the read hung")
+        .expect("a stale tree on a live connection should be recovered and replayed");
+
+        assert_eq!(data, b"healed");
+        assert_eq!(tree.tree_id, TreeId(77), "the caller's tree is the new one");
+        assert_eq!(
+            reviver.dialed.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the replay reconnects the share, not the connection"
+        );
     }
 
     /// The data-safety boundary: a mutating operation is NEVER replayed across

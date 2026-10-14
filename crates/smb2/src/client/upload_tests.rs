@@ -29,6 +29,7 @@ const MIB: u32 = 1024 * 1024;
 
 fn test_tree() -> Arc<Tree> {
     Arc::new(Tree {
+        pin: None,
         tree_id: TreeId(10),
         share_name: "test".to_string(),
         server: "test-server".to_string(),

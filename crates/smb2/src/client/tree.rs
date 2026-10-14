@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use log::{debug, info, trace, warn};
 
-use crate::client::connection::{CompoundOp, Connection, Frame, WaiterGuard};
+use crate::client::connection::{CompoundOp, Connection, Frame, SessionPin, WaiterGuard};
 use crate::client::credits;
 use crate::client::stream::{FileDownload, Progress};
 use crate::client::write_pipe::WritePipe;
@@ -294,6 +294,13 @@ pub struct Tree {
     /// named. Show the caller [`DfsOrigin::requested`], not
     /// [`server`](Self::server).
     pub dfs_origin: Option<DfsOrigin>,
+    /// The connection and session this tree was connected on. Every request
+    /// a `Tree` method sends goes out pinned to it, so once that session is
+    /// gone (a reconnect) or the tree is used on another connection, the
+    /// request fails with [`Error::HandleInvalidated`] instead of sending a
+    /// tree id the receiving session may have given a different share. `None`
+    /// for a tree built by hand, which nothing checks.
+    pub(crate) pin: Option<SessionPin>,
 }
 
 impl Tree {
@@ -302,6 +309,9 @@ impl Tree {
     /// Sends a TREE_CONNECT request with the UNC path `\\server\share`
     /// encoded in UTF-16LE.
     pub async fn connect(conn: &mut Connection, share_name: &str) -> Result<Tree> {
+        // Pinned before the TREE_CONNECT, so a revival that lands before the
+        // answer leaves the tree pinned to the dead session it belongs to.
+        let conn = &mut conn.pinned_to_session();
         let server = conn.server_name().to_string();
         let unc_path = format!(r"\\{}\{}", server, share_name);
 
@@ -372,7 +382,15 @@ impl Tree {
             is_dfs,
             encrypt_data,
             dfs_origin: None,
+            pin: conn.pin(),
         })
+    }
+
+    /// `conn`, pinned to the session this tree was connected on (and to
+    /// whatever `conn` is already pinned to). Every method sending on this
+    /// tree's behalf goes through it.
+    pub(crate) fn pinned_conn(&self, conn: &Connection) -> Connection {
+        conn.pinned_to(self.pin)
     }
 
     /// Normalize and format a path for this tree.
@@ -410,6 +428,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<Vec<DirectoryEntry>> {
+        let conn = &mut self.pinned_conn(conn);
         // TRACE, not DEBUG: a recursive scan calls list_directory once per directory
         // (millions of times on a large share), so at DEBUG it dominates a consumer's
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
@@ -452,6 +471,7 @@ impl Tree {
         path: &str,
         query_buffer_len: Option<u32>,
     ) -> Result<(Vec<DirectoryEntry>, ListingTrace)> {
+        let conn = &mut self.pinned_conn(conn);
         let buffer_len = query_buffer_len.unwrap_or_else(|| Self::default_query_buffer_len(conn));
         let conn = &mut conn.pinned_to_session();
 
@@ -529,6 +549,7 @@ impl Tree {
     /// rather than coming back truncated. Use
     /// [`read_file_pipelined`](Self::read_file_pipelined) for files of any size.
     pub async fn read_file_compound(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
+        let conn = &mut self.pinned_conn(conn);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         self.read_file_compound_sized(conn, path, max_read as u64)
             .await
@@ -560,6 +581,7 @@ impl Tree {
         path: &str,
         expected_size: u64,
     ) -> Result<Vec<u8>> {
+        let conn = &mut self.pinned_conn(conn);
         self.read_file_compound_sized_with_info(conn, path, expected_size)
             .await
             .map(|(data, _)| data)
@@ -589,6 +611,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<(Vec<u8>, FileInfo)> {
+        let conn = &mut self.pinned_conn(conn);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         self.read_file_compound_sized_with_info(conn, path, max_read as u64)
             .await
@@ -604,6 +627,7 @@ impl Tree {
         path: &str,
         expected_size: u64,
     ) -> Result<(Vec<u8>, FileInfo)> {
+        let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
         // Ask for what the caller expects, capped by what one READ can carry
@@ -776,11 +800,13 @@ impl Tree {
     /// [`read_file_pipelined`](Self::read_file_pipelined), which reads any size
     /// with concurrent chunked READs.
     pub async fn read_file(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
+        let conn = &mut self.pinned_conn(conn);
         self.read_file_compound(conn, path).await
     }
 
     /// Disconnect from the share.
     pub async fn disconnect(&self, conn: &mut Connection) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         trace!(
             "tree: disconnecting share={}, tree_id={}",
             self.share_name,
@@ -826,6 +852,7 @@ impl Tree {
         path: &str,
         recursive: bool,
     ) -> Result<crate::client::watcher::Watcher> {
+        let conn = &mut self.pinned_conn(conn);
         debug!(
             "tree: watch path={}, recursive={}, tree_id={}",
             path, recursive, self.tree_id
@@ -865,6 +892,7 @@ impl Tree {
     /// refuses the exclusive open, and the delete goes ahead sharing
     /// everything: the file is gone for good once that client closes it.
     pub async fn delete_file(&self, conn: &mut Connection, path: &str) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         let exclusive = self
             .delete_compound(
                 conn,
@@ -906,6 +934,7 @@ impl Tree {
     /// saves the per-call setup rather than the wire time. To overlap server
     /// work, run `delete_file` on several connections concurrently.
     pub async fn delete_files(&self, conn: &mut Connection, paths: &[&str]) -> Vec<Result<()>> {
+        let conn = &mut self.pinned_conn(conn);
         if paths.is_empty() {
             return vec![];
         }
@@ -930,6 +959,7 @@ impl Tree {
     /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
     /// QUERY_INFO (FileStandardInformation) + CLOSE as a single compound message.
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
+        let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
         trace!("tree: stat (compound) path={}", normalized);
 
@@ -1089,6 +1119,7 @@ impl Tree {
     /// run `stat` on several connections concurrently. To describe a whole
     /// directory, `list_directory` is far cheaper than a stat per entry.
     pub async fn stat_files(&self, conn: &mut Connection, paths: &[&str]) -> Vec<Result<FileInfo>> {
+        let conn = &mut self.pinned_conn(conn);
         if paths.is_empty() {
             return vec![];
         }
@@ -1113,6 +1144,7 @@ impl Tree {
     /// Returns total capacity, free space, and allocation unit sizes.
     /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
     pub async fn fs_info(&self, conn: &mut Connection) -> Result<FsInfo> {
+        let conn = &mut self.pinned_conn(conn);
         trace!("tree: fs_info on share={}", self.share_name);
 
         // Build CREATE request to open the root directory of the share.
@@ -1259,6 +1291,7 @@ impl Tree {
     /// Sends CREATE + SET_INFO (FileRenameInformation) + CLOSE as a single
     /// compound message.
     pub async fn rename(&self, conn: &mut Connection, from: &str, to: &str) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         let from_normalized = self.format_path(from);
         let to_normalized = normalize_path(to);
         trace!(
@@ -1381,6 +1414,7 @@ impl Tree {
         conn: &mut Connection,
         renames: &[(&str, &str)],
     ) -> Vec<Result<()>> {
+        let conn = &mut self.pinned_conn(conn);
         if renames.is_empty() {
             return vec![];
         }
@@ -1420,6 +1454,7 @@ impl Tree {
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         self.write_file_compound_with_disposition(
             conn,
             path,
@@ -1449,6 +1484,7 @@ impl Tree {
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         self.write_file_compound_with_disposition(conn, path, data, CreateDisposition::FileCreate)
             .await
     }
@@ -1464,6 +1500,7 @@ impl Tree {
         data: &[u8],
         create_disposition: CreateDisposition,
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
         trace!(
             "tree: write_file_compound path={}, len={}, disposition={:?}",
@@ -1642,6 +1679,7 @@ impl Tree {
     /// `wire_path` is already formatted. Best effort like the FLUSH it redoes:
     /// the data is written either way, so a failure here is logged, not raised.
     async fn reflush(&self, conn: &mut Connection, wire_path: &str) {
+        let conn = &mut self.pinned_conn(conn);
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -1710,6 +1748,7 @@ impl Tree {
     ///
     /// Returns the total number of bytes written.
     pub async fn write_file(&self, conn: &mut Connection, path: &str, data: &[u8]) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         // `max_write`, lowered to what the credit window funds.
         if data.len() as u64 <= conn.compound_write_limit() {
             self.write_file_compound(conn, path, data).await
@@ -1728,6 +1767,7 @@ impl Tree {
     /// Uses 64 KB chunks with CreditCharge=1 to maximize concurrency.
     /// The window is capped at 32 in-flight requests (2 MB).
     pub async fn read_file_pipelined(&self, conn: &mut Connection, path: &str) -> Result<Vec<u8>> {
+        let conn = &mut self.pinned_conn(conn);
         // Every request after the open carries its handle, so all of them go
         // out pinned to the session that opened it.
         let conn = &mut conn.pinned_to_session();
@@ -1817,6 +1857,7 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        let conn = &mut self.pinned_conn(conn);
         let conn = &mut conn.pinned_to_session();
         let (file_id, file_size) = self.open_file(conn, path).await?;
         self.read_open_file_with_progress(conn, path, file_id, file_size, on_progress)
@@ -1837,6 +1878,7 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        let conn = &mut self.pinned_conn(conn);
         // A no-op when the caller pinned before the open, as it should.
         let conn = &mut conn.pinned_to_session();
         if file_size == 0 {
@@ -1959,6 +2001,7 @@ impl Tree {
         path: &str,
         data: &[u8],
     ) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
 
         if data.is_empty() {
@@ -2122,6 +2165,7 @@ impl Tree {
     where
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
+        let conn = &mut self.pinned_conn(conn);
         trace!("tree: write_file_streamed path={}", path);
         // Every request after the open carries its handle, so all of them go
         // out pinned to the session that opened it.
@@ -2144,6 +2188,7 @@ impl Tree {
     where
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
+        let conn = &mut self.pinned_conn(conn);
         // A no-op when the caller pinned before the open, as it should.
         let conn = &mut conn.pinned_to_session();
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -2191,6 +2236,7 @@ impl Tree {
         conn: Connection,
         path: &str,
     ) -> Result<super::stream::FileReader> {
+        let conn = self.pinned_conn(&conn);
         super::stream::open_file_reader(Arc::clone(self), conn, path).await
     }
 
@@ -2211,6 +2257,7 @@ impl Tree {
         conn: Connection,
         path: &str,
     ) -> Result<super::stream::FileWriter> {
+        let conn = self.pinned_conn(&conn);
         super::stream::open_file_writer(Arc::clone(self), conn, path).await
     }
 
@@ -2232,6 +2279,7 @@ impl Tree {
         conn: Connection,
         path: &str,
     ) -> Result<super::stream::FileWriter> {
+        let conn = self.pinned_conn(&conn);
         super::stream::open_file_writer_exclusive(Arc::clone(self), conn, path).await
     }
 
@@ -2248,6 +2296,7 @@ impl Tree {
         path: &str,
         offset: u64,
     ) -> Result<super::stream::FileWriter> {
+        let conn = self.pinned_conn(&conn);
         super::stream::open_file_writer_at(Arc::clone(self), conn, path, offset).await
     }
 
@@ -2256,6 +2305,7 @@ impl Tree {
     /// Opens the path with `FileCreate` disposition and `FILE_DIRECTORY_FILE`
     /// option, then immediately closes the handle.
     pub async fn create_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
         trace!("tree: create_directory path={}", normalized);
 
@@ -2303,6 +2353,7 @@ impl Tree {
     /// Sends CREATE (with `DELETE_ON_CLOSE`) + CLOSE as a single compound
     /// message. The directory must be empty.
     pub async fn delete_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         self.delete_compound(conn, path, FILE_DIRECTORY_FILE, SHARE_ALL, "directory")
             .await
     }
@@ -2332,6 +2383,7 @@ impl Tree {
         share_access: ShareAccess,
         kind: &str,
     ) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
         trace!("tree: delete_{} (compound) path={}", kind, normalized);
 
@@ -2426,6 +2478,7 @@ impl Tree {
 
     /// Open a directory handle.
     async fn open_directory(&self, conn: &mut Connection, path: &str) -> Result<FileId> {
+        let conn = &mut self.pinned_conn(conn);
         let path = self.format_path(path);
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2483,6 +2536,7 @@ impl Tree {
     /// drop, or by calling the internal close path). Leaking the handle
     /// wastes server resources.
     pub async fn open_file(&self, conn: &mut Connection, path: &str) -> Result<(FileId, u64)> {
+        let conn = &mut self.pinned_conn(conn);
         let (file_id, info) = self.open_for_read(conn, path).await?;
         Ok((file_id, info.size))
     }
@@ -2494,6 +2548,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<(FileId, FileInfo)> {
+        let conn = &mut self.pinned_conn(conn);
         let req = self.read_open_request(path);
         let frame = conn
             .execute(Command::Create, &req, Some(self.tree_id))
@@ -2545,6 +2600,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<FileId> {
+        let conn = &mut self.pinned_conn(conn);
         let req = self.write_open_request(path, CreateDisposition::FileOverwriteIf);
         let frame = conn
             .execute(Command::Create, &req, Some(self.tree_id))
@@ -2606,6 +2662,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<(FileId, u64)> {
+        let conn = &mut self.pinned_conn(conn);
         self.open_readwrite_with_disposition(conn, path, CreateDisposition::FileOpenIf)
             .await
     }
@@ -2618,6 +2675,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<(FileId, u64)> {
+        let conn = &mut self.pinned_conn(conn);
         self.open_readwrite_with_disposition(conn, path, CreateDisposition::FileOverwriteIf)
             .await
     }
@@ -2630,6 +2688,7 @@ impl Tree {
         path: &str,
         create_disposition: CreateDisposition,
     ) -> Result<(FileId, u64)> {
+        let conn = &mut self.pinned_conn(conn);
         let path = self.format_path(path);
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2697,6 +2756,7 @@ impl Tree {
         restart: bool,
         output_buffer_length: u32,
     ) -> Result<QueryStepOutcome> {
+        let conn = &mut self.pinned_conn(conn);
         let req = QueryDirectoryRequest {
             file_information_class: FileInformationClass::FileBothDirectoryInformation,
             flags: QueryDirectoryFlags(if restart {
@@ -2755,6 +2815,7 @@ impl Tree {
         conn: &mut Connection,
         file_id: FileId,
     ) -> Result<Vec<DirectoryEntry>> {
+        let conn = &mut self.pinned_conn(conn);
         let output_buffer_length = Self::default_query_buffer_len(conn);
         let mut all_entries = Vec::new();
         let mut restart = true;
@@ -2781,6 +2842,7 @@ impl Tree {
         file_id: FileId,
         file_size: u64,
     ) -> Result<Vec<u8>> {
+        let conn = &mut self.pinned_conn(conn);
         let max_read = conn.params().map(|p| p.max_read_size).unwrap_or(65536);
 
         let mut data = Vec::with_capacity(file_size as usize);
@@ -2850,6 +2912,7 @@ impl Tree {
         credit_charge: u16,
         total_chunks: usize,
     ) -> Result<Vec<u8>> {
+        let conn = &mut self.pinned_conn(conn);
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         let mut data = vec![0u8; file_size as usize];
@@ -2970,6 +3033,7 @@ impl Tree {
     where
         F: FnMut(Progress) -> ControlFlow<()>,
     {
+        let conn = &mut self.pinned_conn(conn);
         use futures_util::stream::{FuturesUnordered, StreamExt};
 
         let mut data = vec![0u8; file_size as usize];
@@ -3075,6 +3139,7 @@ impl Tree {
     /// Sends an SMB2 FLUSH request and waits for the server to confirm
     /// that all cached data has been written to persistent storage.
     pub(crate) async fn flush_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         trace!("tree: flushing file handle");
         let req = FlushRequest { file_id };
 
@@ -3099,6 +3164,7 @@ impl Tree {
     /// and did not hand to a streaming type (which close themselves) must be
     /// closed with this, or it leaks server-side until session teardown.
     pub async fn close_handle(&self, conn: &mut Connection, file_id: FileId) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         // A no-op for the handles that never held an oplock, which is nearly
         // all of them. Done before the CLOSE so a break arriving in the gap
         // isn't acknowledged on a handle that is on its way out.
@@ -3120,6 +3186,7 @@ impl Tree {
         conn: &Connection,
         file_id: FileId,
     ) -> Result<WaiterGuard> {
+        let conn = &self.pinned_conn(conn);
         // See `close_handle`.
         conn.forget_oplock(file_id);
         let req = CloseRequest { flags: 0, file_id };
@@ -3133,6 +3200,7 @@ impl Tree {
     /// without pipelining or compounding.
     #[allow(dead_code)]
     async fn write_loop(&self, conn: &mut Connection, file_id: FileId, data: &[u8]) -> Result<u64> {
+        let conn = &mut self.pinned_conn(conn);
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
 
         let mut total_written = 0u64;
@@ -3368,6 +3436,7 @@ mod tests {
     #[test]
     fn a_dfs_prefix_keeps_a_whole_ipv6_host() {
         let tree = |server: &str| Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "projects".to_string(),
             server: server.to_string(),
@@ -3593,6 +3662,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id,
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -3641,6 +3711,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id,
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -3693,6 +3764,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id,
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -3729,6 +3801,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id,
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -3787,6 +3860,7 @@ mod tests {
     #[tokio::test]
     async fn format_path_prepends_dfs_prefix() {
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "dfs".to_string(),
             server: "server1".to_string(),
@@ -3808,6 +3882,7 @@ mod tests {
     #[tokio::test]
     async fn format_path_strips_port_from_dfs_prefix() {
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "dfs".to_string(),
             server: "server1:10456".to_string(),
@@ -3824,6 +3899,7 @@ mod tests {
     #[tokio::test]
     async fn format_path_no_prefix_when_not_dfs() {
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "public".to_string(),
             server: "server1".to_string(),
@@ -3899,6 +3975,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(99),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -3987,6 +4064,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4057,6 +4135,7 @@ mod tests {
 
             let mut conn = setup_connection(&mock);
             let tree = Tree {
+                pin: None,
                 tree_id: TreeId(10),
                 share_name: "test".to_string(),
                 server: "test-server".to_string(),
@@ -4132,6 +4211,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4182,6 +4262,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4218,6 +4299,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4264,6 +4346,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4324,6 +4407,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4383,6 +4467,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4431,6 +4516,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4513,6 +4599,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4539,6 +4626,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4570,6 +4658,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4637,6 +4726,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4698,6 +4788,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4737,6 +4828,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4824,6 +4916,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4858,6 +4951,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4886,6 +4980,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4923,6 +5018,7 @@ mod tests {
 
         let conn = setup_connection(&mock);
         let tree = Arc::new(Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -4962,6 +5058,7 @@ mod tests {
 
         let conn = setup_connection(&mock);
         let tree = Arc::new(Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5001,6 +5098,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5067,6 +5165,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5121,6 +5220,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5200,6 +5300,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5268,6 +5369,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5290,6 +5392,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5414,6 +5517,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id,
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5467,6 +5571,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id,
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5498,6 +5603,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5544,6 +5650,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5642,6 +5749,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5725,6 +5833,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5793,6 +5902,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5860,6 +5970,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5916,6 +6027,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -5965,6 +6077,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id,
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -6012,6 +6125,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -6052,6 +6166,7 @@ mod tests {
         let mut conn = setup_connection(&mock);
         conn.set_write_budget(65536);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(21),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -6104,6 +6219,7 @@ mod tests {
         let mut conn = setup_connection(&mock);
         conn.set_write_budget(0); // floors at one 64 KiB granule: one frame at a time
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(22),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -6172,6 +6288,7 @@ mod tests {
             .expect("an idle connection can afford its whole budget");
 
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(23),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -6223,6 +6340,7 @@ mod tests {
             .expect("an idle connection can afford its whole budget");
 
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(24),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -7246,6 +7364,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -7290,6 +7409,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(30),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -7356,6 +7476,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(31),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -7408,6 +7529,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(32),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -7462,6 +7584,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(40),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -7529,6 +7652,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(41),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
@@ -7662,6 +7786,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(11),
             share_name: "share".to_string(),
             server: "test-server".to_string(),
@@ -7709,6 +7834,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(12),
             share_name: "share".to_string(),
             server: "test-server".to_string(),
@@ -7742,6 +7868,7 @@ mod tests {
 
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(13),
             share_name: "share".to_string(),
             server: "test-server".to_string(),
@@ -7813,6 +7940,7 @@ mod tests {
         let mut conn_secondary = conn_primary.clone();
 
         let tree = Arc::new(Tree {
+            pin: None,
             tree_id: TreeId(14),
             share_name: "share".to_string(),
             server: "test-server".to_string(),
@@ -7976,6 +8104,7 @@ mod tests {
         let mock = Arc::new(MockTransport::new());
         let mut conn = setup_connection(&mock);
         let tree = Tree {
+            pin: None,
             tree_id: TreeId(7),
             share_name: "share".to_string(),
             server: "test-server".to_string(),

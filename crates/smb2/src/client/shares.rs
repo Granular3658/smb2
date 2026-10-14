@@ -35,6 +35,10 @@ const PIPE_READ_BUFFER_SIZE: u32 = 65536;
 /// This is a self-contained operation -- it opens and closes its own
 /// tree connection to IPC$.
 pub async fn list_shares(conn: &mut Connection) -> Result<Vec<ShareInfo>> {
+    // The IPC$ tree id and the pipe's file id are used across a dozen round
+    // trips, so all of them go out pinned to the session that issued them.
+    let conn = &mut conn.pinned_to_session();
+
     // 1. Tree connect to IPC$
     let tree_id = tree_connect_ipc(conn).await?;
 

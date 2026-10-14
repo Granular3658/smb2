@@ -246,6 +246,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<DurableOpen> {
+        let conn = &mut self.pinned_conn(conn);
         let create_guid = crate::client::connection::random_guid();
         // A server below SMB 3.0 has only the v1 contexts, whose reclaim this
         // crate refuses to perform. Asking anyway would buy a batch oplock and
@@ -368,6 +369,7 @@ impl Tree {
         handle: &DurableHandle,
         path: &str,
     ) -> Result<DurableHandle> {
+        let conn = &mut self.pinned_conn(conn);
         let lost = |reason| Error::DurableHandleLost {
             path: path.to_string(),
             reason,
@@ -463,6 +465,7 @@ impl Tree {
         conn: &mut Connection,
         create_req: &CreateRequest,
     ) -> Result<(Frame, Option<FileIdentity>)> {
+        let conn = &mut self.pinned_conn(conn);
         let index_req = FileIdentity::index_query();
         let volume_req = FileIdentity::volume_query();
         let results = conn
@@ -538,6 +541,7 @@ mod tests {
 
     pub(super) fn a_share() -> Tree {
         Tree {
+            pin: None,
             tree_id: TreeId(20),
             share_name: "test".to_string(),
             server: "test-server".to_string(),

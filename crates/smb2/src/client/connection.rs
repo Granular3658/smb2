@@ -1895,7 +1895,11 @@ struct Inner {
     /// only asks for IPC$ when there is none, so holding one turns every
     /// referral after the first from three frames into one. Erased with the
     /// rest of the session on a revival, because the tree id belongs to it.
-    ipc_tree: StdMutex<Option<TreeId>>,
+    ///
+    /// Kept with the pin it was connected under, so a tree connect that
+    /// finishes as a revival erases the cache can't leave the dead session's
+    /// id behind for the new one.
+    ipc_tree: StdMutex<Option<(SessionPin, TreeId)>>,
     /// Which tree each oplocked handle belongs to.
     ///
     /// Only durable opens take an oplock, and only so the server will grant
@@ -2701,16 +2705,22 @@ pub struct Connection {
     pin: Option<SessionPin>,
 }
 
-/// The session a [`Connection`] clone was pinned to: the generation and the
-/// session id it had at the time.
+/// The session a [`Connection`] clone (or a [`Tree`](crate::Tree)) was pinned
+/// to: which connection, and the generation and session id it had at the
+/// time.
 ///
-/// Both, because neither covers the other. The generation ticks only once a
-/// WHOLE revival has succeeded, so it still matches through the new session's
-/// NEGOTIATE and SESSION_SETUP; the session id is wiped at the start of a
-/// revival, so it catches that window. And a second `Session::setup` on the
-/// same socket replaces the session id without a revival at all.
+/// Generation and session id both, because neither covers the other. The
+/// generation ticks only once a WHOLE revival has succeeded, so it still
+/// matches through the new session's NEGOTIATE and SESSION_SETUP; the session
+/// id is wiped at the start of a revival, so it catches that window. And a
+/// second `Session::setup` on the same socket replaces the session id without
+/// a revival at all. The connection (its `ClientGuid`, one per connection for
+/// life) because a tree id means nothing on another connection either: a DFS
+/// target's tree sent on the primary names whatever the primary's session gave
+/// that id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SessionPin {
+pub(crate) struct SessionPin {
+    connection: Guid,
     generation: u64,
     session_id: SessionId,
 }
@@ -2741,14 +2751,52 @@ impl Connection {
     /// Pinning a pinned clone keeps the original pin, so a stale clone can't
     /// be pinned again into looking current.
     pub(crate) fn pinned_to_session(&self) -> Connection {
-        let pin = self.pin.unwrap_or_else(|| SessionPin {
-            generation: self.generation(),
-            session_id: self.session_id(),
-        });
+        let pin = self.pin.unwrap_or_else(|| self.current_pin());
         Connection {
             inner: Arc::clone(&self.inner),
             pin: Some(pin),
         }
+    }
+
+    /// A clone pinned to `pin` as well as to whatever this one is pinned to,
+    /// for sending a [`Tree`](crate::Tree)'s requests: they're refused once
+    /// either session is gone. `None` (a tree built by hand, never connected)
+    /// adds nothing.
+    pub(crate) fn pinned_to(&self, pin: Option<SessionPin>) -> Connection {
+        let pin = match (self.pin, pin) {
+            (Some(mine), Some(theirs)) if mine != theirs => {
+                // Two different pins can't both be current, so keep the one
+                // that isn't: the requests must fail if either is stale.
+                Some(if self.pin_is_current(mine) {
+                    theirs
+                } else {
+                    mine
+                })
+            }
+            (mine, theirs) => mine.or(theirs),
+        };
+        Connection {
+            inner: Arc::clone(&self.inner),
+            pin,
+        }
+    }
+
+    /// This clone's pin, if it has one.
+    pub(crate) fn pin(&self) -> Option<SessionPin> {
+        self.pin
+    }
+
+    /// The session this connection has right now.
+    fn current_pin(&self) -> SessionPin {
+        SessionPin {
+            connection: self.inner.client_guid,
+            generation: self.generation(),
+            session_id: self.session_id(),
+        }
+    }
+
+    fn pin_is_current(&self, pin: SessionPin) -> bool {
+        pin.session_id != SessionId(0) && pin == self.current_pin()
     }
 
     /// Whether this clone may still send: always on an unpinned one, and on a
@@ -2765,20 +2813,15 @@ impl Connection {
     /// id, which the new session refuses. Re-reading would hand the stale tree
     /// and file ids the new session's credentials.
     fn session_for_request(&self) -> Result<SessionId> {
-        let current = self.session_id();
         let Some(pin) = self.pin else {
-            return Ok(current);
+            return Ok(self.session_id());
         };
-        let generation = self.generation();
-        if pin.generation == generation
-            && pin.session_id == current
-            && pin.session_id != SessionId(0)
-        {
+        if self.pin_is_current(pin) {
             return Ok(pin.session_id);
         }
         Err(Error::HandleInvalidated {
             opened_on: pin.generation,
-            current: generation,
+            current: self.generation(),
         })
     }
 
@@ -4315,16 +4358,24 @@ impl Connection {
     }
 
     /// The IPC$ tree this connection keeps open for DFS referrals, if any.
+    ///
+    /// Only one connected on the session this connection has now.
     pub(crate) fn cached_ipc_tree(&self) -> Option<TreeId> {
-        *self.inner.ipc_tree.lock().unwrap()
+        let cached = *self.inner.ipc_tree.lock().unwrap();
+        cached
+            .filter(|(pin, _)| self.pin_is_current(*pin))
+            .map(|(_, tree_id)| tree_id)
     }
 
-    /// Remember (or, with `None`, forget) the IPC$ tree for DFS referrals.
+    /// Remember (or, with `None`, forget) the IPC$ tree for DFS referrals,
+    /// connected on the session this clone is pinned to (the current one, if
+    /// unpinned).
     ///
     /// Forget it the moment the server says the tree is gone: a cached id the
     /// session no longer has turns every later referral into the same error.
     pub(crate) fn set_cached_ipc_tree(&self, tree_id: Option<TreeId>) {
-        *self.inner.ipc_tree.lock().unwrap() = tree_id;
+        let pin = self.pin.unwrap_or_else(|| self.current_pin());
+        *self.inner.ipc_tree.lock().unwrap() = tree_id.map(|id| (pin, id));
     }
 
     fn should_set_dfs_flag(&self, tree_id: Option<TreeId>) -> bool {

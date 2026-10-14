@@ -182,7 +182,7 @@ impl<'a> FileDownload<'a> {
     ) -> Self {
         Self::with_tree(
             Cow::Borrowed(tree),
-            conn.pinned_to_session(),
+            tree.pinned_conn(conn).pinned_to_session(),
             file_id,
             file_size,
             chunk_size,
@@ -214,9 +214,10 @@ impl<'a> FileDownload<'a> {
         file_size: u64,
         chunk_size: u32,
     ) -> Self {
+        let conn = tree.pinned_conn(&conn).pinned_to_session();
         Self {
             tree,
-            conn: conn.pinned_to_session(),
+            conn,
             _caller: PhantomData,
             file_id,
             file_size,
@@ -733,7 +734,7 @@ pub struct FileReader {
 pub async fn open_file_reader(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileReader> {
     trace!("stream: open_file_reader path={}", path);
 
-    let mut conn = conn.pinned_to_session();
+    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
     let (created, resolved_path) = tree
         .open_and_name(&mut conn, path, &tree.read_open_request(path), true)
         .await?;
@@ -762,9 +763,10 @@ impl FileReader {
         info: FileInfo,
         max_read: u32,
     ) -> Self {
+        let conn = tree.pinned_conn(&conn).pinned_to_session();
         Self {
             tree,
-            conn: conn.pinned_to_session(),
+            conn,
             file_id,
             info,
             max_read,
@@ -968,7 +970,7 @@ impl<'a> FileUpload<'a> {
         data: &'a [u8],
         max_write: u32,
     ) -> Self {
-        let conn = conn.pinned_to_session();
+        let conn = tree.pinned_conn(&conn).pinned_to_session();
         let pipe = WritePipe::new(conn.clone(), tree.tree_id, file_id, max_write);
         Self {
             tree,
@@ -1171,7 +1173,7 @@ pub struct FileWriter {
 pub async fn open_file_writer(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileWriter> {
     trace!("stream: open_file_writer path={}", path);
 
-    let mut conn = conn.pinned_to_session();
+    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
     let (file_id, resolved_path) =
         open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOverwriteIf).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -1195,7 +1197,7 @@ pub async fn open_file_writer_exclusive(
 ) -> Result<FileWriter> {
     trace!("stream: open_file_writer_exclusive path={}", path);
 
-    let mut conn = conn.pinned_to_session();
+    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
     let (file_id, resolved_path) =
         open_for_writer(&tree, &mut conn, path, CreateDisposition::FileCreate).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -1242,7 +1244,7 @@ pub async fn open_file_writer_at(
         offset
     );
 
-    let mut conn = conn.pinned_to_session();
+    let mut conn = tree.pinned_conn(&conn).pinned_to_session();
     let (file_id, resolved_path) =
         open_for_writer(&tree, &mut conn, path, CreateDisposition::FileOpenIf).await?;
     let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
@@ -1286,7 +1288,7 @@ impl FileWriter {
         file_id: FileId,
         max_write_size: u32,
     ) -> Self {
-        let conn = conn.pinned_to_session();
+        let conn = tree.pinned_conn(&conn).pinned_to_session();
         let pipe = WritePipe::new(conn.clone(), tree.tree_id, file_id, max_write_size);
         Self {
             tree,
@@ -1612,6 +1614,7 @@ mod tests {
 
     fn test_tree() -> Arc<Tree> {
         Arc::new(Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),

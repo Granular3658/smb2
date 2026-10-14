@@ -894,6 +894,7 @@ async fn a_real_watcher_on_a_dead_server_is_told_instead_of_waiting_forever() {
 
     let mut watcher = crate::client::watcher::Watcher::new(
         crate::client::tree::Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "test".to_string(),
             server: "scripted-server".to_string(),
@@ -944,6 +945,7 @@ async fn a_subscription_the_server_forgot_is_re_issued_rather_than_trusted_forev
 
     let mut watcher = crate::client::watcher::Watcher::new(
         crate::client::tree::Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "test".to_string(),
             server: "scripted-server".to_string(),
@@ -1035,6 +1037,7 @@ async fn a_long_poll_with_the_refresh_off_keeps_one_subscription_forever() {
 
     let mut watcher = crate::client::watcher::Watcher::new(
         crate::client::tree::Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "test".to_string(),
             server: "scripted-server".to_string(),
@@ -2215,6 +2218,7 @@ impl SessionReviver for Nas {
 
 fn a_share() -> Tree {
     Tree {
+        pin: None,
         tree_id: TreeId(1),
         share_name: "share".to_string(),
         server: "nas".to_string(),

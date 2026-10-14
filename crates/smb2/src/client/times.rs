@@ -237,6 +237,7 @@ impl Tree {
         path: &str,
         times: FileTimes,
     ) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         let buffer = basic_info_buffer(&times)?;
         let normalized = self.format_path(path);
         trace!("tree: set_times path={} times={:?}", normalized, times);
@@ -327,6 +328,7 @@ impl Tree {
         file_id: FileId,
         times: FileTimes,
     ) -> Result<()> {
+        let conn = &mut self.pinned_conn(conn);
         let req = set_basic_info(file_id, basic_info_buffer(&times)?);
         trace!(
             "tree: set_handle_times file_id={:?} times={:?}",
@@ -368,6 +370,7 @@ mod tests {
 
     fn tree() -> Tree {
         Tree {
+            pin: None,
             tree_id: TreeId(10),
             share_name: "test".to_string(),
             server: "test-server".to_string(),

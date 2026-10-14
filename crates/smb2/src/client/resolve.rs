@@ -224,6 +224,7 @@ impl Tree {
     #[doc(alias = "canonicalize")]
     #[doc(alias = "realpath")]
     pub async fn resolve(&self, conn: &mut Connection, path: &str) -> Result<Resolved> {
+        let conn = &mut self.pinned_conn(conn);
         let wire_path = self.format_path(path);
         let requested_wire = crate::name::encode_path(path);
         trace!("tree: resolve path={}", wire_path);
@@ -326,6 +327,7 @@ impl Tree {
         create_req: &CreateRequest,
         with_all_information: bool,
     ) -> Result<(CreateResponse, Option<String>)> {
+        let conn = &mut self.pinned_conn(conn);
         let all_req = name_query(conn, FILE_ALL_INFORMATION);
         let normalized_req = name_query(conn, FILE_NORMALIZED_NAME_INFORMATION);
         let op = |command, body| CompoundOp {
@@ -425,6 +427,7 @@ mod tests {
 
     fn a_share() -> Tree {
         Tree {
+            pin: None,
             tree_id: TreeId(30),
             share_name: "public".to_string(),
             server: "nas:445".to_string(),

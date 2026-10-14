@@ -60,6 +60,9 @@ pub(crate) async fn get_dfs_referral(
     conn: &mut Connection,
     path: &str,
 ) -> Result<RespGetDfsReferral> {
+    // Pinned before the cached IPC$ tree is read or connected, so its id goes
+    // out only on the session that issued it.
+    let conn = &mut conn.pinned_to_session();
     let tree_id = ensure_ipc_tree(conn).await?;
 
     match referral_ioctl(conn, tree_id, path).await {

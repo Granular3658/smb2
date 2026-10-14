@@ -27,6 +27,7 @@ use crate::types::{FileId, SessionId, TreeId};
 
 fn test_tree() -> Arc<Tree> {
     Arc::new(Tree {
+        pin: None,
         tree_id: TreeId(10),
         share_name: "test".to_string(),
         server: "test-server".to_string(),
@@ -336,4 +337,90 @@ async fn pinning_a_stale_clone_again_keeps_it_stale() {
         "re-pinned onto the new session"
     );
     assert!(conn.pinned_to_session().pinned_session_is_current());
+}
+
+/// The tree ids every frame `mock` received carried.
+fn tree_ids_sent(mock: &MockTransport) -> Vec<Option<TreeId>> {
+    use crate::msg::header::Header;
+    use crate::pack::{ReadCursor, Unpack};
+    mock.sent_messages()
+        .iter()
+        .map(|bytes| Header::unpack(&mut ReadCursor::new(bytes)).unwrap().tree_id)
+        .collect()
+}
+
+/// A `Tree` is a handle too: its tree id belongs to the session that
+/// connected it. A new session numbers its tree connects from scratch, so the
+/// old id can be a different share there, and a delete sent with it deletes
+/// that share's file.
+#[tokio::test]
+async fn a_tree_from_before_a_reconnect_does_not_delete_in_another_share() {
+    let mock = Arc::new(MockTransport::new());
+    mock.queue_response(crate::client::test_helpers::build_tree_connect_response(
+        TreeId(1),
+        crate::msg::tree_connect::ShareType::Disk,
+    ));
+    let mut conn = setup_connection(&mock);
+    let docs = Tree::connect(&mut conn, "Docs").await.unwrap();
+
+    // The new session's server: tree id 1 is its first tree connect, which
+    // is somebody else's share by now.
+    let fresh = revive(
+        &conn,
+        vec![build_compound_response_frame(&[
+            build_create_response(FILE, 0),
+            crate::client::test_helpers::build_set_info_response(),
+            build_close_response(),
+        ])],
+    )
+    .await;
+
+    let deleted = bounded("delete_file", docs.delete_file(&mut conn, "a.txt")).await;
+    assert_eq!(
+        tree_ids_sent(&fresh),
+        Vec::<Option<TreeId>>::new(),
+        "the dead session's tree id must not reach the new session"
+    );
+    assert_invalidated(deleted, "delete_file");
+}
+
+/// A DFS target's tree lives on its own connection, beside the primary. On
+/// that connection it works; sent on another one, its tree id names whatever
+/// that connection's session gave the id, so it's refused there even when
+/// both connections are on generation 0 with the same session id.
+#[tokio::test]
+async fn a_tree_works_on_its_own_connection_and_is_refused_on_another() {
+    let target_mock = Arc::new(MockTransport::new());
+    target_mock.queue_response(crate::client::test_helpers::build_tree_connect_response(
+        TreeId(7),
+        crate::msg::tree_connect::ShareType::Disk,
+    ));
+    let mut target = setup_connection(&target_mock);
+    let tree = Tree::connect(&mut target, "Target").await.unwrap();
+
+    target_mock.queue_response(build_compound_response_frame(&[
+        build_create_response(FILE, 0),
+        crate::client::test_helpers::build_set_info_response(),
+        build_close_response(),
+    ]));
+    bounded(
+        "delete on its own connection",
+        tree.delete_file(&mut target, "a.txt"),
+    )
+    .await
+    .expect("a tree works on the connection it was connected on");
+
+    let primary_mock = Arc::new(MockTransport::new());
+    let mut primary = setup_connection(&primary_mock);
+    assert_eq!(primary.session_id(), target.session_id());
+    match bounded(
+        "delete on the primary",
+        tree.delete_file(&mut primary, "a.txt"),
+    )
+    .await
+    {
+        Err(Error::HandleInvalidated { .. }) => {}
+        other => panic!("expected HandleInvalidated, got {other:?}"),
+    }
+    assert_eq!(primary_mock.sent_count(), 0, "nothing reaches the primary");
 }

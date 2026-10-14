@@ -158,9 +158,10 @@ pub struct Watcher {
 impl Watcher {
     /// Create a new watcher (called by `Tree::watch`).
     pub(crate) fn new(tree: Tree, conn: Connection, file_id: FileId, recursive: bool) -> Self {
+        let conn = tree.pinned_conn(&conn).pinned_to_session();
         Watcher {
             tree,
-            conn: conn.pinned_to_session(),
+            conn,
             file_id,
             recursive,
             pending: None,
@@ -811,6 +812,7 @@ mod loss_window_tests {
 
     fn test_tree() -> Tree {
         Tree {
+            pin: None,
             tree_id: TreeId(1),
             share_name: "test".to_string(),
             server: "test-server".to_string(),
