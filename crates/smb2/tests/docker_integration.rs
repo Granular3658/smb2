@@ -7049,6 +7049,14 @@ async fn connect_smallcredits() -> (Connection, std::sync::Arc<Tree>) {
     (conn, std::sync::Arc::new(tree))
 }
 
+/// `expect`, but a failure also prints the connection's diagnostics. A
+/// `Disconnected` here once came from a full-suite run with no log lines at
+/// all, and the counters (send failures, malformed frames, credits, wire
+/// bytes) are what tell a socket the server closed from a teardown of ours.
+fn or_dump<T>(result: smb2::Result<T>, conn: &Connection, what: &str) -> T {
+    result.unwrap_or_else(|e| panic!("{what}: {e:?}\n{:#?}", conn.diagnostics()))
+}
+
 /// A compound READ of 5 MiB charges 82 credits, which a 64-credit window can
 /// never fund. It fails at once, before anything reaches the wire (Samba
 /// cuts the connection on a charge above its maximum), even while a
@@ -7127,47 +7135,42 @@ async fn smallcredits_chunked_transfers_fit_the_window() {
     let path = "_test_smallcredits_chunked.bin";
     let data: Vec<u8> = (0..=250u8).cycle().take(5 * 1024 * 1024 + 17).collect();
 
-    let mut writer = tree
-        .create_file_writer(conn.clone(), path)
-        .await
-        .expect("create_file_writer");
-    writer.write_chunk(&data).await.expect("FileWriter write");
+    // A clone shares the connection, so it reports its diagnostics while a
+    // download holds `conn` borrowed.
+    let probe = conn.clone();
+    let opened = tree.create_file_writer(conn.clone(), path).await;
+    let mut writer = or_dump(opened, &probe, "create_file_writer");
+    or_dump(writer.write_chunk(&data).await, &probe, "FileWriter write");
     assert_eq!(
-        writer.finish().await.expect("FileWriter finish"),
+        or_dump(writer.finish().await, &probe, "FileWriter finish"),
         data.len() as u64
     );
 
     let mut got = Vec::new();
     {
-        let mut download = tree.download(&mut conn, path).await.expect("download");
+        let mut download = or_dump(tree.download(&mut conn, path).await, &probe, "download");
         while let Some(chunk) = download.next_chunk().await {
-            got.extend_from_slice(&chunk.expect("download chunk"));
+            got.extend_from_slice(&or_dump(chunk, &probe, "download chunk"));
         }
     }
     assert_eq!(got, data, "the streamed download");
 
-    tree.write_file_pipelined(&mut conn, path, &data)
-        .await
-        .expect("write_file_pipelined");
-    assert_eq!(
-        tree.read_file_pipelined(&mut conn, path)
-            .await
-            .expect("read_file_pipelined"),
-        data
-    );
+    let written = tree.write_file_pipelined(&mut conn, path, &data).await;
+    or_dump(written, &probe, "write_file_pipelined");
+    let read = tree.read_file_pipelined(&mut conn, path).await;
+    assert_eq!(or_dump(read, &probe, "read_file_pipelined"), data);
 
     let limit = conn.quick_read_limit();
     assert!(limit > 0 && limit < 5 * 1024 * 1024, "limit {limit}");
     let small = &data[..limit as usize];
-    tree.write_file(&mut conn, path, small)
-        .await
-        .expect("a small write_file");
+    let written = tree.write_file(&mut conn, path, small).await;
+    or_dump(written, &probe, "a small write_file");
+    let read = tree.read_file_compound_sized(&mut conn, path, limit).await;
     assert_eq!(
-        tree.read_file_compound_sized(&mut conn, path, limit)
-            .await
-            .expect("a read under quick_read_limit is fundable"),
+        or_dump(read, &probe, "a read under quick_read_limit is fundable"),
         small
     );
 
-    tree.delete_file(&mut conn, path).await.expect("delete");
+    let deleted = tree.delete_file(&mut conn, path).await;
+    or_dump(deleted, &probe, "delete");
 }
