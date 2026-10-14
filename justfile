@@ -86,7 +86,7 @@ test-docker:
         echo "[*] Running the smol suite on a smol-only build..." && \
         cargo test -p smb2 --no-default-features --features smol --test smol_integration -- --ignored --quiet && \
         (echo "[*] Stopping Docker containers..." && ./crates/smb2/tests/docker/stop.sh && echo "[+] Docker integration tests passed") || \
-        (echo "[*] Stopping Docker containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
+        (./crates/smb2/tests/docker/save-logs.sh internal; echo "[*] Stopping Docker containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
 
 # Run consumer integration tests (starts/stops containers automatically)
 test-consumer:
@@ -95,7 +95,7 @@ test-consumer:
     @echo "[*] Running consumer integration tests..."
     @cargo test -p smb2 --features testing --test consumer_integration -- --ignored --quiet && \
         (echo "[*] Stopping consumer containers..." && ./crates/smb2/tests/docker/stop.sh && echo "[+] Consumer integration tests passed") || \
-        (echo "[*] Stopping consumer containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
+        (./crates/smb2/tests/docker/save-logs.sh consumer; echo "[*] Stopping consumer containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
 
 # Run the CLI end-to-end tests against a live Samba fixture (starts/stops it automatically)
 test-cli-e2e:
@@ -104,7 +104,7 @@ test-cli-e2e:
     @echo "[*] Running CLI end-to-end tests..."
     @cargo test -p smb2-cli --test e2e -- --ignored --quiet && \
         (echo "[*] Stopping containers..." && ./crates/smb2/tests/docker/stop.sh && echo "[+] CLI end-to-end tests passed") || \
-        (echo "[*] Stopping containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
+        (./crates/smb2/tests/docker/save-logs.sh internal; echo "[*] Stopping containers..." && ./crates/smb2/tests/docker/stop.sh && exit 1)
 
 # Build documentation
 doc:

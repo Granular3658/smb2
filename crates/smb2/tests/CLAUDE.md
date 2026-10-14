@@ -85,6 +85,22 @@ cargo test -p smb2 --test docker_integration -- --ignored   # repeat (~8s)
 ./crates/smb2/tests/docker/stop.sh              # when done (~10s)
 ```
 
+**A failed run keeps the container logs.** `just test-docker`, `test-consumer`, and `test-cli-e2e` run
+`docker/save-logs.sh <profile>` before `stop.sh` on failure, which writes `target/docker-logs/<profile>-<timestamp>.log`
+and prints the path. `stop.sh` deletes the containers and their logs with them, and Samba's log is what tells a client
+it cut off (a credit or sequence violation, logged at level 0) from a socket we tore down: a 2026-10-14
+`smallcredits_chunked_transfers_fit_the_window` failure (`read_file_pipelined: Disconnected`, no client log lines,
+not reproduced in ~400 runs) stayed undiagnosed for exactly that reason.
+
+Two traps when several sessions share the machine:
+
+- ❌ **Never run two Docker suites against the same fixtures at once.** Tests use fixed paths on the shared shares, so
+  two concurrent `test-docker` runs fail 14–50 tests each (sharing violations, files deleted under each other).
+- ❌ **`stop.sh` takes down every fixture**, internal and consumer, whatever started them. A `test-cli-e2e` or
+  `test-consumer` finishing mid-`test-docker` kills the containers under it, and the tests in flight fail with
+  `Disconnected`. The compose project names (`internal`, `consumer`) are the same from every worktree, so this crosses
+  worktrees too.
+
 **Containers and what they exercise:**
 
 | Container | Port | Focus |
