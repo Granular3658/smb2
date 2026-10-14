@@ -5,11 +5,21 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.29.0] - 2026-10-14
+
+### Breaking
+
+- **`ClientConfig` has a new `response_timeout` field.** A struct literal that spreads `..Default::default()` (as the docs show) compiles unchanged; one that lists every field needs to add it, and `Some(Duration::from_secs(30))` keeps the previous behavior.
+
+### Added
+
+- **Bound how long `SmbClient::connect` waits on a silent server**, with `ClientConfig::response_timeout`. It's the same deadline `Connection::set_response_timeout` sets, but in force from the very first request, the NEGOTIATE inside `connect`, which no setter can reach. Together with `timeout` for the TCP connect, a `connect` against a server that never answers now gives up within roughly the sum of the two. Defaults to 30 s, as before.
+- `Connection::response_timeout()` reads the deadline currently in force.
 
 ### Fixed
 
-- **A server that accepts the connection and then never answers can no longer hang `connect` forever** ([cmdr#406](https://github.com/vdavid/cmdr/issues/406)). The NEGOTIATE that opens every connection waited for its answer with no deadline, so `SmbClient::connect`, `Connection::negotiate`, and any reconnect built on them never returned. It now gets the same response deadline as every other request (30 s of silence by default, tuned with `Connection::set_response_timeout`) and gives up with `Error::Timeout`, or `Error::ServerUnresponsive` when the connection is provably dead.
+- **A server that accepts the connection and then never answers can no longer hang `connect` forever** ([cmdr#406](https://github.com/vdavid/cmdr/issues/406)). The NEGOTIATE that opens every connection waited for its answer with no deadline, so `SmbClient::connect`, `Connection::negotiate`, and any reconnect built on them never returned. It now gets the same response deadline as every other request and gives up with `Error::Timeout`, or `Error::ServerUnresponsive` when the connection is provably dead. A reconnect keeps whatever deadline the connection had.
+- **A DFS target connection keeps the response deadline you set on the client.** It used to start from the 30 s default whatever the primary connection had, so a deadline tuned on `SmbClient::connection()` silently didn't cover the server a DFS namespace actually sends you to.
 
 ## [0.28.0] - 2026-10-12
 
