@@ -6374,6 +6374,7 @@ impl<T: TransportReceive> TransportReceive for Arc<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SignatureFailure;
     use crate::msg::negotiate::{NegotiateContext, HASH_ALGORITHM_SHA512};
     use crate::transport::MockTransport;
     use crate::types::flags::HeaderFlags;
@@ -8629,7 +8630,16 @@ mod tests {
             .unwrap();
         let action = prepare_sub_frame(&wrong, false, &conn.inner).unwrap();
         assert!(
-            matches!(action, SubFrameAction::Route(_, Err(_))),
+            matches!(
+                action,
+                SubFrameAction::Route(
+                    _,
+                    Err(Error::SignatureInvalid {
+                        reason: SignatureFailure::Mismatch,
+                        ..
+                    })
+                )
+            ),
             "the cancel bit has to be part of the check, got {action:?}"
         );
         assert_eq!(conn.metrics().signature_failures, 1);
@@ -8660,9 +8670,75 @@ mod tests {
 
         let action = prepare_sub_frame(&stripped, false, &conn.inner).unwrap();
         assert!(
-            matches!(action, SubFrameAction::Route(_, Err(_))),
-            "an unsigned response on a signed session must be refused, got {action:?}"
+            matches!(
+                action,
+                SubFrameAction::Route(
+                    MessageId(7),
+                    Err(Error::SignatureInvalid {
+                        command: Command::Echo,
+                        message_id: MessageId(7),
+                        reason: SignatureFailure::Missing,
+                    })
+                )
+            ),
+            "an unsigned response on a signed session must be refused as Missing, got {action:?}"
         );
+        assert_eq!(conn.metrics().signature_failures, 1);
+    }
+
+    /// A response that carries a signature, just not the session key's, is
+    /// refused the same way, and says the signature was wrong rather than
+    /// absent. What an on-path rewrite that re-signs with a key of its own
+    /// looks like, and what a server with a different session key sends.
+    #[tokio::test]
+    async fn a_wrongly_signed_response_on_a_signed_session_is_rejected() {
+        let mock = Arc::new(MockTransport::new());
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        conn.activate_signing(vec![0xAB; 16], SigningAlgorithm::AesCmac);
+        let _guard = conn.register_waiter(MessageId(7), Command::Echo).unwrap();
+
+        let mut h = Header::new_request(Command::Echo);
+        h.flags.set_response();
+        h.flags.set_signed();
+        h.message_id = MessageId(7);
+        h.status = NtStatus::SUCCESS;
+        let mut forged = pack_message(&h, &crate::msg::echo::EchoResponse);
+        signing::sign_message_as_server(
+            &mut forged,
+            &[0xCD; 16],
+            SigningAlgorithm::AesCmac,
+            7,
+            false,
+        )
+        .unwrap();
+        assert_ne!(
+            &forged[48..64],
+            &[0u8; 16],
+            "the forgery carries a real signature"
+        );
+
+        let action = prepare_sub_frame(&forged, false, &conn.inner).unwrap();
+        match action {
+            SubFrameAction::Route(MessageId(7), Err(e)) => {
+                assert!(
+                    matches!(
+                        e,
+                        Error::SignatureInvalid {
+                            command: Command::Echo,
+                            message_id: MessageId(7),
+                            reason: SignatureFailure::Mismatch,
+                        }
+                    ),
+                    "got {e:?}"
+                );
+                assert_eq!(e.kind(), crate::ErrorKind::SignatureInvalid);
+            }
+            other => panic!("a wrongly signed response must be refused, got {other:?}"),
+        }
         assert_eq!(conn.metrics().signature_failures, 1);
     }
 

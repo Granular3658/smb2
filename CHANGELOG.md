@@ -5,6 +5,20 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **Two security refusals classify differently now.** Both enums are `#[non_exhaustive]`, so every `match` compiles unchanged, but code that branches on the old kinds sees new ones:
+  - A response whose signature is missing or wrong, on a session that signs, was `Error::InvalidData` (`ErrorKind::InvalidData`) and is now `Error::SignatureInvalid` (`ErrorKind::SignatureInvalid`). The same goes for a login whose final SESSION_SETUP response is unsigned or doesn't verify, which was `Error::Auth` (`ErrorKind::AuthRequired`).
+  - A login naming an account that the server answered with a guest or anonymous session was `Error::Auth` (`ErrorKind::AuthRequired`) and is now `Error::GuestSessionRefused` (`ErrorKind::GuestSessionRefused`). If you show "check your username and password" for `AuthRequired`, show it for this one too: on a Samba set to `map to guest = bad user`, it's what a wrong password looks like.
+  - Neither is retryable, as before. `crypto::signing::verify_signature` returns `Error::SignatureInvalid` for a signature that doesn't verify, too.
+
+### Added
+
+- **Tell a tampered or broken connection from a malformed reply.** `Error::SignatureInvalid { command, message_id, reason }` says which response was refused, and `reason` (the new `error::SignatureFailure`) says whether it carried no signature (`Missing`) or a wrong one (`Mismatch`). A consumer can now warn that the connection may be tampered with, without matching message text. The connection stays up; only the request the response answered fails. A WRITE answered this way closes its upload's handle, as before.
+- **Tell "your password was taken as guest" from other login failures.** `Error::GuestSessionRefused { username, anonymous }` carries the account the login named and whether the server offered an anonymous session rather than a guest one.
+
 ## [0.30.0] - 2026-10-14
 
 ### Breaking

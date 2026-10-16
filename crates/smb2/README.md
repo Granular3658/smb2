@@ -31,7 +31,9 @@ we have more control to reach even better speeds.
   that hand out the file's dates and attributes at no extra cost, so a copy keeps its source's modification date and
   flags
 - Pipelined I/O with sliding window for large file transfers
-- SMB 2.x (HMAC-SHA256) and 3.x (AES-CMAC, AES-GMAC) signing, and encryption (AES-128/256-CCM/GCM)
+- SMB 2.x (HMAC-SHA256) and 3.x (AES-CMAC, AES-GMAC) signing, and encryption (AES-128/256-CCM/GCM). A response
+  whose signature is missing or wrong, and a guest session offered in place of the account you signed in as, are
+  refused with their own `ErrorKind` (`SignatureInvalid`, `GuestSessionRefused`), so you can tell them from a typo
 - LZ4 compression
 - Share enumeration (list shares on a server via IPC$ + srvsvc RPC)
 - Streaming downloads and uploads with progress reporting and cancellation

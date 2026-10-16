@@ -86,6 +86,40 @@ impl std::fmt::Display for ResumeRefusal {
     }
 }
 
+/// What was wrong with a response's signature.
+///
+/// Both mean the response was refused unread: it can't be shown to come from
+/// the server that holds the session key, so neither its status nor its
+/// payload can be trusted. They're told apart for the person diagnosing it. A
+/// [`Missing`](Self::Missing) signature most often means a server, or
+/// something on the path that strips signatures, sending responses unsigned
+/// on a session that has to sign them. A [`Mismatch`](Self::Mismatch) means
+/// the bytes were altered on the way, or the server derived a different key.
+/// Either can be an attack, which is why neither is retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SignatureFailure {
+    /// The response carries no signature: its signature field is empty
+    /// (all zeros), or, for the final SESSION_SETUP response on SMB 3.x, the
+    /// server didn't flag it signed. Never decided by the
+    /// `SMB2_FLAGS_SIGNED` bit alone on any other response: that bit travels
+    /// in the same untrusted bytes as the payload.
+    Missing,
+    /// The response carries a signature, and it isn't the one the session
+    /// key produces for these bytes.
+    Mismatch,
+}
+
+impl std::fmt::Display for SignatureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Missing => "isn't signed",
+            Self::Mismatch => "has a signature that doesn't match",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Top-level error type for SMB2 operations.
 ///
 /// `#[non_exhaustive]`: new variants appear as the crate learns to tell more
@@ -116,6 +150,74 @@ pub enum Error {
     Auth {
         /// Description of what went wrong.
         message: String,
+    },
+
+    /// A response on a session that signs failed its signature check, so it
+    /// was refused unread.
+    ///
+    /// On a signed session every response has to verify against the session
+    /// key, except the two MS-SMB2 § 3.2.5.1.3 exempts (an interim
+    /// `STATUS_PENDING` and an unsolicited oplock break). One that doesn't is
+    /// either a broken server or someone on the path rewriting it, and
+    /// nothing in it, its status included, can be believed. `reason` says
+    /// whether the signature was absent or wrong.
+    ///
+    /// Two places return it:
+    ///
+    /// - **Any response on an established signed session**: the request it
+    ///   answers fails with this, and the connection stays up. Encrypted
+    ///   responses are authenticated by their encryption instead and never
+    ///   reach this check.
+    /// - **The final SESSION_SETUP response of a login that names an
+    ///   account**, which decides whether the session signs or encrypts at
+    ///   all, so it has to prove itself before its flags are believed. The
+    ///   login fails with this, `command` is
+    ///   [`SessionSetup`](Command::SessionSetup), and no session is set up.
+    ///
+    /// Classifies as [`ErrorKind::SignatureInvalid`] and is **not**
+    /// retryable: sending the same request again over the same path invites
+    /// the same answer. Surface it to a person as a security problem with the
+    /// connection, not as a missing file or a wrong password. Every refusal
+    /// also counts in the connection's `signature_failures` diagnostic,
+    /// except the SESSION_SETUP one, which happens before the session exists.
+    #[error("the server's {command} response (message {}) {reason}, so it was refused", message_id.0)]
+    SignatureInvalid {
+        /// The command the refused response answers.
+        command: Command,
+        /// The response's `MessageId`, for matching it against a trace.
+        message_id: crate::types::MessageId,
+        /// Whether the signature was absent or wrong.
+        reason: SignatureFailure,
+    },
+
+    /// A login that named an account was answered with a guest or anonymous
+    /// session, and the client refused it.
+    ///
+    /// The caller asked to be someone, and a guest or anonymous session is
+    /// unsigned, so taking it would quietly drop both the identity and the
+    /// protection. Samba's `map to guest = bad user` answers a wrong password
+    /// or an unknown user this way, which makes that the common cause; an
+    /// on-path attacker setting `IS_GUEST` in the final SESSION_SETUP
+    /// response looks exactly the same (MS-SMB2 § 3.2.5.3.1 refuses it for
+    /// the same reason). A login with an empty username, or with the name
+    /// `Guest` in any ASCII case, asks for a guest session and never gets
+    /// this.
+    ///
+    /// Classifies as [`ErrorKind::GuestSessionRefused`] and is not retryable:
+    /// check the username and password, or log in without a username to take
+    /// the guest session on purpose.
+    #[error(
+        "the server offered {} instead of signing in as {username}. Check the username and \
+         password: a Samba server set to `map to guest = bad user` answers a wrong password \
+         this way. To sign in as guest, leave the username empty or use `Guest`",
+        if *anonymous { "an anonymous session" } else { "a guest session" }
+    )]
+    GuestSessionRefused {
+        /// The account the login named.
+        username: String,
+        /// `true` when the server offered an anonymous (null) session,
+        /// `false` when it offered a guest one.
+        anonymous: bool,
     },
 
     /// An I/O or transport error occurred.
@@ -531,6 +633,7 @@ impl Error {
 ///         ErrorKind::IsADirectory => println!("path is a directory, not a file"),
 ///         ErrorKind::NotADirectory => println!("path is a file, not a directory"),
 ///         ErrorKind::DiskFull => println!("volume is full"),
+///         ErrorKind::SignatureInvalid => println!("the reply was tampered with, or the server is broken"),
 ///         ErrorKind::ConnectionLost => { client.reconnect().await?; }
 ///         _ => return Err(e),
 ///     }
@@ -629,6 +732,16 @@ pub enum ErrorKind {
     /// file again from the start. Only [`Error::ResumeRefused`] has it, and
     /// its `reason` says why.
     ResumeRefused,
+    /// A response on a signed session had a missing or wrong signature, so it
+    /// was refused: a broken server, or the connection being tampered with.
+    /// Only [`Error::SignatureInvalid`] has it, and its `reason` says which.
+    /// Not retryable.
+    SignatureInvalid,
+    /// A login that named an account was answered with a guest or anonymous
+    /// session, and the client refused it. Usually a wrong password on a
+    /// server that maps failed logins to guest; check the credentials. Only
+    /// [`Error::GuestSessionRefused`] has it. Not retryable.
+    GuestSessionRefused,
     /// A protocol error not covered by other variants.
     ///
     /// Use [`Error::status()`] to get the raw NTSTATUS code. Some defined
@@ -650,6 +763,8 @@ impl Error {
         match self {
             Error::InvalidData { .. } => ErrorKind::InvalidData,
             Error::Auth { .. } => ErrorKind::AuthRequired,
+            Error::SignatureInvalid { .. } => ErrorKind::SignatureInvalid,
+            Error::GuestSessionRefused { .. } => ErrorKind::GuestSessionRefused,
             Error::Io(_) => ErrorKind::Io,
             Error::Disconnected => ErrorKind::ConnectionLost,
             Error::Timeout => ErrorKind::TimedOut,
@@ -874,6 +989,68 @@ mod tests {
             .kind(),
             ErrorKind::AuthRequired
         );
+    }
+
+    /// The security refusals have kinds of their own, so a consumer can tell
+    /// "the connection is being tampered with" and "your password was taken
+    /// as guest" from a malformed reply or a refused password, and neither
+    /// is retried.
+    #[test]
+    fn security_refusals_classify_apart_and_are_not_retryable() {
+        for reason in [SignatureFailure::Missing, SignatureFailure::Mismatch] {
+            let err = Error::SignatureInvalid {
+                command: Command::Read,
+                message_id: crate::types::MessageId(42),
+                reason,
+            };
+            assert_eq!(err.kind(), ErrorKind::SignatureInvalid);
+            assert!(!err.is_retryable());
+        }
+        for anonymous in [false, true] {
+            let err = Error::GuestSessionRefused {
+                username: "alice".into(),
+                anonymous,
+            };
+            assert_eq!(err.kind(), ErrorKind::GuestSessionRefused);
+            assert!(!err.is_retryable());
+        }
+    }
+
+    #[test]
+    fn security_refusals_say_what_happened() {
+        let missing = Error::SignatureInvalid {
+            command: Command::Read,
+            message_id: crate::types::MessageId(42),
+            reason: SignatureFailure::Missing,
+        };
+        assert_eq!(
+            missing.to_string(),
+            "the server's Read response (message 42) isn't signed, so it was refused"
+        );
+        let mismatch = Error::SignatureInvalid {
+            command: Command::SessionSetup,
+            message_id: crate::types::MessageId(3),
+            reason: SignatureFailure::Mismatch,
+        };
+        assert_eq!(
+            mismatch.to_string(),
+            "the server's SessionSetup response (message 3) has a signature that doesn't \
+             match, so it was refused"
+        );
+        let guest = Error::GuestSessionRefused {
+            username: "alice".into(),
+            anonymous: false,
+        };
+        assert!(guest
+            .to_string()
+            .starts_with("the server offered a guest session instead of signing in as alice."));
+        let anonymous = Error::GuestSessionRefused {
+            username: "alice".into(),
+            anonymous: true,
+        };
+        assert!(anonymous
+            .to_string()
+            .starts_with("the server offered an anonymous session instead"));
     }
 
     #[test]

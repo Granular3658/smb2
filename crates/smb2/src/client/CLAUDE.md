@@ -456,7 +456,7 @@ Every pipelined upload (`FileWriter`, `FileUpload`, `Tree::write_file_pipelined`
 - **What a confirmation measures**: the server having every byte, plus its disk and half a round trip. The gap between two confirmations is the uplink's time for the second WRITE when it was queued behind the first, the same full-pipe test as for READs, and each is timed by arrival (`Landed.arrived_at`, from the guard), so a producer that polls its answers late doesn't skew it. It reads low (answers share the downlink; a slow disk holds them), never high. The rate is shared on the connection apart from the download one (`note_write_rate`, `upload_rate_hint`, same 30 s TTL, cleared on revival), because most links are asymmetric.
 - **`Connection::quick_write_limit`** is the one-frame cut-off: `max(512 KiB, upload rate × QUICK_FRAME_BUDGET)` (250 ms, not the learned headroom), capped at `compound_write_limit()` (which wins over the floor, and can be 0). It never exceeds `compound_write_limit`, so a consumer that promised one frame by it can still send that frame after the limit moved.
 - **`FileWriter::write_chunk` is cancel-safe**: pushed bytes leave `pending_data` only once their WRITE is dispatched. A WRITE caught mid-send can go out twice, same bytes, same offset. Pinned by `dropping_write_chunk_while_it_waits_for_room_loses_nothing`.
-- **Errors**: the pipe drains what's in flight (`abandon`) before handing an error back; the owner closes the handle only on a WRITE the server refused (`Error::Protocol { command: Write }`) or answered short (`Error::InvalidData`), since any other error may be the connection itself.
+- **Errors**: the pipe drains what's in flight (`abandon`) before handing an error back; the owner closes the handle only on a WRITE the server refused (`Error::Protocol { command: Write }`) answered short (`Error::InvalidData`), or answered with a response that failed its signature check (`Error::SignatureInvalid`, so nobody knows what landed), since any other error may be the connection itself.
 - **A short WRITE is an error, never a partial confirmation** (`WritePipe::land`). The WRITEs after it don't know about the hole, so counting the part that landed would let a checkpoint vouch for bytes that were never written. `Count` is how many bytes the server wrote (MS-SMB2 § 2.2.22, § 3.2.5.12), and nothing says it has to be all of them.
 - `WriteBehind::Fixed(n)` plus `with_chunk_size(MaxWriteSize)` is the escape hatch to the old shape; only `FileWriter` takes the knobs.
 
@@ -513,10 +513,11 @@ Rules, in order (AGENTS.md pitfall 30):
   (`is_guest_on_purpose`). Consumers log in to guest shares this way, and some servers take the named `Guest` login but
   refuse an anonymous one. Answered with a full session, it's a named account from here on. ❌ Don't widen the match to
   look-alikes (`DOMAIN\Guest`, `guests`).
-- **Named account, `IS_GUEST` or `IS_NULL`:** `Error::Auth`. Samba's `map to guest = bad user` does this for a wrong
+- **Named account, `IS_GUEST` or `IS_NULL`:** `Error::GuestSessionRefused` (its own `ErrorKind`, so a consumer can say "check the password" without matching text). Samba's `map to guest = bad user` does this for a wrong
   password, and it's also what tampering looks like. ❌ Keep this before the signature check: a genuine guest response is
   never signed, so the other order reports a wrong password as a bad signature.
-- **Named account, SMB 3.x:** must carry `SMB2_FLAGS_SIGNED` and verify with the new signing key, else `Error::Auth`.
+- **Named account, SMB 3.x:** must carry `SMB2_FLAGS_SIGNED` and verify with the new signing key, else
+  `Error::SignatureInvalid` (`Missing` when unflagged, `Mismatch` when it doesn't verify; `command` is `SessionSetup`).
 - **Named account, SMB 2.x:** verified if flagged signed. The spec asks nothing more, and with guest refused there is no
   flag left to downgrade.
 - Kerberos answering `STATUS_MORE_PROCESSING_REQUIRED` goes through the same rules. That response is never signed, so

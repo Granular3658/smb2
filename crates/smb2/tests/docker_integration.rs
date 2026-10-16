@@ -1419,8 +1419,21 @@ async fn a_named_login_mapped_to_guest_is_refused() {
         .await
         .expect_err("a guest session must not stand in for the account");
 
-    assert_eq!(err.kind(), smb2::ErrorKind::AuthRequired, "got: {err}");
-    assert!(err.to_string().contains("guest session"), "got: {err}");
+    assert_eq!(
+        err.kind(),
+        smb2::ErrorKind::GuestSessionRefused,
+        "got: {err}"
+    );
+    assert!(
+        matches!(
+            err,
+            smb2::Error::GuestSessionRefused {
+                anonymous: false,
+                ..
+            }
+        ),
+        "got: {err:?}"
+    );
 }
 
 /// The named `Guest` login is a guest login on purpose, so Samba mapping it

@@ -1069,7 +1069,9 @@ impl<'a> FileUpload<'a> {
 
     /// The upload can't go on: close the handle without a flush
     /// (best-effort) and hand the error back. Only when the server refused a
-    /// WRITE or answered one short; any other error may be the connection.
+    /// WRITE, answered one short, or sent an answer that failed its signature
+    /// check (so nobody knows what was written); any other error may be the
+    /// connection.
     async fn failed(&mut self, e: Error) -> Error {
         self.done = true;
         if matches!(
@@ -1078,6 +1080,7 @@ impl<'a> FileUpload<'a> {
                 command: Command::Write,
                 ..
             } | Error::InvalidData { .. }
+                | Error::SignatureInvalid { .. }
         ) {
             let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
         }
@@ -1793,8 +1796,9 @@ impl FileWriter {
         self.tree.flush_handle(&mut self.conn, self.file_id).await
     }
 
-    /// The server refused a WRITE, or answered one short: the file is done
-    /// for, so close the handle (best-effort) and hand the error back. The
+    /// The server refused a WRITE, answered one short, or sent an answer that
+    /// failed its signature check: the file is done for, so close the handle
+    /// (best-effort) and hand the error back. The
     /// pipe has already waited out the WRITEs behind it. Any other error
     /// leaves the handle alone: the connection may be the thing that failed.
     async fn failed(&mut self, e: Error) -> Error {
@@ -1804,6 +1808,7 @@ impl FileWriter {
                 command: Command::Write,
                 ..
             } | Error::InvalidData { .. }
+                | Error::SignatureInvalid { .. }
         ) {
             let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
             self.done = true;

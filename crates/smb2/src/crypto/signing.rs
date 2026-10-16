@@ -11,7 +11,8 @@
 use ctutils::CtEq;
 use log::{error, trace};
 
-use crate::types::Dialect;
+use crate::error::SignatureFailure;
+use crate::types::{Command, Dialect, MessageId};
 use crate::Error;
 
 /// Offset of the 16-byte Signature field within the SMB2 header.
@@ -127,8 +128,18 @@ pub(crate) fn sign_message_as_server(
 
 /// Verify the signature on a received SMB2 message (server → client).
 ///
-/// Returns `Ok(())` if the signature matches, or [`Error::InvalidData`]
-/// if the message is tampered or the key is wrong.
+/// Returns `Ok(())` if the signature matches. Otherwise
+/// [`Error::SignatureInvalid`], naming the message's command and
+/// `message_id`, with [`SignatureFailure::Missing`] when the signature field
+/// is empty (all zeros, which is what an unsigned message carries) and
+/// [`SignatureFailure::Mismatch`] when it holds a signature this key didn't
+/// produce: the message was altered, or the key is wrong. A message shorter
+/// than an SMB2 header, or one naming no known command, is
+/// [`Error::InvalidData`].
+///
+/// ❌ The `SMB2_FLAGS_SIGNED` bit plays no part: it travels in the same
+/// untrusted bytes, so a caller that skips this for an unflagged message
+/// lets anyone clear the bit and rewrite the payload.
 ///
 /// For GMAC, the nonce role bit is set to 1 (server) automatically.
 pub fn verify_signature(
@@ -169,7 +180,24 @@ pub fn verify_signature(
             received_sig[0], received_sig[1], received_sig[2], received_sig[3],
             expected_sig[0], expected_sig[1], expected_sig[2], expected_sig[3]
         );
-        return Err(Error::invalid_data("signature verification failed"));
+        let code = u16::from_le_bytes([message[12], message[13]]);
+        let command = Command::try_from(code).map_err(|_| {
+            Error::invalid_data(format!(
+                "message names unknown command 0x{code:04x} and fails signature verification"
+            ))
+        })?;
+        // A plain compare is fine here: it only looks at what the sender
+        // sent, after the verdict.
+        let reason = if received_sig == [0u8; SIGNATURE_LEN] {
+            SignatureFailure::Missing
+        } else {
+            SignatureFailure::Mismatch
+        };
+        return Err(Error::SignatureInvalid {
+            command,
+            message_id: MessageId(message_id),
+            reason,
+        });
     }
 
     trace!(
@@ -472,11 +500,16 @@ mod tests {
         msg[last] ^= 0xFF;
 
         let result = verify_signature(&msg, &key, SigningAlgorithm::HmacSha256, 0, false);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("verification failed"),);
+        assert!(
+            matches!(
+                result,
+                Err(Error::SignatureInvalid {
+                    reason: crate::error::SignatureFailure::Mismatch,
+                    ..
+                })
+            ),
+            "got {result:?}"
+        );
     }
 
     #[test]
@@ -488,6 +521,37 @@ mod tests {
         let wrong_key = [0x43; 16];
         let result = verify_signature(&msg, &wrong_key, SigningAlgorithm::HmacSha256, 0, false);
         assert!(result.is_err());
+    }
+
+    /// A wrong signature and an absent one are both refusals, told apart by
+    /// whether anything was in the signature field; the command comes from
+    /// the message's own header.
+    #[test]
+    fn verify_failure_is_typed_missing_or_mismatch() {
+        use crate::error::SignatureFailure;
+        use crate::types::{Command, MessageId};
+
+        let key = [0x42; 16];
+        let mut msg = make_test_message(b"data"); // a READ, MessageId 42
+
+        match verify_signature(&msg, &key, SigningAlgorithm::AesCmac, 42, false) {
+            Err(Error::SignatureInvalid {
+                command: Command::Read,
+                message_id: MessageId(42),
+                reason: SignatureFailure::Missing,
+            }) => {}
+            other => panic!("an unsigned message must be Missing, got {other:?}"),
+        }
+
+        sign_message(&mut msg, &[0x43; 16], SigningAlgorithm::AesCmac, 42, false).unwrap();
+        match verify_signature(&msg, &key, SigningAlgorithm::AesCmac, 42, false) {
+            Err(Error::SignatureInvalid {
+                command: Command::Read,
+                message_id: MessageId(42),
+                reason: SignatureFailure::Mismatch,
+            }) => {}
+            other => panic!("a wrong non-zero signature must be Mismatch, got {other:?}"),
+        }
     }
 
     // ── AES-128-CMAC ────────────────────────────────────────────────

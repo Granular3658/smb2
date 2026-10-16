@@ -9,7 +9,7 @@ use crate::auth::ntlm::{NtlmAuthenticator, NtlmCredentials};
 use crate::client::connection::Connection;
 use crate::crypto::kdf::derive_session_keys;
 use crate::crypto::signing::{self, algorithm_for_dialect, SigningAlgorithm};
-use crate::error::Result;
+use crate::error::{Result, SignatureFailure};
 use crate::msg::header::Header;
 use crate::msg::session_setup::{SessionFlags, SessionSetupRequest, SessionSetupResponse};
 use crate::pack::{ReadCursor, Unpack};
@@ -97,6 +97,15 @@ impl Session {
     /// 8. Prove the final response (signature, no guest stand-in for a named
     ///    account) before trusting the session flags it carries.
     /// 9. Activate signing on the connection.
+    ///
+    /// # Errors
+    ///
+    /// Besides the server's own refusal (`STATUS_LOGON_FAILURE` and kin, as
+    /// [`Error::Protocol`]), a login with a username other than `Guest` fails
+    /// with [`Error::GuestSessionRefused`] when the server answers it with a
+    /// guest or anonymous session, and with [`Error::SignatureInvalid`] when
+    /// the final response is missing the signature it must carry or doesn't
+    /// verify.
     pub async fn setup(
         conn: &mut Connection,
         username: &str,
@@ -382,8 +391,11 @@ impl Session {
     /// SPNEGO-wrapped AP-REQ in SESSION_SETUP, one round. The AP-REP that
     /// completes mutual authentication rides in that STATUS_SUCCESS response.
     /// A server asking for another round (STATUS_MORE_PROCESSING_REQUIRED) is
-    /// not followed: on SMB 3.x that fails the login, because that response is
-    /// unsigned and the session flags it carries can't be trusted.
+    /// not followed: on SMB 3.x that fails the login with
+    /// [`Error::SignatureInvalid`], because that response is unsigned and the
+    /// session flags it carries can't be trusted. The final response is
+    /// proven the same way [`setup`](Self::setup) proves it, with the same
+    /// errors.
     ///
     /// The session key comes from the Kerberos TGS exchange, not from the
     /// SMB server response.
@@ -666,19 +678,14 @@ fn authenticate_final_response(
         if is_guest_on_purpose(account) {
             return Ok(());
         }
-        let offered = if flags.is_guest() {
-            "a guest session"
-        } else {
-            "an anonymous session"
-        };
-        debug!("session: server offered {offered} to a login as {account}, refusing");
-        return Err(Error::Auth {
-            message: format!(
-                "the server offered {offered} instead of signing in as {account}. \
-                 Check the username and password: a Samba server set to \
-                 `map to guest = bad user` answers a wrong password this way. \
-                 To sign in as guest, leave the username empty or use `Guest`"
-            ),
+        let anonymous = !flags.is_guest();
+        debug!(
+            "session: server offered a {} session to a login as {account}, refusing",
+            if anonymous { "anonymous" } else { "guest" }
+        );
+        return Err(Error::GuestSessionRefused {
+            username: account.to_string(),
+            anonymous,
         });
     }
 
@@ -691,28 +698,24 @@ fn authenticate_final_response(
         return Ok(());
     }
     if !flagged_signed {
-        return Err(Error::Auth {
-            message: format!(
-                "the server's final SESSION_SETUP response ({:?}) was not signed, \
-                 so its session flags can't be trusted",
-                header.status
-            ),
+        debug!(
+            "session: final SESSION_SETUP response ({:?}) isn't flagged signed, refusing",
+            header.status
+        );
+        return Err(Error::SignatureInvalid {
+            command: Command::SessionSetup,
+            message_id: header.message_id,
+            reason: SignatureFailure::Missing,
         });
     }
-    signing::verify_signature(raw, signing_key, algorithm, header.message_id.0, false).map_err(
-        |_| Error::Auth {
-            message: "the server's final SESSION_SETUP response failed signature \
-                      verification: either it was altered on the way, or the server \
-                      doesn't know the session key"
-                .to_string(),
-        },
-    )
+    signing::verify_signature(raw, signing_key, algorithm, header.message_id.0, false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::connection::{pack_message, Connection, NegotiatedParams};
+    use crate::error::SignatureFailure;
     use crate::msg::header::Header;
     use crate::msg::session_setup::{SessionFlags, SessionSetupResponse};
     use crate::pack::Guid;
@@ -1094,16 +1097,37 @@ mod tests {
     /// header, then `StructureSize` (2).
     const SESSION_FLAGS_AT: usize = 66;
 
+    /// The login failed because the final response didn't prove itself.
     #[track_caller]
-    fn assert_auth_error(result: Result<Session>, needle: &str) {
+    fn assert_signature_refused(result: Result<Session>, expected: SignatureFailure) {
         match result {
-            Err(Error::Auth { message }) => assert!(
-                message.contains(needle),
-                "expected an auth error mentioning {needle:?}, got: {message}"
-            ),
-            Err(other) => panic!("expected Error::Auth mentioning {needle:?}, got: {other}"),
+            Err(Error::SignatureInvalid {
+                command: Command::SessionSetup,
+                reason,
+                ..
+            }) if reason == expected => {}
+            Err(other) => panic!("expected a {expected:?} SESSION_SETUP signature, got: {other:?}"),
             Ok(session) => panic!(
-                "expected Error::Auth mentioning {needle:?}, got a session (sign={}, encrypt={})",
+                "expected a {expected:?} SESSION_SETUP signature, got a session (sign={}, encrypt={})",
+                session.should_sign, session.should_encrypt
+            ),
+        }
+    }
+
+    /// The login failed because a guest (or, with `anonymous`, a null)
+    /// session stood in for the account it named.
+    #[track_caller]
+    fn assert_guest_refused(result: Result<Session>, account: &str, anonymous: bool) {
+        match result {
+            Err(Error::GuestSessionRefused {
+                username,
+                anonymous: got,
+            }) if username == account && got == anonymous => {}
+            Err(other) => panic!(
+                "expected GuestSessionRefused for {account:?} (anonymous={anonymous}), got: {other:?}"
+            ),
+            Ok(session) => panic!(
+                "expected GuestSessionRefused for {account:?}, got a session (sign={}, encrypt={})",
                 session.should_sign, session.should_encrypt
             ),
         }
@@ -1169,7 +1193,7 @@ mod tests {
             Final::Unsigned,
         )
         .await;
-        assert_auth_error(result, "not signed");
+        assert_signature_refused(result, SignatureFailure::Missing);
     }
 
     /// A server MUST sign the final response of a non-guest session on every
@@ -1186,7 +1210,7 @@ mod tests {
             Final::Unsigned,
         )
         .await;
-        assert_auth_error(result, "not signed");
+        assert_signature_refused(result, SignatureFailure::Missing);
     }
 
     /// The downgrade this check exists for: a server demands encryption, and
@@ -1205,7 +1229,7 @@ mod tests {
             }),
         )
         .await;
-        assert_auth_error(result, "signature");
+        assert_signature_refused(result, SignatureFailure::Mismatch);
     }
 
     /// Setting `IS_GUEST` on a genuine response turns signing off, so a
@@ -1221,7 +1245,7 @@ mod tests {
             Final::SignedThenTampered(|r| r[SESSION_FLAGS_AT] |= SessionFlags::IS_GUEST as u8),
         )
         .await;
-        assert_auth_error(result, "guest");
+        assert_guest_refused(result, USER, false);
     }
 
     /// Samba's `map to guest = bad user` answers a wrong password with a
@@ -1238,7 +1262,7 @@ mod tests {
                 Final::Unsigned,
             )
             .await;
-            assert_auth_error(result, "guest");
+            assert_guest_refused(result, USER, false);
         }
     }
 
@@ -1253,7 +1277,7 @@ mod tests {
             Final::Unsigned,
         )
         .await;
-        assert_auth_error(result, "anonymous");
+        assert_guest_refused(result, USER, true);
     }
 
     /// 2.x servers aren't required to flag the final response signed from
@@ -1269,7 +1293,7 @@ mod tests {
             Final::SignedThenTampered(|r| r[48] ^= 0xFF),
         )
         .await;
-        assert_auth_error(result, "signature");
+        assert_signature_refused(result, SignatureFailure::Mismatch);
     }
 
     /// What the caller asked for: no username means a guest or anonymous
@@ -1332,7 +1356,7 @@ mod tests {
                 Final::Unsigned,
             )
             .await;
-            assert_auth_error(result, "guest");
+            assert_guest_refused(result, name, false);
         }
     }
 
@@ -1350,7 +1374,7 @@ mod tests {
             Final::SignedThenTampered(|r| r[48] ^= 0xFF),
         )
         .await;
-        assert_auth_error(result, "signature");
+        assert_signature_refused(result, SignatureFailure::Mismatch);
 
         let session = setup_against_server(
             Dialect::Smb3_1_1,

@@ -255,6 +255,8 @@ use smb2::Error;
 
 match result {
     Err(Error::Auth { message }) => // auth failed
+    Err(Error::GuestSessionRefused { .. }) => // offered guest instead of the account: wrong password?
+    Err(Error::SignatureInvalid { .. }) => // reply failed its signature check: tampering or a broken server
     Err(Error::Protocol { status, command }) => {
         // status is NtStatus enum, can match specific codes
         if err.is_retryable() { /* retry */ }
