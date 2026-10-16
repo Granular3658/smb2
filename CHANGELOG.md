@@ -5,7 +5,7 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.31.0] - 2026-10-16
 
 ### Breaking
 
@@ -18,6 +18,7 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 - **Tell a tampered or broken connection from a malformed reply.** `Error::SignatureInvalid { command, message_id, reason }` says which response was refused, and `reason` (the new `error::SignatureFailure`) says whether it carried no signature (`Missing`) or a wrong one (`Mismatch`). A consumer can now warn that the connection may be tampered with, without matching message text. The connection stays up; only the request the response answered fails. A WRITE answered this way closes its upload's handle, as before.
 - **Tell "your password was taken as guest" from other login failures.** `Error::GuestSessionRefused { username, anonymous }` carries the account the login named and whether the server offered an anonymous session rather than a guest one.
+- **`smb2` names a refused signature** (smb2-cli 0.4.20): a reply that fails its signature check reports which command it answered and whether the signature was missing or wrong, where it used to say "Invalid data: signature verification failed".
 
 ## [0.30.0] - 2026-10-14
 

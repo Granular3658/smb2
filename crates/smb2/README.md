@@ -315,7 +315,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.30"
+smb2 = "0.31"
 ```
 
 You'll also need an async runtime. smb2 runs on [tokio](https://github.com/tokio-rs/tokio) out of the box:
