@@ -240,7 +240,7 @@ impl Tree {
         let conn = &mut self.pinned_conn(conn);
         let buffer = basic_info_buffer(&times)?;
         let normalized = self.format_path(path);
-        trace!("tree: set_times path={} times={:?}", normalized, times);
+        trace!("tree: set_times path={path:?} times={times:?}");
 
         // Attribute-write access is all FileBasicInformation needs (MS-FSCC
         // § 2.4.7), and sharing everything keeps the open from tripping over a
@@ -311,7 +311,7 @@ impl Tree {
             );
         }
 
-        debug!("tree: set times on {}", normalized);
+        debug!("tree: set times path={path:?}");
         Ok(())
     }
 

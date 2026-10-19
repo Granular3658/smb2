@@ -253,7 +253,7 @@ impl Tree {
         let conn = &mut self.pinned_conn(conn);
         let wire_path = self.format_path(path);
         let requested_wire = crate::name::encode_path(path);
-        trace!("tree: resolve path={}", wire_path);
+        trace!("tree: resolve path={path:?}");
 
         // The same open `stat` uses: FILE_READ_ATTRIBUTES is what class 18
         // and FileBasicInformation need (MS-SMB2 § 3.3.5.20.1); class 48 and
@@ -330,7 +330,7 @@ impl Tree {
         }
 
         let resolved = outcome?;
-        trace!("tree: resolve done, path={}", resolved.path);
+        trace!("tree: resolve done, path={:?}", resolved.path);
         Ok(resolved)
     }
 
@@ -391,7 +391,7 @@ impl Tree {
             ),
         };
         let name = resolved_name(&crate::name::encode_path(path), all, frames.last());
-        trace!("tree: opened path={} as {:?}, {:?}", path, name, identity);
+        trace!("tree: opened path={path:?} name={name:?} identity={identity:?}");
         Ok(NamedOpen {
             created,
             name,

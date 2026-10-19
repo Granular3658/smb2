@@ -66,6 +66,12 @@ Connect to the real NAS, send a NegotiateRequest, capture the server's raw respo
 
 5 tests, all `#[ignore]` (require NAS). Covers negotiate request/response and header byte layout.
 
+## Log field guard (`tests/log_fields.rs`)
+
+Scans `src/`, `examples/`, and the CLI's `src/` for log macros and fails on any path, share, name, host, or user printed
+bare or positionally, per `AGENTS.md` § Logging "The field rule". No server, runs in `cargo test`. A false positive (a
+number held in a variable named like a path) is fixed by renaming the variable, not by loosening the list.
+
 ## Docker integration tests (`tests/docker_integration.rs`)
 
 Tests against 18 Docker-based Samba containers. Deterministic, no real hardware needed. Runs in CI on every PR.

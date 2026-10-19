@@ -95,8 +95,8 @@ async fn referral_ioctl(
             ..
         }) => {
             debug!(
-                "dfs: referral for {:?} overflowed {} bytes, retrying with {}",
-                path, DFS_MAX_OUTPUT_RESPONSE, DFS_RETRY_OUTPUT_RESPONSE
+                "dfs: referral overflowed {} bytes, retrying with {} path={:?}",
+                DFS_MAX_OUTPUT_RESPONSE, DFS_RETRY_OUTPUT_RESPONSE, path
             );
             send_dfs_ioctl(conn, tree_id, path, DFS_RETRY_OUTPUT_RESPONSE).await
         }
@@ -169,9 +169,9 @@ async fn send_dfs_ioctl(
     let input_data = req_cursor.into_inner();
 
     trace!(
-        "dfs: sending FSCTL_DFS_GET_REFERRALS for {:?} ({} bytes input)",
-        path,
-        input_data.len()
+        "dfs: sending FSCTL_DFS_GET_REFERRALS ({} bytes input) path={:?}",
+        input_data.len(),
+        path
     );
 
     // Build the IOCTL request
@@ -375,7 +375,7 @@ impl DfsResolver {
         // 1. Check cache (longest prefix match)
         if let Some(resolved) = self.resolve_from_cache(unc_path) {
             self.cache_hits.fetch_add(1, Ordering::Relaxed);
-            trace!("dfs: cache hit for {:?}", unc_path);
+            trace!("dfs: cache hit path={unc_path:?}");
             return Ok(resolved);
         }
 
@@ -388,7 +388,7 @@ impl DfsResolver {
             unc_path
         };
 
-        debug!("dfs: cache miss, sending referral for {:?}", referral_path);
+        debug!("dfs: cache miss, sending a referral request path={referral_path:?}");
         let resp = get_dfs_referral(conn, referral_path).await?;
         self.referrals_resolved.fetch_add(1, Ordering::Relaxed);
 
@@ -466,9 +466,9 @@ impl DfsResolver {
                 && entry.target_hint != resolved.target_index
             {
                 trace!(
-                    "dfs: target hint for {:?} moves to {}",
-                    entry.dfs_path_prefix,
-                    resolved.target_index
+                    "dfs: target hint moves to {} prefix={:?}",
+                    resolved.target_index,
+                    entry.dfs_path_prefix
                 );
                 entry.target_hint = resolved.target_index;
             }
@@ -491,9 +491,9 @@ impl DfsResolver {
                 Some(prefix) => prefix.to_string(),
                 None => {
                     debug!(
-                        "dfs: referral for {:?} carries no DFS path and path_consumed={} \
-                         does not name a prefix of it; not caching",
-                        request_path, resp.path_consumed
+                        "dfs: referral carries no DFS path and path_consumed={} does not name \
+                         a prefix of the path asked for; not caching path={:?}",
+                        resp.path_consumed, request_path
                     );
                     return;
                 }
@@ -531,7 +531,7 @@ impl DfsResolver {
         let ttl = first.ttl().max(1);
 
         debug!(
-            "dfs: caching {:?} with {} targets, ttl={}s, {:?}{}",
+            "dfs: caching prefix={:?} targets={} ttl={}s, {:?}{}",
             dfs_path_prefix,
             targets.len(),
             ttl,
@@ -579,7 +579,7 @@ impl DfsResolver {
             else {
                 break;
             };
-            debug!("dfs: cache full, evicting {:?}", soonest);
+            debug!("dfs: cache full, evicting prefix={soonest:?}");
             self.cache.remove(&soonest);
         }
     }

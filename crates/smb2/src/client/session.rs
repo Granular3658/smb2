@@ -680,7 +680,7 @@ fn authenticate_final_response(
         }
         let anonymous = !flags.is_guest();
         debug!(
-            "session: server offered a {} session to a login as {account}, refusing",
+            "session: server offered a {} session to a named login, refusing user={account:?}",
             if anonymous { "anonymous" } else { "guest" }
         );
         return Err(Error::GuestSessionRefused {

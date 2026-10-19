@@ -243,7 +243,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     });
                     tokio::time::sleep(cancel_after).await;
                     handle.abort();
-                    log::debug!("cancelled {}", path);
+                    log::debug!("cancelled path={path:?}");
                     return Ok(0u64);
                 }
                 let started = Instant::now();
@@ -251,9 +251,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match &result {
                     Ok(n) => {
                         progress.record(*n);
-                        log::debug!("done {} ({} bytes) in {:?}", path, n, started.elapsed());
+                        log::debug!(
+                            "done ({} bytes) in {:?} path={path:?}",
+                            n,
+                            started.elapsed()
+                        );
                     }
-                    Err(e) => log::warn!("FAILED {} after {:?}: {}", path, started.elapsed(), e),
+                    Err(e) => {
+                        log::warn!("FAILED after {:?} path={path:?}: {}", started.elapsed(), e)
+                    }
                 }
                 result.map_err(|e| format!("{path}: {e}"))
             }));
@@ -335,7 +341,7 @@ async fn copy_one(
     }
 
     let mut writer = tree.create_file_writer(conn, path).await?;
-    log::debug!("stream: open_file_writer {}", path);
+    log::debug!("stream: open_file_writer path={path:?}");
     let mut offset = 0usize;
     while offset < body.len() {
         let end = (offset + push).min(body.len());

@@ -166,10 +166,7 @@ impl KerberosAuthenticator {
         self.as_exchange(&kdc_config).await?;
 
         // ── Step 2: TGS exchange ──
-        debug!(
-            "kerberos: starting TGS exchange for cifs/{}",
-            server_hostname
-        );
+        debug!("kerberos: starting TGS exchange for cifs host={server_hostname:?}");
         self.tgs_exchange(&kdc_config, server_hostname).await?;
 
         // ── Step 3: Build AP-REQ ──
@@ -197,10 +194,7 @@ impl KerberosAuthenticator {
 
         // Try cached service ticket first (no KDC needed).
         if let Some(svc) = ccache.find_service_ticket("cifs", server_hostname, realm) {
-            debug!(
-                "kerberos: using cached service ticket for cifs/{}",
-                server_hostname
-            );
+            debug!("kerberos: using cached service ticket for cifs host={server_hostname:?}");
             self.load_service_ticket_from_ccache(svc)?;
             self.build_ap_req()?;
             debug!("kerberos: authentication complete (from cached service ticket)");
@@ -210,8 +204,7 @@ impl KerberosAuthenticator {
         // Fall back to cached TGT + TGS exchange.
         if let Some(tgt_cred) = ccache.find_tgt(realm) {
             debug!(
-                "kerberos: using cached TGT, doing TGS exchange for cifs/{}",
-                server_hostname
+                "kerberos: using cached TGT, doing TGS exchange for cifs host={server_hostname:?}"
             );
             self.load_tgt_from_ccache(tgt_cred)?;
 
@@ -408,7 +401,7 @@ impl KerberosAuthenticator {
         // Update etype from what the KDC actually chose.
         self.etype = etype_from_i32(as_rep.enc_part.etype)?;
         trace!(
-            "kerberos: AS-REP etype={}, kvno={:?}, cipher_len={}, crealm={}, cname={:?}",
+            "kerberos: AS-REP etype={}, kvno={:?}, cipher_len={}, crealm={:?}, cname={:?}",
             as_rep.enc_part.etype,
             as_rep.enc_part.kvno,
             as_rep.enc_part.cipher.len(),
@@ -420,7 +413,7 @@ impl KerberosAuthenticator {
         // but etype might have changed based on the KDC response).
         let user_key = self.derive_user_key();
         trace!(
-            "kerberos: user_key len={}, etype={:?}, salt={}{}, key_prefix={:02x?}",
+            "kerberos: user_key len={}, etype={:?}, salt from realm={:?} user={:?}, key_prefix={:02x?}",
             user_key.len(),
             self.etype,
             self.credentials.realm,
@@ -774,7 +767,7 @@ impl KerberosAuthenticator {
                 match parse_krb_error(krb_data) {
                     Ok(err) => {
                         debug!(
-                            "kerberos: mutual auth KRB-ERROR code={}, realm={}, sname={:?}, e_text={:?}, e_data={:02x?}",
+                            "kerberos: mutual auth KRB-ERROR code={}, realm={:?}, sname={:?}, e_text={:?}, e_data={:02x?}",
                             err.error_code, err.realm, err.sname, err.e_text,
                             err.e_data.as_deref().unwrap_or(&[])
                         );

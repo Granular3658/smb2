@@ -150,7 +150,7 @@ pub fn parse_ccache(data: &[u8]) -> Result<CCache> {
     }
 
     debug!(
-        "ccache: parsed v{}, principal={}@{}, {} credentials",
+        "ccache: parsed v{}, principal={:?} realm={:?}, {} credentials",
         version & 0xFF,
         default_principal.components.join("/"),
         default_principal.realm,

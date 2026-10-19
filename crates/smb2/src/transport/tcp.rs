@@ -216,7 +216,10 @@ pub(crate) async fn dial_staggered(
         if next < addrs.len() {
             let (index, addr) = (next, addrs[next]);
             next += 1;
-            trace!("tcp: dialling {addr} for {host} (attempt {})", index + 1);
+            trace!(
+                "tcp: dialling (attempt {}) host={host:?} ip={addr:?}",
+                index + 1
+            );
             in_flight.push(async move { (index, TcpStream::connect(addr).await) });
         }
 
@@ -251,17 +254,20 @@ pub(crate) async fn dial_staggered(
             Either::Left((Some((index, result)), _)) => match result {
                 Ok(stream) => {
                     debug!(
-                        "tcp: {host} connected on {} ({} of {} address(es) tried)",
-                        addrs[index],
+                        "tcp: connected ({} of {} address(es) tried) host={host:?} ip={:?}",
                         index + 1,
-                        addrs.len()
+                        addrs.len(),
+                        addrs[index]
                     );
                     return Ok(stream);
                 }
                 Err(e) => {
                     // A fast failure starts the next address immediately: the
                     // loop pushes it before computing a fresh stagger.
-                    trace!("tcp: {} refused {host}: {e}", addrs[index]);
+                    trace!(
+                        "tcp: address refused host={host:?} ip={:?}: {e}",
+                        addrs[index]
+                    );
                     attempts[index].error_kind = Some(e.kind());
                 }
             },

@@ -502,8 +502,7 @@ impl Tree {
     ) -> Result<u64> {
         let conn = &mut self.pinned_conn(conn);
         debug!(
-            "copy: server-side copy {} -> {} (truncate_dest={})",
-            source_path, dest_path, truncate_dest
+            "copy: server-side copy from={source_path:?} to={dest_path:?} truncate_dest={truncate_dest}"
         );
         // Both handles are used across many round trips, so every request
         // goes out pinned to the session that opened them.

@@ -2966,7 +2966,7 @@ impl Connection {
         // `SmbClient::unc_for`, so the two can't disagree.
         let server_name = crate::client::host_of(addr).to_string();
         let transport = TcpTransport::connect_with(addr, opts).await?;
-        info!("connection: connected to {}", addr);
+        info!("connection: connected addr={addr:?}");
         let transport = Arc::new(transport);
         Ok(Self::from_transport(
             Box::new(Arc::clone(&transport)),

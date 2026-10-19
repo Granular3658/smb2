@@ -115,14 +115,14 @@ impl<'a> Pipeline<'a> {
     async fn execute_one(&mut self, op: Op) -> OpResult {
         match op {
             Op::ReadFile(path) => {
-                trace!("pipeline: read_file path={}", path);
+                trace!("pipeline: read_file path={path:?}");
                 match self.tree.read_file(self.conn, &path).await {
                     Ok(data) => OpResult::FileData { path, data },
                     Err(e) => OpResult::Error { path, error: e },
                 }
             }
             Op::WriteFile(path, data) => {
-                trace!("pipeline: write_file path={}", path);
+                trace!("pipeline: write_file path={path:?}");
                 match self.tree.write_file(self.conn, &path, &data).await {
                     Ok(bytes_written) => OpResult::Written {
                         path,
@@ -132,21 +132,21 @@ impl<'a> Pipeline<'a> {
                 }
             }
             Op::Delete(path) => {
-                trace!("pipeline: delete path={}", path);
+                trace!("pipeline: delete path={path:?}");
                 match self.tree.delete_file(self.conn, &path).await {
                     Ok(()) => OpResult::Deleted { path },
                     Err(e) => OpResult::Error { path, error: e },
                 }
             }
             Op::ListDirectory(path) => {
-                trace!("pipeline: list_directory path={}", path);
+                trace!("pipeline: list_directory path={path:?}");
                 match self.tree.list_directory(self.conn, &path).await {
                     Ok(entries) => OpResult::DirEntries { path, entries },
                     Err(e) => OpResult::Error { path, error: e },
                 }
             }
             Op::Stat(path) => {
-                trace!("pipeline: stat path={}", path);
+                trace!("pipeline: stat path={path:?}");
                 match self.tree.stat(self.conn, &path).await {
                     Ok(info) => OpResult::Stat { path, info },
                     Err(e) => OpResult::Error { path, error: e },

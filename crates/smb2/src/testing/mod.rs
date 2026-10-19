@@ -541,7 +541,7 @@ pub fn write_compose_files(dir: &Path) -> Result<()> {
             fs::set_permissions(&path, perms).map_err(Error::Io)?;
         }
     }
-    debug!("wrote {} embedded files to {}", files.len(), dir.display());
+    debug!("wrote {} embedded files dir={dir:?}", files.len());
     Ok(())
 }
 
@@ -747,7 +747,7 @@ impl TestServers {
     fn prepare(profile: Profile) -> Result<Self> {
         let compose_dir = std::env::temp_dir().join(format!("smb2-testing-{}", std::process::id()));
         write_compose_files(&compose_dir)?;
-        info!("prepared compose files in {}", compose_dir.display());
+        info!("prepared compose files dir={compose_dir:?}");
         Ok(Self {
             compose_dir,
             profile,
@@ -845,7 +845,7 @@ impl TestServers {
 
     /// Run `docker compose down` (best-effort).
     fn compose_down(&self) {
-        debug!("stopping containers in {}", self.compose_dir.display());
+        debug!("stopping containers dir={:?}", self.compose_dir);
         let result = Command::new("docker")
             .arg("compose")
             .arg("-f")
@@ -873,7 +873,7 @@ impl TestServers {
     fn cleanup_dir(&self) {
         if self.compose_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&self.compose_dir) {
-                debug!("failed to clean up {}: {e}", self.compose_dir.display());
+                debug!("failed to clean up dir={:?}: {e}", self.compose_dir);
             }
         }
     }

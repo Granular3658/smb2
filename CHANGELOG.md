@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Log lines print paths, shares, names, hosts, and users as quoted, keyed fields.** `tree: exclusive delete of Summer (Lake House)/a.jpg refused ...` is now `tree: exclusive delete refused (...), deleting shared path="Summer (Lake House)/a.jpg"`, and the same goes for every line that carried one (`path=`, `share=`, `from=`/`to=`, `server=`, `namespace=`, `host=`, `user=`, ...), at every level. A bare name has no end a reader can find, so a consumer's log parser, filter, or redactor couldn't tell where it stopped, and a hostile name could pass for the rest of the line. `{:?}` quoting escapes `"`, `\`, and newlines, so the value always ends at its closing quote. Paths appear as the caller passed them rather than in wire form. Log text isn't API, but if you grep or parse smb2's logs, expect the new shape. A test now keeps future lines to it (`AGENTS.md` § Logging).
+
 ## [0.32.0] - 2026-10-19
 
 ### Breaking

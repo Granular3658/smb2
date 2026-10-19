@@ -320,14 +320,14 @@ impl Tree {
         let durable = match (grant, identity) {
             (Some(grant), Some(identity)) => {
                 debug!(
-                    "durable: {} opened with a durable handle, server holds it {} ms{}",
-                    path,
+                    "durable: opened with a durable handle, server holds it {} ms{} path={:?}",
                     grant.timeout_ms,
                     if grant.persistent {
                         " (persistent)"
                     } else {
                         ""
-                    }
+                    },
+                    path
                 );
                 // So an oplock break, which arrives with no usable tree id of
                 // its own, can be answered on the right tree.
@@ -342,16 +342,16 @@ impl Tree {
             }
             (Some(_), None) => {
                 warn!(
-                    "durable: {path} got a durable handle but the server would not say \
-                     which file it is, so a reclaim could never be proven to be the same \
-                     one; treating the handle as non-resumable"
+                    "durable: got a durable handle but the server would not say which file \
+                     it is, so a reclaim could never be proven to be the same one; treating \
+                     the handle as non-resumable path={path:?}"
                 );
                 None
             }
             (None, _) => {
                 debug!(
-                    "durable: {path} opened without durability (server declined or does \
-                     not support it); an interrupted write will restart"
+                    "durable: opened without durability (server declined or does not \
+                     support it); an interrupted write will restart path={path:?}"
                 );
                 None
             }
@@ -421,8 +421,8 @@ impl Tree {
             Ok(pair) => pair,
             Err(Error::Protocol { status, .. }) => {
                 debug!(
-                    "durable: the server would not give {path} back ({status}); the open \
-                     expired or the server restarted"
+                    "durable: the server would not give the handle back ({status}); the \
+                     open expired or the server restarted path={path:?}"
                 );
                 return Err(lost(DurableLoss::Expired));
             }
@@ -434,8 +434,9 @@ impl Tree {
             // It answered the reclaim but not the question. We hold a handle we
             // cannot vouch for, so put it back.
             warn!(
-                "durable: {path} came back but the server would not say which file it \
-                 is, so nothing about it can be proven; closing it and starting over"
+                "durable: the handle came back but the server would not say which file \
+                 it is, so nothing about it can be proven; closing it and starting over \
+                 path={path:?}"
             );
             let _ = self.close_handle(conn, resp.file_id).await;
             return Err(lost(DurableLoss::IdentityUnavailable));
@@ -446,10 +447,10 @@ impl Tree {
             // Loud, because a server reaching this is doing something the
             // protocol says it must not.
             error!(
-                "durable: REFUSING a reclaimed handle for {path} -- the server matched \
-                 our CreateGuid but handed back a different file (asked for volume \
-                 {:#x} file {:#x}, got volume {:#x} file {:#x}). Closing it; the \
-                 transfer restarts rather than writing into the wrong file.",
+                "durable: REFUSING a reclaimed handle -- the server matched our \
+                 CreateGuid but handed back a different file (asked for volume {:#x} \
+                 file {:#x}, got volume {:#x} file {:#x}). Closing it; the transfer \
+                 restarts rather than writing into the wrong file. path={path:?}",
                 handle.identity.volume_serial,
                 handle.identity.index_number,
                 identity.volume_serial,
@@ -460,8 +461,8 @@ impl Tree {
         }
 
         info!(
-            "durable: {path} reclaimed on the new session; the transfer resumes rather \
-             than restarting"
+            "durable: reclaimed on the new session; the transfer resumes rather than \
+             restarting path={path:?}"
         );
         conn.register_oplock(resp.file_id, self.tree_id);
         Ok(DurableHandle {

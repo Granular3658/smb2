@@ -187,8 +187,8 @@ fn link_key(addr: &str, share: &str) -> (String, String) {
 
 fn orphaned(tree: &Tree) -> Error {
     debug!(
-        "smb_client: no connection for {} (share {:?}); the DFS target it was \
-         resolved on is gone, so connect_share again",
+        "smb_client: no connection for this tree; the DFS target it was resolved on is \
+         gone, so connect_share again server={:?} share={:?}",
         tree.server, tree.share_name
     );
     Error::Disconnected

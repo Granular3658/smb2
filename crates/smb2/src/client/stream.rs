@@ -738,7 +738,7 @@ pub struct FileReader {
 /// you already hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
 /// connection clone.
 pub async fn open_file_reader(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileReader> {
-    trace!("stream: open_file_reader path={}", path);
+    trace!("stream: open_file_reader path={path:?}");
 
     let mut conn = tree.pinned_conn(&conn).pinned_to_session();
     let opened = tree
@@ -1239,7 +1239,7 @@ impl WriteCheckpoint {
 /// hold an `&SmbClient` or `&Arc<Tree>` and don't need the explicit
 /// connection clone.
 pub async fn open_file_writer(tree: Arc<Tree>, conn: Connection, path: &str) -> Result<FileWriter> {
-    trace!("stream: open_file_writer path={}", path);
+    trace!("stream: open_file_writer path={path:?}");
 
     let (writer, _) = open_writer(tree, conn, path, CreateDisposition::FileOverwriteIf).await?;
     Ok(writer)
@@ -1257,7 +1257,7 @@ pub async fn open_file_writer_exclusive(
     conn: Connection,
     path: &str,
 ) -> Result<FileWriter> {
-    trace!("stream: open_file_writer_exclusive path={}", path);
+    trace!("stream: open_file_writer_exclusive path={path:?}");
 
     let (writer, _) = open_writer(tree, conn, path, CreateDisposition::FileCreate).await?;
     Ok(writer)
@@ -1300,11 +1300,7 @@ pub async fn open_file_writer_at(
     path: &str,
     offset: u64,
 ) -> Result<FileWriter> {
-    trace!(
-        "stream: open_file_writer_at path={} offset={}",
-        path,
-        offset
-    );
+    trace!("stream: open_file_writer_at path={path:?} offset={offset}");
 
     let (mut writer, _) = open_writer(tree, conn, path, CreateDisposition::FileOpenIf).await?;
     writer.pipe.set_offset(offset);
@@ -1377,13 +1373,12 @@ pub async fn open_file_writer_resume(
     checkpoint: &WriteCheckpoint,
 ) -> Result<FileWriter> {
     trace!(
-        "stream: open_file_writer_resume path={} offset={}",
-        path,
+        "stream: open_file_writer_resume path={path:?} offset={}",
         checkpoint.offset
     );
     let refused = |reason| {
         debug!(
-            "stream: not resuming {path} at {}: {reason}",
+            "stream: not resuming path={path:?} offset={}: {reason}",
             checkpoint.offset
         );
         Error::ResumeRefused {

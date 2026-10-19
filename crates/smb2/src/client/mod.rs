@@ -522,7 +522,7 @@ impl SmbClient {
     ///
     /// Performs TCP connect, negotiate, and session setup in one call.
     pub async fn connect(config: ClientConfig) -> Result<Self> {
-        debug!("smb_client: connecting to {}", config.addr);
+        debug!("smb_client: connecting addr={:?}", config.addr);
 
         let mut conn = Connection::connect_with(&config.addr, config.connect_options()).await?;
         conn.set_compression_requested(config.compression);
@@ -640,7 +640,7 @@ impl SmbClient {
         // is found again then.
         let requested = self.unc_for(share_name);
         if self.config.dfs_enabled && self.dfs_resolver.resolve_from_cache(&requested).is_some() {
-            trace!("dfs: {requested:?} is a known namespace, going straight to its targets");
+            trace!("dfs: known namespace, going straight to its targets namespace={requested:?}");
             return self.connect_namespace(&requested).await;
         }
 
@@ -660,8 +660,8 @@ impl SmbClient {
         }
 
         debug!(
-            "dfs: {share_name:?} is not a share on {}, and the server speaks DFS; \
-             asking it for a root referral",
+            "dfs: not a share on the server, and the server speaks DFS; asking it for a root \
+             referral share={share_name:?} server={:?}",
             self.connections.primary_server()
         );
         match self.connect_namespace(&requested).await {
@@ -675,7 +675,9 @@ impl SmbClient {
                 Err(err)
             }
             Err(err) => {
-                debug!("dfs: no namespace behind {share_name:?} ({err}); reporting the refusal");
+                debug!(
+                    "dfs: no namespace behind the share, reporting the refusal share={share_name:?}: {err}"
+                );
                 Err(refusal)
             }
         }
@@ -752,7 +754,7 @@ impl SmbClient {
             // namespace, so there is nothing here to connect to.
             if let Some(first) = targets.first().filter(|t| t.interlink) {
                 path = format!(r"\\{}\{}", first.server, first.share);
-                trace!("dfs: {requested:?} is an interlink, re-resolving as {path:?}");
+                trace!("dfs: interlink, re-resolving namespace={requested:?} target={path:?}");
                 continue;
             }
 
@@ -768,8 +770,8 @@ impl SmbClient {
                 // dropping the suffix and opening the wrong directory.
                 if !target.remaining_path.is_empty() {
                     debug!(
-                        "dfs: skipping target \\\\{}\\{} for {requested:?}: a root target \
-                         cannot carry the path suffix {:?}",
+                        "dfs: skipping a root target that carries a path suffix, which a root \
+                         target cannot namespace={requested:?} server={:?} share={:?} suffix={:?}",
                         target.server, target.share, target.remaining_path
                     );
                     continue;
@@ -784,13 +786,15 @@ impl SmbClient {
                             target: format!(r"\\{}\{}", target.server, target.share),
                         });
                         info!(
-                            "dfs: namespace {requested} resolved to \\\\{}\\{}",
+                            "dfs: namespace resolved namespace={requested:?} server={:?} share={:?}",
                             target.server, target.share
                         );
                         return Ok(tree);
                     }
                     Err(err) => {
-                        debug!("dfs: target {target_addr} for {requested:?} refused: {err}");
+                        debug!(
+                            "dfs: target refused namespace={requested:?} addr={target_addr:?}: {err}"
+                        );
                         last_error = Some(err);
                     }
                 }
@@ -880,7 +884,7 @@ impl SmbClient {
     /// connection is left unambiguously dead and the error is
     /// [`Error::ReconnectFailed`].
     pub async fn reconnect(&mut self) -> Result<()> {
-        debug!("smb_client: reconnecting to {}", self.config.addr);
+        debug!("smb_client: reconnecting addr={:?}", self.config.addr);
         self.reconnects.fetch_add(1, Ordering::Relaxed);
 
         // An explicit reconnect works even when `auto_reconnect` is off: the
@@ -1086,7 +1090,7 @@ impl SmbClient {
             }
             Err(e) => {
                 debug!(
-                    "dfs: couldn't follow the link at {path:?} ({e}), keeping the server's answer"
+                    "dfs: couldn't follow the link, keeping the server's answer path={path:?}: {e}"
                 );
                 return Followed {
                     result: Err(original),
@@ -1186,7 +1190,7 @@ impl SmbClient {
         let normalized = crate::name::encode_path(original_path);
         let unc_path = format!("\\\\{}\\{}\\{}", hostname, share, normalized);
 
-        debug!("dfs: resolving {}", unc_path);
+        debug!("dfs: resolving path={unc_path:?}");
 
         // Resolve the referral (uses cache or IOCTL).
         let conn = self.connections.for_tree(tree)?;
@@ -1210,7 +1214,7 @@ impl SmbClient {
                 }
                 Err(e) => {
                     debug!(
-                        "dfs: target \\\\{}\\{} ({}) refused: {}",
+                        "dfs: target refused server={:?} share={:?} addr={:?}: {}",
                         resolved.server, resolved.share, target_addr, e
                     );
                     last_error = Some(e);

@@ -421,7 +421,7 @@ impl Tree {
                 let mut cursor = ReadCursor::new(&frame.body);
                 if let Ok(err) = crate::msg::header::ErrorResponse::unpack(&mut cursor) {
                     if err.is_share_redirect() {
-                        debug!("tree: {share_name} was redirected to another cluster node");
+                        debug!("tree: redirected to another cluster node share={share_name:?}");
                         return Err(Error::ShareRedirected {
                             share: share_name.to_string(),
                         });
@@ -449,7 +449,7 @@ impl Tree {
             .share_flags
             .contains(crate::types::flags::ShareFlags::ENCRYPT_DATA);
 
-        info!("tree: connected share={}, tree_id={}", share_name, tree_id);
+        info!("tree: connected share={share_name:?}, tree_id={tree_id}");
         debug!("tree: is_dfs={}, encrypt_data={}", is_dfs, encrypt_data);
 
         if is_dfs {
@@ -538,7 +538,7 @@ impl Tree {
         buffer_len: u32,
         options: ListOptions,
     ) -> Result<DirectoryReader> {
-        trace!("tree: open_directory_reader path={}", path);
+        trace!("tree: open_directory_reader path={path:?}");
         // A server that refused class 37 once on this connection is listed
         // the default way from the start.
         let class = if options.index_numbers && !conn.listing_ids_refused() {
@@ -586,7 +586,7 @@ impl Tree {
         // TRACE, not DEBUG: a recursive scan calls list_directory once per directory
         // (millions of times on a large share), so at DEBUG it dominates a consumer's
         // log. Per-operation mutations (rename/delete/write) stay at DEBUG. See AGENTS.md.
-        trace!("tree: list_directory path={}", path);
+        trace!("tree: list_directory path={path:?}");
         let mut reader = self
             .open_directory_reader_with(conn.clone(), path, options)
             .await?;
@@ -748,10 +748,7 @@ impl Tree {
         // which is not a request the spec allows.
         let requested = expected_size.min(max_read as u64).max(1) as u32;
         trace!(
-            "tree: read_file_compound path={}, requested={}, max_read={}",
-            normalized,
-            requested,
-            max_read
+            "tree: read_file_compound path={path:?}, requested={requested}, max_read={max_read}"
         );
 
         // Build CREATE request (same params as open_file).
@@ -851,8 +848,8 @@ impl Tree {
         // CLOSE already released the handle, so there's nothing to clean up.
         if create_resp.end_of_file > requested as u64 {
             debug!(
-                "tree: read_file_compound path={} is {} bytes > the {}-byte read issued for it",
-                normalized, create_resp.end_of_file, requested
+                "tree: read_file_compound file is {} bytes > the {}-byte read issued for it path={:?}",
+                create_resp.end_of_file, requested, path
             );
             return Err(Error::FileTooLargeForSingleRead {
                 size: create_resp.end_of_file,
@@ -921,7 +918,7 @@ impl Tree {
     pub async fn disconnect(&self, conn: &mut Connection) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
         trace!(
-            "tree: disconnecting share={}, tree_id={}",
+            "tree: disconnecting share={:?}, tree_id={}",
             self.share_name,
             self.tree_id
         );
@@ -940,7 +937,7 @@ impl Tree {
         conn.deregister_dfs_tree(self.tree_id);
 
         info!(
-            "tree: disconnected share={}, tree_id={}",
+            "tree: disconnected share={:?}, tree_id={}",
             self.share_name, self.tree_id
         );
         Ok(())
@@ -967,7 +964,7 @@ impl Tree {
     ) -> Result<crate::client::watcher::Watcher> {
         let conn = &mut self.pinned_conn(conn);
         debug!(
-            "tree: watch path={}, recursive={}, tree_id={}",
+            "tree: watch path={:?}, recursive={}, tree_id={}",
             path, recursive, self.tree_id
         );
 
@@ -1027,9 +1024,9 @@ impl Tree {
                 ) =>
             {
                 debug!(
-                    "tree: exclusive delete of {} refused ({:?}), deleting shared",
-                    path,
-                    e.status()
+                    "tree: exclusive delete refused ({:?}), deleting shared path={:?}",
+                    e.status(),
+                    path
                 );
                 self.delete_compound(conn, path, FILE_NON_DIRECTORY_FILE, SHARE_ALL, "file")
                     .await
@@ -1113,7 +1110,7 @@ impl Tree {
     ) -> Result<(FileInfo, Option<FileIdentity>)> {
         let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
-        trace!("tree: stat (compound) path={}", normalized);
+        trace!("tree: stat (compound) path={path:?}");
 
         // BUILD CREATE request for reading attributes.
         let create_req = CreateRequest {
@@ -1277,7 +1274,7 @@ impl Tree {
     /// Uses a compound CREATE+QUERY_INFO+CLOSE for efficiency (one round-trip).
     pub async fn fs_info(&self, conn: &mut Connection) -> Result<FsInfo> {
         let conn = &mut self.pinned_conn(conn);
-        trace!("tree: fs_info on share={}", self.share_name);
+        trace!("tree: fs_info on share={:?}", self.share_name);
 
         // Build CREATE request to open the root directory of the share.
         let create_req = CreateRequest {
@@ -1465,9 +1462,7 @@ impl Tree {
         let from_normalized = self.format_path(from);
         let to_normalized = normalize_path(to);
         trace!(
-            "tree: rename (compound) from={} to={} replace_if_exists={}",
-            from_normalized,
-            to_normalized,
+            "tree: rename (compound) from={from:?} to={to:?} replace_if_exists={}",
             options.replace_if_exists
         );
 
@@ -1565,10 +1560,7 @@ impl Tree {
             );
         }
 
-        debug!(
-            "tree: renamed from={} to={}",
-            from_normalized, to_normalized
-        );
+        debug!("tree: renamed from={from:?} to={to:?}");
         Ok(())
     }
 
@@ -1694,8 +1686,8 @@ impl Tree {
         let conn = &mut conn.pinned_to_session();
         let normalized = self.format_path(path);
         trace!(
-            "tree: write_file_compound path={}, len={}, disposition={:?}",
-            normalized,
+            "tree: write_file_compound path={:?}, len={}, disposition={:?}",
+            path,
             data.len(),
             create_disposition
         );
@@ -1857,7 +1849,7 @@ impl Tree {
 
         if file_size == 0 {
             trace!(
-                "tree: read_file_pipelined path={}, size=0 (empty file)",
+                "tree: read_file_pipelined path={:?}, size=0 (empty file)",
                 path
             );
             self.close_handle(conn, file_id).await?;
@@ -1884,7 +1876,7 @@ impl Tree {
         let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
-            "tree: read_file_pipelined path={}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
+            "tree: read_file_pipelined path={:?}, size={}, chunk_size={}, credit_charge={}, total_chunks={}, credits={}",
             path, file_size, chunk_size, credit_charge, total_chunks, conn.credits()
         );
 
@@ -1963,7 +1955,7 @@ impl Tree {
         let conn = &mut conn.pinned_to_session();
         if file_size == 0 {
             trace!(
-                "tree: read_file_pipelined_with_progress path={}, size=0 (empty file)",
+                "tree: read_file_pipelined_with_progress path={:?}, size=0 (empty file)",
                 path
             );
             self.close_handle(conn, file_id).await?;
@@ -1985,7 +1977,7 @@ impl Tree {
         let credit_charge = credits::charge_for_payload(chunk_size as u64);
         let total_chunks = file_size.div_ceil(chunk_size as u64) as usize;
         trace!(
-            "tree: read_file_pipelined_with_progress path={}, size={}, chunk_size={}, total_chunks={}",
+            "tree: read_file_pipelined_with_progress path={:?}, size={}, chunk_size={}, total_chunks={}",
             path, file_size, chunk_size, total_chunks
         );
 
@@ -2085,10 +2077,7 @@ impl Tree {
         let normalized = self.format_path(path);
 
         if data.is_empty() {
-            trace!(
-                "tree: write_file_pipelined path={}, len=0 (empty write)",
-                normalized
-            );
+            trace!("tree: write_file_pipelined path={path:?}, len=0 (empty write)");
             // Still create the file (to match write_file behavior).
             return self.write_file_compound(conn, path, data).await;
         }
@@ -2132,8 +2121,8 @@ impl Tree {
         let max_write = conn.params().map(|p| p.max_write_size).unwrap_or(65536);
         let mut pipe = WritePipe::new(conn.clone(), self.tree_id, file_id, max_write);
         trace!(
-            "tree: write_file_pipelined path={}, len={}, chunk_size={}, credits={}",
-            normalized,
+            "tree: write_file_pipelined path={:?}, len={}, chunk_size={}, credits={}",
+            path,
             data.len(),
             pipe.next_len(),
             conn.credits()
@@ -2246,7 +2235,7 @@ impl Tree {
         F: FnMut() -> Option<std::result::Result<Vec<u8>, std::io::Error>>,
     {
         let conn = &mut self.pinned_conn(conn);
-        trace!("tree: write_file_streamed path={}", path);
+        trace!("tree: write_file_streamed path={path:?}");
         // Every request after the open carries its handle, so all of them go
         // out pinned to the session that opened it.
         let conn = &mut conn.pinned_to_session();
@@ -2435,7 +2424,7 @@ impl Tree {
     pub async fn create_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
-        trace!("tree: create_directory path={}", normalized);
+        trace!("tree: create_directory path={path:?}");
 
         let req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2472,7 +2461,7 @@ impl Tree {
 
         // Close the handle immediately.
         self.close_handle(conn, file_id).await?;
-        debug!("tree: created directory={}", normalized);
+        debug!("tree: created directory path={path:?}");
         Ok(())
     }
 
@@ -2513,7 +2502,7 @@ impl Tree {
     ) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
-        trace!("tree: delete_{} (compound) path={}", kind, normalized);
+        trace!("tree: delete_{kind} (compound) path={path:?}");
 
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
@@ -2600,7 +2589,7 @@ impl Tree {
             }
         }
 
-        debug!("tree: deleted {}={}", kind, normalized);
+        debug!("tree: deleted {kind} path={path:?}");
         Ok(())
     }
 
@@ -2930,7 +2919,7 @@ impl Tree {
         let entries = parse_directory_entries(class, &resp.output_buffer)?;
         for e in &entries {
             trace!(
-                "tree: dir_entry name={}, size={}, is_dir={}",
+                "tree: dir_entry name={:?}, size={}, is_dir={}",
                 e.name,
                 e.size,
                 e.is_directory

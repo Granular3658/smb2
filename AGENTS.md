@@ -528,6 +528,21 @@ Two follow-on rules fall out of it:
 An idle connection is the test case that matters: keepalive `ECHO`s and long-polling `CHANGE_NOTIFY`s must produce
 nothing at `debug` when they're working.
 
+**The field rule:** every path, file name, share, DFS namespace, host, or user in a log line is a keyed, Debug-quoted
+field at the end of the line: `tree: exclusive delete refused (..), deleting shared path="a/b c.txt"`, never
+`deleted {}` or `{path} reclaimed` in the prose. A bare value has no end anyone can find (`Summer (Lake House)/a.jpg`
+swallows the rest of the line), and a hostile name could forge what follows it; `{:?}` escapes `"`, `\`, and
+newlines, so a consumer's parser, filter, or redactor finds the value exactly. Details that go with it:
+
+- Log the path as the caller passed it (`path`), not the wire form (`normalized`, `format_path`): the caller's form is
+  what a consumer can match, and the wire form's backslashes come out doubled under `{:?}`.
+- Split a UNC target into `server={:?} share={:?}` rather than quoting `\\server\share`, for the same reason.
+- Numbers, flags, ids, statuses, and an error's `{e}` stay as they are. Error `Display` text is prose a consumer may
+  show a person, so it's out of scope; a consumer wanting the path matches on the variant's `path` field.
+- `tests/log_fields.rs` enforces it by key (`path=`, `share=`, ..) and by variable name (`path`, `share_name`,
+  `server`, ..), so name a variable after what it holds. Its `SENSITIVE` list is the vocabulary; extend it when you
+  log a new kind of name.
+
 **How to enable:**
 
 ```sh
