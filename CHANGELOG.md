@@ -5,7 +5,11 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.32.1] - 2026-10-19
+
+### Fixed
+
+- **Kerberos `trace` logs no longer print part of a key.** Two lines printed the first eight bytes of the user's long-term key and of the AS session key. They print the key length now, as every other key log does.
 
 ### Changed
 
