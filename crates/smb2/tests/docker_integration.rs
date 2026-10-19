@@ -582,7 +582,11 @@ async fn guest_a_dropped_writer_lets_go_of_the_file_before_the_next_request() {
         .delete_file(&mut conn, path)
         .await
         .expect_err("an open writer keeps the file from being deleted");
-    assert_eq!(refused.kind(), smb2::ErrorKind::SharingViolation, "{refused}");
+    assert_eq!(
+        refused.kind(),
+        smb2::ErrorKind::SharingViolation,
+        "{refused}"
+    );
 
     drop(writer);
     tree.delete_file(&mut conn, path)

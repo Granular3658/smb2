@@ -2107,17 +2107,6 @@ impl Inner {
         frame.settle().await
     }
 
-    /// [`send_and_count`](Self::send_and_count)'s handover without the wait,
-    /// for a caller that can't await (`Drop`): the frame joins the writer's
-    /// queue now, behind every frame already handed over and ahead of every
-    /// one handed over after. `None` when the queue is full or the writer is
-    /// gone, and then nothing was queued.
-    fn try_queue(self: &Arc<Self>, bytes: Vec<u8>, command: Command) -> Option<QueuedFrame> {
-        let (job, frame) = self.write_job(bytes, command);
-        let write_tx = self.write_tx.lock().unwrap().clone();
-        write_tx.try_send(job).ok().map(|()| frame)
-    }
-
     /// A frame ready for the writer task, and the handle that waits for its
     /// outcome. The frame counts in `send_queue_depth` from here until that
     /// handle is settled or dropped.
@@ -4001,10 +3990,20 @@ impl Connection {
         let Some(mut reservation) = self.inner.credits.try_reserve(1) else {
             return Ok(None);
         };
-        let request = self.prepare_request(command, body, tree_id, 1, &mut reservation)?;
-        let Some(frame) = self.inner.try_queue(request.wire, command) else {
+        // The queue slot before the message id: an id allocated and then
+        // never sent leaves a hole the server's sequence window can't move
+        // past (Samba advances it only from its lowest unused id), and on a
+        // live connection that stalls everything after it.
+        let write_tx = self.inner.write_tx.lock().unwrap().clone();
+        let Ok(slot) = write_tx.try_reserve() else {
             return Ok(None);
         };
+        let request = self.prepare_request(command, body, tree_id, 1, &mut reservation)?;
+        let (job, frame) = self.inner.write_job(request.wire, command);
+        // Lands behind every frame already handed over and ahead of every
+        // one handed over after. A writer gone meanwhile drops it, and the
+        // frame's ack reports `Disconnected`.
+        slot.send(job);
         // Spent from here on: the frame goes out, or the connection dies
         // with the session that funded it. Refunding it now would let the
         // next request spend a credit this one is about to use.
@@ -9917,6 +9916,47 @@ mod send_path_liveness_tests {
                 crate::ErrorKind::ConnectionLost,
                 "got {other:?}"
             );
+        }
+    }
+
+    /// A request queued from `Drop` that finds the writer's queue full sends
+    /// nothing and spends no message id. An id allocated and never sent is a
+    /// hole in the server's sequence window, which Samba can't advance past,
+    /// so on a live connection it would stall every request after it.
+    #[tokio::test]
+    async fn queueing_without_waiting_on_a_full_queue_spends_no_message_id() {
+        let mock = Arc::new(MockTransport::new());
+        let conn = Connection::from_transport(
+            Box::new(StallingSend::new(Arc::clone(&mock), 0)),
+            Box::new(Arc::clone(&mock)),
+            "test-server",
+        );
+        conn.set_credits(1024);
+        conn.set_send_timeout(None);
+
+        // One frame parked in the writer, the queue full behind it, and a few
+        // callers waiting for room.
+        let callers = WRITE_QUEUE_DEPTH + 8;
+        let tasks: Vec<_> = (0..callers)
+            .map(|_| {
+                let c = conn.clone();
+                tokio::spawn(async move { c.execute(Command::Echo, &EchoRequest, None).await })
+            })
+            .collect();
+        wait_for(|| (conn.send_queue_depth() == callers).then_some(())).await;
+
+        let next_id = conn.inner.next_message_id.load(Ordering::SeqCst);
+        let queued = conn
+            .dispatch_without_waiting(Command::Echo, &EchoRequest, None)
+            .expect("nothing about the connection is wrong");
+        assert!(queued.is_none(), "a full queue declines");
+        assert_eq!(
+            conn.inner.next_message_id.load(Ordering::SeqCst),
+            next_id,
+            "and allocates no message id"
+        );
+        for task in tasks {
+            task.abort();
         }
     }
 

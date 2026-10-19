@@ -88,11 +88,12 @@ for the writer task's ack; `writer_loop` owns the transport's write half and is 
   `Error::Io` from a live connection means a local failure (a streamed upload's own callback). Read errors already
   reach waiters as `Disconnected` through `fan_error_to_waiters`. Pinned by
   `the_request_whose_send_broke_the_connection_reports_it_lost`.
-- **Handing over can be synchronous.** `Inner::try_queue` puts a frame in the queue without awaiting (`try_send`), and
-  `Connection::dispatch_without_waiting` builds a whole request around it (a credit by `try_reserve`, the waiter, the
-  signed bytes); it's what `Drop` uses (§ Dropping a handle). The frame's place in the queue is its place on the wire.
-  `QueuedFrame` holds the frame's count in `send_queue_depth` until its ack (or its drop), so a cancelled caller can't
-  leave the gauge counting it.
+- **Handing over can be synchronous.** `Connection::dispatch_without_waiting` takes a credit (`try_reserve`) and a
+  queue slot (the `mpsc` `try_reserve` permit), then builds, signs, and queues the request without awaiting; it's what
+  `Drop` uses (§ Dropping a handle). The frame's place in the queue is its place on the wire. ❌ Take the slot before
+  `prepare_request` allocates the message id: an id allocated and then never sent leaves a hole that Samba's sequence
+  window can't move past, which stalls a live connection. `QueuedFrame` holds the frame's count in `send_queue_depth`
+  until its ack (or its drop), so a cancelled caller can't leave the gauge counting it.
 - **Whole frames only.** `TcpTransport::send` writes a 4-byte length header and then the body. A caller cancelled
   between the two used to leave a header with no body on the wire and every later frame landed inside it — and
   consumers cancel constantly (a user aborting a copy). Queuing the frame as one message makes that unreachable.
@@ -493,7 +494,7 @@ Both consume `self` so write-after-close/abort is a compile error. A writer drop
 
 Every type that owns an open handle (`FileWriter`, `FileReader`, `FileUpload`, `FileDownload`, `DirectoryReader`, `Watcher`) closes it when dropped still open, through `Tree::close_dropped_handle`. Consumers drop these routinely: a copy driver that stops on the first failure drops every writer in flight, and a handle left open keeps the file locked against the consumer's own cleanup (`STATUS_SHARING_VIOLATION` deleting the temp file it just wrote, Cmdr 2026-10-19) for as long as the session lives.
 
-- **Queued synchronously, so ordered.** `Drop` can't await, and a spawned CLOSE would race the owner's next request: the delete right after the drop got there first. `dispatch_without_waiting` takes a credit with `try_reserve`, builds and signs the CLOSE, and `try_send`s it into the writer task's queue before `Drop` returns. It lands after every request the handle already queued (a writer's in-flight WRITEs: `WritePipe::dispatch` returns only once its frame is queued, so a dropped `write_chunk` leaves nothing half-sent behind it) and before anything the owner sends next. A spawned task then only waits for the answer and logs a failure at `debug`; with no runtime in reach (`rt::try_spawn` answers `None` instead of panicking) the CLOSE goes out all the same and its answer is discarded.
+- **Queued synchronously, so ordered.** `Drop` can't await, and a spawned CLOSE would race the owner's next request: the delete right after the drop got there first. `dispatch_without_waiting` takes a credit and a queue slot without waiting, builds and signs the CLOSE, and queues it for the writer task before `Drop` returns (§ The send path). It lands after every request the handle already queued (a writer's in-flight WRITEs: `WritePipe::dispatch` returns only once its frame is queued, so a dropped `write_chunk` leaves nothing half-sent behind it) and before anything the owner sends next. A spawned task then only waits for the answer and logs a failure at `debug`; with no runtime in reach (`rt::try_spawn` answers `None` instead of panicking) the CLOSE goes out all the same and its answer is discarded.
 - **Fallback, unordered.** No credit on hand, or a full queue: the CLOSE is sent from a spawned task instead, with no ordering promise. No runtime either: logged at `debug`, and the handle stays open until the session ends.
 - ❌ **Never a second CLOSE.** Each type marks the CLOSE as started *before* sending it (`done` / `closed` / `close_started` / `State::Closing`), and `Drop` sends nothing once it is, even when the future that started it was dropped before its frame got out (that handle then stays open until the session ends). A second CLOSE is worse than a leak: the server may have given the same file id to a new open in between (Windows reuses volatile ids), and the stray CLOSE would close somebody else's file on this session.
 - **A handle from a session that ended sends nothing** (`pinned_session_is_current`), as with an explicit close: the server let go of it with the session.
