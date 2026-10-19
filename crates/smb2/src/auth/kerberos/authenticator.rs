@@ -413,12 +413,11 @@ impl KerberosAuthenticator {
         // but etype might have changed based on the KDC response).
         let user_key = self.derive_user_key();
         trace!(
-            "kerberos: user_key len={}, etype={:?}, salt from realm={:?} user={:?}, key_prefix={:02x?}",
+            "kerberos: user_key len={}, etype={:?}, salt from realm={:?} user={:?}",
             user_key.len(),
             self.etype,
             self.credentials.realm,
             self.credentials.username,
-            &user_key[..user_key.len().min(8)],
         );
 
         // Decrypt the enc-part to get the session key.
@@ -513,9 +512,9 @@ impl KerberosAuthenticator {
         );
 
         trace!(
-            "kerberos: TGS authenticator plain ({} bytes), session key prefix={:02x?}",
+            "kerberos: TGS authenticator plain ({} bytes), session key len={}",
             authenticator_plain.len(),
-            &as_session_key[..as_session_key.len().min(8)]
+            as_session_key.len()
         );
 
         let encrypted_authenticator = kerberos_encrypt(
