@@ -5,6 +5,17 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Copying small files to an older Samba NAS no longer drops the connection.** A file that fits in one WRITE went up as one compound CREATE + WRITE + FLUSH + CLOSE. Samba 4.4 through 4.15 (and early 4.16.x / 4.17.x, which covers a lot of NAS firmware) refuses a FLUSH with anything after it in a compound, and the refusal crashes the server's connection process a moment later (Samba bug 15172), so a small-file copy lost its connection on the first file or two, and every reconnect tripped it again. The write now ends its compound on the FLUSH and sends the CLOSE on its own. This is the shape MS-SMB2 allows a server to process asynchronously, so it works on every server, Windows included, and the crate no longer has to learn per connection that Windows refuses the old chain. It costs one more round trip per small file: on a QNAP over Wi-Fi, 5.5 ms became 9.7 ms per file one at a time, and 1.3 ms became 2.0 ms at eight in flight. Affects `write_file`, `write_file_compound`, `write_file_compound_exclusive` (on `Tree` and `SmbClient`), `SmbClient::upload` for small data, and `smb2 put` (smb2-cli 0.4.21).
+- **A small-file write the server can't flush is an error.** The compound write used to log a refused FLUSH and report success. It now closes the handle and fails with `Error::Protocol { command: Command::Flush, .. }`, as `FileWriter::finish` always has, so "written" means the server said the data is on disk.
+
+### Changed
+
+- **`Connection::compound_write_limit()` counts the CREATE and FLUSH next to the WRITE**, not the CLOSE that no longer rides along. It moves only on a server with a small credit window, and only up: one credit more.
+
 ## [0.31.0] - 2026-10-16
 
 ### Breaking

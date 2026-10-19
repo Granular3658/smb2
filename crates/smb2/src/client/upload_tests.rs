@@ -357,7 +357,7 @@ async fn the_quick_write_limit_stays_within_the_compound_write_limit() {
     assert_eq!(
         conn.quick_write_limit(),
         conn.compound_write_limit(),
-        "what half the window funds next to CREATE, FLUSH, and CLOSE"
+        "what half the window funds next to the CREATE and FLUSH"
     );
     conn.set_credit_ceiling(4);
     assert_eq!(

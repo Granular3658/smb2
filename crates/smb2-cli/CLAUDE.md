@@ -58,7 +58,7 @@ Neither direction ever holds a whole file. That is a correctness matter as much 
 server's `MaxReadSize` (8 MB on a stock Samba) is a hard ceiling on what one READ can return.
 
 - **`put`** (`transfer::upload`): a file that fits in one WRITE is read into memory and sent as a single compound
-  CREATE+WRITE+FLUSH+CLOSE, which keeps a small upload at one round trip. Anything larger is pulled off disk a
+  CREATE+WRITE+FLUSH and a CLOSE, which keeps a small upload at two round trips. Anything larger is pulled off disk a
   chunk at a time and fed to `write_file_streamed`, whose pipeline window is what the upload then costs. The
   callback reads with blocking `std::fs`, on purpose: it is called from inside the write pipeline's own task, so
   it stalls only itself.

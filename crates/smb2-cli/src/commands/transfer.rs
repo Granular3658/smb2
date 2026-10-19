@@ -309,7 +309,7 @@ pub async fn put(
 /// acknowledged.
 ///
 /// A file that fits in one WRITE goes up as a single compound
-/// CREATE+WRITE+FLUSH+CLOSE, which is one round trip and worth keeping for the
+/// CREATE+WRITE+FLUSH plus a CLOSE, two round trips and worth keeping for the
 /// common case of uploading something small. Anything larger is pulled off disk
 /// a chunk at a time and fed to the library's pipelined streaming write, so the
 /// memory an upload costs is the pipeline's window rather than the file: this

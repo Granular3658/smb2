@@ -1,58 +1,52 @@
-# Samba 4.9.5 crashes on `write_file_compound`
+# Samba up to 4.15 crashes on a FLUSH inside a compound
 
-**Status**: confirmed against real hardware, not chased further. Affects the server, not this crate.
+**Status**: root-caused (2026-10-19). A Samba bug, avoided on our side since the compound write ends its chain on the
+FLUSH (AGENTS.md pitfall 33). The file name keeps its first sighting, on Samba 4.9.5.
 
-`Tree::write_file_compound` (CREATE + WRITE + FLUSH + CLOSE in one frame) reliably panics Samba 4.9.5. The connection
-dies mid-transfer; the client sees `Disconnected` or `Broken pipe`.
+The compound write used to send CREATE + WRITE + FLUSH + CLOSE in one frame. On Samba 4.4 through 4.15 (and early
+4.16.x / 4.17.x) that panics the server's connection process within a file or two. The connection dies mid-transfer; the
+client sees `Disconnected`, `Connection reset by peer`, or `Broken pipe` on whatever it sends next.
 
 ## What the server says
 
 ```
-[.., 0] ../source3/lib/popt_common.c:67(popt_s3_talloc_log_fn)
-  talloc: access after free error - first free may be at ../tevent_req.c:289
-  Bad talloc magic value - access after free
-[.., 0] ../source3/lib/util.c:816(smb_panic_s3)
-  PANIC (pid 9435): Bad talloc magic value - access after free
-  dumping core in /var/log/samba/cores/smbd
+talloc: access after free error - first free may be at ../tevent_req.c:289
+Bad talloc magic value - access after free
+PANIC (pid 9435): Bad talloc magic value - access after free
+dumping core in /var/log/samba/cores/smbd
 ```
 
-A use-after-free on a `tevent_req`, with a core dump each time.
+Samba 4.15.13 prints the same, with `tevent_req.c:291`.
 
-## Reproducing it (2026-08-01)
+## Why
 
-Raspberry Pi 4 (192.168.1.156), Debian buster, `samba 2:4.9.5+dfsg-5+deb10u1+rpi1` (armhf), guest share. Driven by
-`examples/write_storm`:
+- MS-SMB2 § 3.3.5.2.7 lets a server fail a compounded operation that needs asynchronous processing unless it's last in
+  the chain (product behavior note 266 says Windows does, with `STATUS_INTERNAL_ERROR`).
+- Since Samba 4.4 (commit `c737fae5f79f`, 2015), an SMB2 FLUSH is an fsync in Samba's thread pool, so it's always
+  async. In `smbd_smb2_request_pending_queue` (`source3/smbd/smb2_server.c`), an async op that isn't a CREATE and isn't
+  last in its compound gets `tevent_req_cancel`, and when that fails, `TALLOC_FREE(req->subreq)` and
+  `NT_STATUS_INTERNAL_ERROR`. The fsync job is still running in the thread pool, and when it finishes, it touches the
+  request just freed: the panic above.
+- Samba bug 15172 (commit `26adf3344337`, 2022-11, in 4.18 and backported to 4.16.x and 4.17.x) runs a mid-chain FLUSH
+  synchronously, which is why Samba 4.20 and 4.22 take the old chain without complaint. The cancel-and-free path itself
+  is still there.
+- A FLUSH last in its chain is allowed to go async, and it does (interim `STATUS_PENDING`, then the answer). That shape
+  ran clean on 4.10.18 and 4.15.13: 100 writes one at a time and 400 at eight in flight, no panic.
 
-- **8/8 runs crashed it.** Fastest kill: 126 ms into a run.
-- **The server's config doesn't matter.** The first eight runs were against `smb2 max write = 1048576` (set to mimic
-  the QNAP); re-confirmed afterwards against the Pi's stock `smb2 max write = 8388608`, same panic, same core.
-- **Concurrency is not the trigger.** `WS_CONC=1` crashes after 2 files.
-- **Size is not the trigger.** A 4 KB body crashes it (`WS_SMALL=4096`), as does 520 KB.
-- **One compound write is not enough.** It takes ~2, which is why the single-write
-  `compound_read_and_write_on_raspberry_pi` integration test passes against the same box.
-- **Streamed writes are innocent.** `WS_LARGE_EVERY=1 WS_CONC=8` (pure `FileWriter`, 1 MB wire writes, no compound)
-  ran 8/8 files clean, repeatedly. Only the compound path kills it.
+## Reproducing it
 
-## Who is affected
+- **Samba 4.9.5** (Raspberry Pi 4, Debian buster, 2026-08-01, `examples/write_storm`): 8/8 runs crashed it, the fastest
+  126 ms in. Concurrency and size were not the trigger (`WS_CONC=1` and a 4 KB body crashed it); streamed writes, which
+  send their FLUSH on its own, never did.
+- **Samba 4.15.13** (Alpine 3.15 in Docker, 2026-10-19): the old chain lost the connection on the second file in both runs.
+  run. The `smb-samba415` fixture keeps this server in the Docker suite, and `samba415_small_writes_keep_the_connection`
+  is the regression test.
+- **In the field** (a Cmdr user copying photos to a NAS, SMB 3.1.1, 2026-10-19): every one of seven connection resets
+  came 10–110 ms after the client logged the server refusing the FLUSH, and no reset came without one.
+- **Immune**: Samba 4.20.6 (the Docker fixtures), 4.22.10 (the Pi since 2026-08-08), and the QNAP TS-464 on current QTS.
 
-- **Samba 4.20.6** (the crate's Docker fixtures): immune. 96 files / 16 concurrent / with a watcher, clean.
-- **Samba 4.22.10** (Debian 13 trixie, armhf): immune. Re-checked on the same Raspberry Pi that used to die, after it
-  was rebuilt on trixie (2026-08-08): `WS_CONC=1 WS_SMALL=4096`, the shape that killed 4.9.5 after two files, plus 96
-  files at 8 concurrent with a watcher. 0 failures, 0 core dumps, no `talloc` line in any log, `smbd` still active.
-- **QNAP TS-464, QTS, SMB 3.1.1**: immune. 768 files × 6 rounds, clean.
-- **Samba 4.9.5**: dies.
+## If it comes back
 
-4.9.5 shipped in 2019 and is long out of support, so this is almost certainly a Samba bug fixed upstream rather than a
-malformed frame from us — newer Samba and the NAS both accept the identical frame. It has not been bisected against
-Samba's history, and no upstream bug id has been matched to it.
-
-## Why it is written down
-
-The blast radius is wider than it looks. `write_file_compound` is the fast path for **every** file that fits one
-`max_write_size`, so on an affected server a routine small-file copy kills the server-side connection — the common case,
-not an edge case. Anyone running an older Samba build (a Debian buster NAS, an old OpenMediaVault, vendor firmware built
-on 4.9-era Samba) hits it immediately.
-
-If a consumer reports "the connection dies on small-file copies but large ones are fine", check the server's Samba
-version before looking anywhere in this crate. A workaround exists without code changes: sending those writes through
-`create_file_writer` instead of the compound path avoids it entirely, at the cost of three extra round trips per file.
+A consumer reporting "the connection dies on small-file copies but large ones are fine" against an older NAS is this
+shape. Check that no compound puts an op that can go async (FLUSH first of all) anywhere but last, then check the
+server's Samba version.

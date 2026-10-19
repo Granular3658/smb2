@@ -330,7 +330,7 @@ discover a new pitfall that involves 2+ modules, add it to this list.
 
 32. **A runtime call outside `rt/` compiles everywhere and works only on tokio** ✅ -- `tokio::spawn`, `tokio::time::sleep` / `timeout`, `tokio::net`, and `tokio::io` all build fine in a default build and panic on a smol consumer with "there is no reactor running" (issue #1, which the README's "runtime-agnostic" claim had invited). ❌ So nothing outside `src/rt/` calls them; `tokio::sync` is the exception and stays everywhere, because it works on any executor. The guard is the smol-only build in `just clippy` and CI, which leaves tokio's `time`, `net`, `io-util`, and `rt` features off so a stray call fails to compile. Two semantics the rest of the crate leans on and `rt` preserves on smol: ❌ a dropped `TaskHandle` detaches and only `abort()` stops the task (smol's own `Task` cancels on drop, which would silently stop a connection's writer or receiver), and a dropped TCP write half shuts the write side down (pitfall 28's socket lifetime assumes it). Spans `rt/` + `client/connection.rs` + `transport/tcp.rs` + `auth/kerberos/kdc.rs`; see `src/rt/CLAUDE.md`.
 
-33. **Windows fails an async op anywhere but last in a compound** ✅ -- Windows (Vista / Server 2008 and later) answers a compounded operation that needs asynchronous processing with `STATUS_INTERNAL_ERROR` unless it's the last one in the chain (MS-SMB2 § 3.3.5.2.7, product behavior note 266). A FLUSH always goes async there, so `write_file`'s CREATE + WRITE + FLUSH + CLOSE never flushed anything on Windows, silently, since a failed FLUSH is tolerated. The connection learns it from the first refusal (`flush_must_end_compound`, erased on revival), re-flushes that file with the FLUSH last, and from then on ends the write chain on the FLUSH and closes separately. Samba and the QNAP take the four-op chain. Spans `client/connection.rs` + `client/tree.rs`; see `client/CLAUDE.md` § Compound requests.
+33. **An op that can go async ends its compound, and a FLUSH always can** ✅ -- MS-SMB2 § 3.3.5.2.7 lets a server fail a compounded operation that needs asynchronous processing, and both families do unless it's last in the chain: Windows (Vista / Server 2008 and later) answers `STATUS_INTERNAL_ERROR` (product behavior note 266), and so does Samba from 4.4 (when SMB2 FLUSH started fsyncing in a thread pool) through 4.15 and early 4.16.x / 4.17.x (Samba bug 15172, fixed by running a mid-chain FLUSH synchronously). On those Samba builds the refusal is fatal: it frees the FLUSH request while its fsync is still running, smbd panics when the fsync finishes (`Bad talloc magic value - access after free`), and the client sees a TCP reset 10–100 ms later. That is what killed small-file copies to an older-firmware NAS (a Cmdr user, 2026-10-19) and the Pi's Samba 4.9.5 (`docs/notes/samba-4.9-compound-write-crash.md`), and no client-side reaction can save the connection once the refusal is sent. So `write_file_compound` sends CREATE + WRITE + FLUSH with the FLUSH last, then a standalone CLOSE (two round trips), on every server, with nothing to learn per connection. ❌ Never put a FLUSH, or anything else that can go async, anywhere but last in a new compound; a compounded WRITE, READ, or CLOSE didn't go async on Windows Server 2022 (2026-09-23), and Samba forces a compounded READ or WRITE synchronous. The `smb-samba415` Docker fixture pins it against a real Samba 4.15.13. Spans `client/tree.rs` + `client/connection.rs` (`compound_write_limit`); see `client/CLAUDE.md` § Compound requests.
 
 34. **A transfer's rate is the link's only when the pipe was full, and only when timed at the wire** ✅ -- The rate a download or upload leaves on the connection feeds `quick_read_limit` / `quick_write_limit`, so reading it low streams files one frame would move twice as fast, and reading it high compounds files the link can't move quickly (the head-of-line blocking pitfall 27 is about). Two traps, both measured in the `read_ahead.rs` simulator: a gap between answers measures the link only if the later request was already queued at the server (sent at least one RTT before the earlier answer arrived), or a 4 MiB download at +60 ms on ~1 GB/s shares ~24 MB/s; and an answer has to be timed when the receiver task read it, not when the consumer took it, or a consumer catching up after a stall shares 365 MB/s on a 50 MB/s link. The stamp travels crate-privately (`Routed.arrived_at` → `WaiterGuard::arrived_at`); ❌ never on the public `Frame`. An error in the RTT only lowers the estimate, by construction. Spans `client/connection.rs` + `client/read_ahead.rs` + `client/stream.rs` + `client/write_pipe.rs`; see `client/CLAUDE.md` § Streaming download entry points.
 
@@ -354,7 +354,7 @@ starts one container rather than 16.
 
 ### Docker test containers
 
-17 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
+18 Samba containers in `tests/docker/internal/`, exercising the full protocol stack:
 
 | Container             | Port  | What it tests                                 |
 |-----------------------|-------|-----------------------------------------------|
@@ -376,6 +376,7 @@ starts one container rather than 16.
 | smb-dfs-namespace     | 10460 | DFS *namespace root*: `msdfs proxy` makes TreeConnect refuse with `STATUS_BAD_NETWORK_NAME`, and only a V3 root referral over IPC$ says where the storage is. Plus a plain share, so a test can prove an ordinary connect still costs nothing |
 | smb-dfs-failover      | 10461 | Two root targets, the first unreachable: multi-target failover and the `TargetHint` that remembers which one worked |
 | smb-smallcredits      | 10462 | `smb2 max credits = 64`: the credit ceiling, fail-fast on unfundable charges, chunks sized to the window |
+| smb-samba415          | 10463 | Samba 4.15.13, whose smbd crashes on a FLUSH anywhere but last in a compound (pitfall 33): small-file writes keep the connection |
 
 ### Consumer test containers
 
@@ -405,8 +406,9 @@ Integration tests (`tests/integration.rs`) run against real hardware:
 
 - QNAP TS-464 NAS (SMB 3.1.1, NTLM auth, AES-GMAC signing)
 - Raspberry Pi 4 Model B (SMB 3.1.1, guest access), Samba 4.22.10 on Debian 13. It ran 4.9.5 until it was rebuilt on
-  2026-08-08, and 4.9.5 crashes on compound writes: a server bug, not ours, and one to remember if a dead connection
-  ever turns up against an old server. See `docs/notes/samba-4.9-compound-write-crash.md`.
+  2026-08-08, and 4.9.5 crashed on the compound write while it still put the FLUSH mid-chain: a Samba bug that every
+  release up to 4.15 shares, which the write now steers clear of (pitfall 33). See
+  `docs/notes/samba-4.9-compound-write-crash.md`.
 
 How much silence a real one of each tolerates before a watch is given up on, and the `SIGSTOP` recipe that
 measures it deterministically: `docs/notes/watcher-silence-tolerance.md`.

@@ -31,6 +31,7 @@ const DFS_TARGET_ADDR: &str = "127.0.0.1:10457";
 const DFS_NAMESPACE_ADDR: &str = "127.0.0.1:10460";
 const DFS_FAILOVER_ADDR: &str = "127.0.0.1:10461";
 const SMALLCREDITS_ADDR: &str = "127.0.0.1:10462";
+const SAMBA415_ADDR: &str = "127.0.0.1:10463";
 const TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -7186,4 +7187,45 @@ async fn smallcredits_chunked_transfers_fit_the_window() {
 
     let deleted = tree.delete_file(&mut conn, path).await;
     or_dump(deleted, &probe, "delete");
+}
+
+// ── An older Samba (smb-samba415) ─────────────────────────────────────
+
+/// Samba 4.15 refuses a FLUSH inside a compound, and its refusal panics the
+/// connection's smbd once the fsync it abandoned finishes (Samba bug 15172).
+/// A small-file write that compounded its FLUSH lost the connection on the
+/// first or second file, the shape a Cmdr user hit copying to a NAS
+/// (2026-10-19). Every write here has to land on one connection, and read
+/// back intact.
+#[tokio::test]
+#[ignore]
+async fn samba415_small_writes_keep_the_connection() {
+    let _ = env_logger::try_init();
+    let mut conn = Connection::connect(SAMBA415_ADDR, TIMEOUT)
+        .await
+        .expect("failed to connect to smb-samba415");
+    conn.negotiate().await.expect("negotiate failed");
+    let _session = Session::setup(&mut conn, "", "", "")
+        .await
+        .expect("guest session setup failed");
+    let tree = Tree::connect(&mut conn, "public")
+        .await
+        .expect("tree connect to 'public' failed");
+    let probe = conn.clone();
+
+    let dir = "_test_samba415_small_writes";
+    let _ = tree.create_directory(&mut conn, dir).await;
+    let files: Vec<(String, Vec<u8>)> = (0..20u8)
+        .map(|i| (format!("{dir}/file-{i:02}.bin"), vec![i; 6148]))
+        .collect();
+    for (path, data) in &files {
+        let written = tree.write_file(&mut conn, path, data).await;
+        assert_eq!(or_dump(written, &probe, path), data.len() as u64);
+    }
+    for (path, data) in &files {
+        let read = tree.read_file(&mut conn, path).await;
+        assert_eq!(&or_dump(read, &probe, path), data, "{path}");
+        or_dump(tree.delete_file(&mut conn, path).await, &probe, path);
+    }
+    or_dump(tree.delete_directory(&mut conn, dir).await, &probe, dir);
 }

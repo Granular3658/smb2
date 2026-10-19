@@ -1518,12 +1518,13 @@ impl SmbClient {
         .map(|(done, _)| done)
     }
 
-    /// Write a small file using a compound CREATE+WRITE+FLUSH+CLOSE request.
+    /// Write a small file: a compound CREATE+WRITE+FLUSH, then a standalone
+    /// CLOSE.
     ///
-    /// Sends all four operations in a single transport frame, reducing
-    /// round-trips from 4 to 1. Best for files that fit in MaxWriteSize
-    /// (typically 64 KB to 8 MB). For larger files, use
-    /// [`write_file_pipelined`](Self::write_file_pipelined).
+    /// Two round trips instead of four. Best for files that fit in
+    /// MaxWriteSize (typically 64 KB to 8 MB). For larger files, use
+    /// [`write_file_pipelined`](Self::write_file_pipelined). Why the CLOSE
+    /// can't ride along: [`Tree::write_file_compound`].
     pub async fn write_file_compound(
         &mut self,
         tree: &Tree,
@@ -1537,7 +1538,8 @@ impl SmbClient {
         .map(|(done, _)| done)
     }
 
-    /// Write a small NEW file in one compound CREATE+WRITE+FLUSH+CLOSE request.
+    /// Write a small NEW file: a compound CREATE+WRITE+FLUSH, then a standalone
+    /// CLOSE.
     ///
     /// Like [`write_file_compound`](Self::write_file_compound), but the name
     /// must be free: if it exists, the write is refused with
@@ -1870,8 +1872,8 @@ impl SmbClient {
     /// request and reports progress.
     ///
     /// For small files (data fits in one MaxWriteSize), the data is written
-    /// immediately via a compound CREATE+WRITE+FLUSH+CLOSE request in the
-    /// constructor. The returned `FileUpload` is already complete, and
+    /// immediately in the constructor, via a compound CREATE+WRITE+FLUSH and
+    /// a standalone CLOSE. The returned `FileUpload` is already complete, and
     /// `write_next_chunk` returns `false` immediately. This gives the caller
     /// a uniform API regardless of file size.
     ///
@@ -2827,8 +2829,8 @@ mod tests {
         /// answers every one of them.
         fn first_frame_ops(self) -> usize {
             match self {
-                // CREATE + WRITE + FLUSH + CLOSE.
-                LinkCall::UploadSmall => 4,
+                // CREATE + WRITE + FLUSH (the CLOSE follows on its own).
+                LinkCall::UploadSmall => 3,
                 // CREATE + QUERY_INFO (class 18) + QUERY_INFO (class 48).
                 LinkCall::OpenFileReader => 3,
                 // CREATE + QUERY_INFO (index, volume, class 48).

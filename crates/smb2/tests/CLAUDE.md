@@ -41,9 +41,8 @@ cargo test -p smb2 --test integration -- --ignored --nocapture
 - QNAP NAS at 192.168.1.111 (NTLM auth, SMB 3.1.1, AES-GMAC signing)
 - Raspberry Pi at 192.168.1.150, share `PiHDD`, user `david`, SMB 3.1.1 signed (verified 2026-08-08). It took guest
   sessions on Debian buster and takes a real account on Debian 13 trixie / Samba 4.22.10, so a test here needs a
-  password. `docs/notes/samba-4.9-compound-write-crash.md` records a compound-write panic that belonged to the old
-  Samba 4.9.5; 4.22.10 does not share it (re-checked on this box 2026-08-08), so the compound tests here run
-  unrestricted.
+  password. `docs/notes/samba-4.9-compound-write-crash.md` records the compound-write panic the old Samba 4.9.5 had
+  (a mid-chain FLUSH, AGENTS.md pitfall 33); 4.22.10 does not share it (re-checked on this box 2026-08-08).
 - `SMB2_TEST_NAS_PASSWORD` and `SMB2_TEST_PI_PASSWORD` env vars (from `.env` file or shell). See `.env.example`.
 - **Both hosts are named once**, in `NAS_ADDR` / `PI_ADDR` / `USER` at the top of `integration.rs`. ❌ Don't inline an
   address at a call site: the Pi's was written out four times, so when the box moved, four tests failed at connect and
@@ -117,6 +116,7 @@ Two traps when several sessions share the machine:
 | smb-manyshares | 10458 | 200 long-comment shares (~90 KiB reply): multi-fragment / overflow srvsvc reassembly |
 | smb-maxreadsize | 10454 | 64 KB max read/write: pipelined 512 KB, streamed write, streaming download chunk count |
 | smb-smallcredits | 10462 | `smb2 max credits = 64` with the default 8 MiB MaxRead/WriteSize: the connection learns the ceiling, an unfundable compound fails fast with `CreditStarvation` even while a watcher holds a long poll (Samba would cut the connection if it arrived), and every chunked transfer and `write_file` still moves 5 MiB |
+| smb-samba415 | 10463 | Samba 4.15.13 on Alpine 3.15, kept old on purpose: it refuses a FLUSH anywhere but last in a compound, and the refusal panics smbd (AGENTS.md pitfall 33). Twenty small `write_file`s on one connection, read back intact. ❌ Don't bump its base image |
 | smb-encryption-aes128 | 10455 | Mandatory encryption (AES-128-CCM, SMB 3.0.2): different cipher family |
 | smb-weirdnames | 10459 | Names with SMB2-illegal characters. `populate.sh` writes them with octal escapes, so the on-disk bytes are exactly what macOS smbfs produces; a listing that decodes them proves Finder parity, which is the strongest assertion CI can make without a Mac. ❌ Don't replace those escapes with the literal characters. |
 | smb-dfs-root | 10456 | DFS namespace root with msdfs link to smb-dfs-target, plus a seeded `Root-File.txt` in the root share itself (guest can't write there) for `resolve` on a DFS share |

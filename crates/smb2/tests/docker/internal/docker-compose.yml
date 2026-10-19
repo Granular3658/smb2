@@ -86,6 +86,12 @@ services:
     ports:
       - "${SMB_BIND_ADDR:-127.0.0.1}:10462:445"
 
+  smb-samba415:
+    build:
+      context: smb-samba415
+    ports:
+      - "${SMB_BIND_ADDR:-127.0.0.1}:10463:445"
+
   smb-weirdnames:
     build:
       context: smb-weirdnames

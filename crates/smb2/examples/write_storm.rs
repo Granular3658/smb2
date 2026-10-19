@@ -2,7 +2,7 @@
 //
 // Mimics cmdr's bulk-copy shape with no cmdr in the picture: a sliding window of
 // N concurrent per-file tasks against ONE SMB session, each file going through
-// either the compound CREATE+WRITE+FLUSH+CLOSE fast path (small) or the
+// either the compound CREATE+WRITE+FLUSH (+ CLOSE) fast path (small) or the
 // pipelined `FileWriter` (large). Optionally a second connection long-polling
 // CHANGE_NOTIFY, matching cmdr's watcher.
 //

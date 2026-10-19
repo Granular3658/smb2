@@ -1861,23 +1861,12 @@ struct Inner {
     /// at. Kept apart from the download rate because most links are
     /// asymmetric, a home uplink often ten times slower than its downlink.
     write_rate_hint: StdMutex<Option<(rt::Instant, f64)>>,
-    /// Whether this server refuses a FLUSH that isn't last in its compound.
-    ///
-    /// Windows (Vista / Server 2008 and later) fails any compounded operation
-    /// that needs asynchronous processing with `STATUS_INTERNAL_ERROR` unless
-    /// it is last in the chain (MS-SMB2 § 3.3.5.2.7, product behavior note
-    /// 266), and a FLUSH always does, so the one-frame CREATE + WRITE + FLUSH +
-    /// CLOSE write never persisted anything there. Samba and the QNAP flush it
-    /// fine. Learned from the first refusal rather than guessed from the
-    /// server, since nothing in NEGOTIATE says which it is; see
-    /// `Tree::write_file_compound`. Erased on a revival with the rest of what
-    /// the old server told us.
-    flush_must_end_compound: AtomicBool,
     /// Whether this server refused `FileIdBothDirectoryInformation` (class 37)
     /// in a QUERY_DIRECTORY, so a listing that opts into index numbers asks
     /// for the default class from the start instead of paying the refusal on
-    /// every directory. Learned like `flush_must_end_compound`, and erased on a
-    /// revival the same way.
+    /// every directory. Learned from the first refusal rather than guessed
+    /// from the server, and erased on a revival with the rest of what the old
+    /// server told us.
     listing_ids_refused: AtomicBool,
     /// How late READ answers came for the last download on this connection,
     /// and when: what the next download's learned headroom starts from.
@@ -2002,7 +1991,6 @@ impl Inner {
             estimated_rtt: StdMutex::new(None),
             read_rate_hint: StdMutex::new(None),
             write_rate_hint: StdMutex::new(None),
-            flush_must_end_compound: AtomicBool::new(false),
             listing_ids_refused: AtomicBool::new(false),
             read_lateness_hint: StdMutex::new(None),
             write_lateness_hint: StdMutex::new(None),
@@ -3199,8 +3187,8 @@ impl Connection {
 
     /// The largest file worth writing as one frame on this connection right
     /// now, in bytes: the size cut-off between one compound
-    /// CREATE + WRITE + FLUSH + CLOSE ([`Tree::write_file_compound`](crate::Tree::write_file_compound))
-    /// and a streamed [`FileWriter`](crate::FileWriter).
+    /// CREATE + WRITE + FLUSH ([`Tree::write_file_compound`](crate::Tree::write_file_compound),
+    /// its CLOSE standalone) and a streamed [`FileWriter`](crate::FileWriter).
     ///
     /// The upload twin of [`quick_read_limit`](Self::quick_read_limit), for
     /// the same reason: one frame costs a single round trip, but nothing else
@@ -3409,33 +3397,20 @@ impl Connection {
     ///
     /// The server's `MaxWriteSize`, which bounds one WRITE, lowered once the
     /// server has shown a [`credit_ceiling`](Self::credit_ceiling) to what
-    /// half the window funds next to the CREATE, FLUSH, and CLOSE riding
-    /// along. Half, because a chain charging the whole window can only be
-    /// funded once everything else on the connection has been answered, and a
-    /// directory watcher's long poll never is on cue. Can be 0 on a tiny
-    /// window, meaning stream everything. Before NEGOTIATE, assumes the
-    /// 64 KiB every dialect allows.
+    /// half the window funds next to the CREATE and FLUSH riding along. Half,
+    /// because a chain charging the whole window can only be funded once
+    /// everything else on the connection has been answered, and a directory
+    /// watcher's long poll never is on cue. Can be 0 on a tiny window, meaning
+    /// stream everything. Before NEGOTIATE, assumes the 64 KiB every dialect
+    /// allows.
     ///
-    /// A consumer that promises "one frame, all or nothing" for a compound
-    /// write should decide by this, up front: a bigger chain can wait out the
-    /// credit deadline or fail with [`Error::CreditStarvation`].
+    /// A consumer that promises "one frame carries all the data" for a
+    /// compound write should decide by this, up front: a bigger chain can
+    /// wait out the credit deadline or fail with [`Error::CreditStarvation`].
     #[must_use]
     pub fn compound_write_limit(&self) -> u64 {
         let max_write = self.params().map_or(65536, |p| p.max_write_size);
-        self.fundable_payload(u64::from(max_write), 3)
-    }
-
-    /// Whether this server has refused a FLUSH that wasn't last in its
-    /// compound, so a one-frame write has to end its chain on the FLUSH.
-    pub(crate) fn flush_must_end_compound(&self) -> bool {
-        self.inner.flush_must_end_compound.load(Ordering::Acquire)
-    }
-
-    /// Record that this server refuses a FLUSH that isn't last in its compound.
-    pub(crate) fn note_flush_must_end_compound(&self) {
-        self.inner
-            .flush_must_end_compound
-            .store(true, Ordering::Release);
+        self.fundable_payload(u64::from(max_write), 2)
     }
 
     /// Whether this server has refused a listing in
@@ -5438,9 +5413,6 @@ impl Connection {
         *inner.ipc_tree.lock().unwrap() = None;
         inner.oplock_trees.lock().unwrap().clear();
         inner.compression_enabled.store(false, Ordering::Release);
-        inner
-            .flush_must_end_compound
-            .store(false, Ordering::Release);
         inner.listing_ids_refused.store(false, Ordering::Release);
         // ❌ `send_queue_depth` is deliberately NOT reset: a caller parked
         // between its increment and its decrement would underflow the gauge
@@ -6487,9 +6459,9 @@ mod tests {
         conn.set_credit_ceiling(64);
 
         // Half of 64 is 32: the READ gets 30 next to CREATE and CLOSE, the
-        // WRITE 29 next to CREATE, FLUSH, and CLOSE, and a lone chunk all 32.
+        // WRITE 30 next to CREATE and FLUSH, and a lone chunk all 32.
         assert_eq!(conn.quick_read_limit(), 30 * 65536);
-        assert_eq!(conn.compound_write_limit(), 29 * 65536);
+        assert_eq!(conn.compound_write_limit(), 30 * 65536);
         assert_eq!(conn.fundable_chunk(8 * 1024 * 1024), 32 * 65536);
         assert_eq!(conn.credit_capacity_for(512 * 1024), 6);
 

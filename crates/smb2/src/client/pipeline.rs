@@ -528,14 +528,16 @@ mod tests {
             volatile: 2,
         };
 
-        // WRITE uses compound: CREATE+WRITE+FLUSH+CLOSE in one frame.
+        // WRITE uses the compound CREATE+WRITE+FLUSH, then a standalone CLOSE.
         let create_resp = build_create_response(file_id, 0);
         let write_resp = build_write_response(11);
         let flush_resp = build_flush_response();
-        let close_resp = build_close_response();
-        let frame =
-            build_compound_response_frame(&[create_resp, write_resp, flush_resp, close_resp]);
-        mock.queue_response(frame);
+        mock.queue_response(build_compound_response_frame(&[
+            create_resp,
+            write_resp,
+            flush_resp,
+        ]));
+        mock.queue_response(build_close_response());
 
         let mut conn = setup_connection(&mock);
         let tree = test_tree();

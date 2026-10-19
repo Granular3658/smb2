@@ -20,7 +20,7 @@ use crate::{arg, connect, fnv, median, share, spawn_load, tuning};
 enum Put {
     /// A `FileWriter` fed 1 MiB pushes.
     Stream,
-    /// One compound CREATE + WRITE + FLUSH + CLOSE (`write_file_compound`).
+    /// One compound CREATE + WRITE + FLUSH, then a CLOSE (`write_file_compound`).
     /// Skipped for a file above `compound_write_limit`.
     Compound,
     /// Compound when the file fits `Connection::quick_write_limit`, the
