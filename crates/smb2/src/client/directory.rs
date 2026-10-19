@@ -75,8 +75,9 @@ impl ListOptions {
 /// [`Tree::list_directory`] returns them, `.` and `..` included.
 ///
 /// The end of the listing closes the handle by itself. To stop before then,
-/// call [`close`](Self::close): Rust has no async drop, so a reader dropped
-/// part-way leaks its handle until the session ends, and logs a debug line.
+/// call [`close`](Self::close), or drop the reader: that closes the handle
+/// too, without the answer (see [`FileWriter`](crate::FileWriter)'s
+/// "Dropping it" section).
 ///
 /// [`next_batch`](Self::next_batch) is cancel-safe: drop it in a `select!` and
 /// the next call returns the batch the dropped one asked for, never the one
@@ -349,12 +350,16 @@ impl DirectoryReader {
 
 impl Drop for DirectoryReader {
     fn drop(&mut self) {
-        // A handle whose session ended went with it, so nothing leaks.
-        if !matches!(self.state, State::Done) && self.conn.pinned_session_is_current() {
-            debug!(
-                "directory: DirectoryReader dropped before the end of its listing without \
-                 close(), directory handle may leak until session teardown"
-            );
+        match self.state {
+            // A query still out was handed to the connection before the
+            // CLOSE is, so the server answers it first.
+            State::Ready { .. } | State::Querying { .. } => {
+                self.tree
+                    .close_dropped_handle(&self.conn, self.file_id, "DirectoryReader");
+            }
+            // A CLOSE already started is never sent twice, even if its
+            // future went away before it got out.
+            State::Closing { .. } | State::Done => {}
         }
     }
 }
@@ -634,6 +639,92 @@ mod tests {
             "the CLOSE already out is the one awaited"
         );
         mock.assert_fully_consumed();
+    }
+
+    /// A reader abandoned partway closes its handle as it drops, ahead of
+    /// anything sent after it, so the folder isn't held open for the rest of
+    /// the session.
+    #[tokio::test]
+    async fn a_reader_dropped_mid_listing_closes_its_handle() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(DIR, 0));
+        mock.queue_response(batch(&["a", "b"]));
+        mock.queue_response(build_close_response());
+        mock.queue_response(crate::client::test_helpers::build_flush_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+        let mut reader = tree
+            .open_directory_reader(conn.clone(), "somedir")
+            .await
+            .unwrap();
+        reader.next_batch().await.unwrap().unwrap();
+        drop(reader);
+        tree.flush_handle(&mut conn, FileId::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::QueryDirectory,
+                Command::Close,
+                Command::Flush
+            ]
+        );
+    }
+
+    /// Dropped with a query out, the CLOSE follows it; dropped with its CLOSE
+    /// started, nothing more goes out.
+    #[tokio::test]
+    async fn a_dropped_reader_closes_after_its_query_and_never_twice() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_create_response(DIR, 0));
+        let conn = setup_connection(&mock);
+        let reader = {
+            let mut reader = test_tree()
+                .open_directory_reader(conn.clone(), "somedir")
+                .await
+                .unwrap();
+            let dropped =
+                tokio::time::timeout(Duration::from_millis(50), reader.next_batch()).await;
+            assert!(dropped.is_err(), "nothing was answered yet");
+            reader
+        };
+        mock.queue_response(batch(&["a"]));
+        mock.queue_response(build_close_response());
+        drop(reader);
+        wait_until(|| mock.sent_count() == 3).await;
+        assert_eq!(
+            sent_commands(&mock),
+            [Command::Create, Command::QueryDirectory, Command::Close]
+        );
+
+        // Its CLOSE started and then dropped mid-flight: no second one.
+        mock.clear_sent();
+        mock.queue_response(build_create_response(DIR, 0));
+        mock.queue_response(no_more_files());
+        let mut reader = test_tree()
+            .open_directory_reader(conn.clone(), "somedir")
+            .await
+            .unwrap();
+        let dropped = tokio::time::timeout(Duration::from_millis(50), reader.next_batch()).await;
+        assert!(dropped.is_err(), "the CLOSE wasn't answered yet");
+        drop(reader);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            sent_commands(&mock),
+            [Command::Create, Command::QueryDirectory, Command::Close]
+        );
+    }
+
+    async fn wait_until(mut f: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "never happened in 5s");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// The QUERY_DIRECTORY requests the mock saw, decoded.

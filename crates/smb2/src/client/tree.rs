@@ -33,6 +33,7 @@ use crate::msg::tree_connect::{TreeConnectRequest, TreeConnectRequestFlags, Tree
 use crate::msg::tree_disconnect::TreeDisconnectRequest;
 use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{FileTime, ReadCursor, Unpack};
+use crate::rt;
 use crate::types::flags::{FileAccessMask, FileAttributes};
 use crate::types::status::NtStatus;
 #[cfg(test)]
@@ -3296,6 +3297,90 @@ impl Tree {
         let req = CloseRequest { flags: 0, file_id };
         conn.dispatch(Command::Close, &req, Some(self.tree_id))
             .await
+    }
+
+    /// Close `file_id` for a handle type whose owner dropped it still open
+    /// (a `FileWriter` dropped without `finish` or `abort`, say). Called from
+    /// `Drop`, so it never blocks and never panics.
+    ///
+    /// The CLOSE is queued before this returns, so it reaches the server
+    /// after every request the handle already sent and before anything the
+    /// owner sends next: delete the file right after dropping its writer and
+    /// the server has closed it first. Only when that can't happen without
+    /// waiting (no credit on hand, or the writer's queue full) is the CLOSE
+    /// sent from a background task instead, which gives no such order; and
+    /// if there's no async runtime to run that task on, the handle stays open
+    /// until the session ends, as it would have before this existed.
+    ///
+    /// ❌ Callers must not call this for a handle whose CLOSE was already
+    /// started, even one whose future was dropped before it could have gone
+    /// out: the server may have handed the same file id to a new open since,
+    /// and a second CLOSE would close that one. A handle from a session that
+    /// has ended sends nothing; the server let go of it with the session.
+    pub(crate) fn close_dropped_handle(
+        &self,
+        conn: &Connection,
+        file_id: FileId,
+        owner: &'static str,
+    ) {
+        let conn = self.pinned_conn(conn);
+        if !conn.pinned_session_is_current() {
+            return;
+        }
+        // See `close_handle`.
+        conn.forget_oplock(file_id);
+        let req = CloseRequest { flags: 0, file_id };
+        let tree_id = self.tree_id;
+        match conn.dispatch_without_waiting(Command::Close, &req, Some(tree_id)) {
+            Ok(Some(queued)) => {
+                trace!("{owner} dropped while open; its CLOSE is queued");
+                // Only to hear the answer. With no runtime to wait on, the
+                // CLOSE goes out all the same and its answer is discarded.
+                if let Some(task) = rt::try_spawn(async move {
+                    match queued
+                        .response()
+                        .await
+                        .and_then(|frame| close_outcome(&frame))
+                    {
+                        Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
+                        Err(e) => debug!("{owner} dropped while open; its CLOSE failed: {e}"),
+                    }
+                }) {
+                    task.detach();
+                }
+            }
+            Ok(None) => {
+                let task = rt::try_spawn(async move {
+                    let result = match conn.dispatch(Command::Close, &req, Some(tree_id)).await {
+                        Ok(mut guard) => conn
+                            .await_response_in_place(&mut guard, Command::Close)
+                            .await
+                            .and_then(|frame| close_outcome(&frame)),
+                        Err(e) => Err(e),
+                    };
+                    match result {
+                        Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
+                        Err(e) => debug!(
+                            "{owner} dropped while open; its CLOSE failed, so the handle stays \
+                             open on the server until the session ends: {e}"
+                        ),
+                    }
+                });
+                match task {
+                    Some(task) => task.detach(),
+                    None => debug!(
+                        "{owner} dropped while open, outside an async runtime and with no credit \
+                         on hand to queue a CLOSE; the handle stays open on the server until the \
+                         session ends"
+                    ),
+                }
+            }
+            Err(Error::HandleInvalidated { .. }) => {}
+            Err(e) => debug!(
+                "{owner} dropped while open; no CLOSE could be sent, so the handle stays open on \
+                 the server until the session ends: {e}"
+            ),
+        }
     }
 }
 
@@ -7890,8 +7975,7 @@ mod tests {
     }
 
     /// Dropping a `FileDownload` mid-stream (before draining all chunks)
-    /// must not panic. The `Drop` impl logs a warning; the handle may leak
-    /// on the server, but the client stays healthy.
+    /// must not panic, and the client stays healthy.
     #[tokio::test]
     async fn tree_download_drop_mid_stream_does_not_panic() {
         let mock = Arc::new(MockTransport::new());

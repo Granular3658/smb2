@@ -5,6 +5,22 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- **A request whose own send broke the connection reports a lost connection.** When the socket failed while a request was being written (the server reset the connection, say, so the write got `EPIPE` or `ECONNRESET`), that request came back as `Error::Io`, which classifies as `ErrorKind::Io` ("the connection may still be fine") and isn't retryable, while every other request in flight on the connection got `Error::Disconnected`. A consumer then failed the one file it was writing even though it recovered everything else. That request now gets the new `Error::SendFailed { command, source }`: `ErrorKind::ConnectionLost`, retryable, with the OS error kept as its `source` (and in its message) for the log. The connection already reports `is_disconnected()` by the time the caller hears. `Error` is `#[non_exhaustive]`, so every `match` compiles unchanged, but code that matched `Error::Io` to spot a dead connection should branch on `kind()` instead. `Error::Io` from an established connection now only means a local failure, like a streamed upload's own callback.
+- **A file handle you drop is closed.** `FileWriter`, `FileReader`, `FileUpload`, `FileDownload`, `DirectoryReader`, and `Watcher` used to leave the handle open on the server when dropped without `finish`, `abort`, or `close` (a debug line said it "may leak"), so the file stayed locked until the session ended. A copy that stopped on its first failure and dropped its writers then couldn't delete their partial files: `STATUS_SHARING_VIOLATION` until it reconnected. Now the drop sends a CLOSE, without a flush for a writer, and queues it before it returns: it reaches the server after the requests that handle already sent and before anything you send next, so deleting the file right after dropping its writer works. With no credit on hand it goes out a moment later instead; that, and a drop outside any async runtime in the same case, are the only times the handle stays open. A handle is never closed twice: once `finish`, `abort`, or `close` has started a CLOSE, dropping it sends nothing more. If you relied on a dropped handle staying open (to keep a file locked, say), keep the handle alive instead.
+
+### Fixed
+
+- **A `FileWriter` whose `finish` failed at the FLUSH, or a `FileUpload` whose last FLUSH failed, closes its handle when dropped.** It used to stay open for the rest of the session.
+- **`send_queue_depth()` no longer creeps up when callers are cancelled.** A request dropped while it waited for the socket kept counting as queued forever, so the gauge could read non-zero on an idle connection.
+
+### Notes
+
+- An `async fn` that holds a handle only for the call (`write_file_compound`, the pipelined reads and writes, `copy`) still leaves the handle open if its future is dropped between the CREATE and the CLOSE. Until the CREATE's answer arrives, the client doesn't know which handle to close, so fixing it needs the connection itself to close the handle of an answer nobody is waiting for: [#24](https://github.com/vdavid/smb2/issues/24).
+
 ## [0.31.1] - 2026-10-19
 
 ### Fixed

@@ -79,9 +79,8 @@ impl Progress {
 ///
 /// `next_chunk` is cancel-safe: dropping its future (a `select!` arm losing)
 /// loses no data, and the next call picks up where it left off. The CLOSE goes
-/// out as the last chunk arrives, so a download dropped after its last chunk
-/// has closed its handle; one dropped before that leaves the handle open until
-/// the session ends (there is no async drop).
+/// out as the last chunk arrives; a download dropped before that closes its
+/// handle as it drops (see [`FileWriter`]'s "Dropping it" section).
 ///
 /// # Example
 ///
@@ -135,6 +134,10 @@ pub struct FileDownload<'a> {
     /// CLOSE), so a caller that drops `next_chunk` there gets it on the next
     /// call rather than losing it.
     ready: Option<Vec<u8>>,
+    /// Whether the CLOSE was started. Set before it's sent, so the handle
+    /// never gets a second one (see `Tree::close_dropped_handle`); until
+    /// then, dropping the download closes the handle.
+    close_started: bool,
     /// The CLOSE, once it's on the wire and until its answer is collected.
     /// Sent as the last chunk lands, so handing that chunk out never waits a
     /// round trip for it; the `None` call after the last chunk collects it.
@@ -234,6 +237,7 @@ impl<'a> FileDownload<'a> {
             in_flight_bytes: 0,
             peak_in_flight_bytes: 0,
             ready: None,
+            close_started: false,
             closing: None,
             close_failed: None,
         }
@@ -537,8 +541,9 @@ impl<'a> FileDownload<'a> {
         self.next_offset = self.file_size;
     }
 
-    /// Stop on an error: no more chunks, and no CLOSE (the connection may be
-    /// the thing that failed).
+    /// Stop on an error: no more chunks, and no CLOSE here (the connection
+    /// may be the thing that failed). Dropping the download sends one, if
+    /// the connection still can.
     fn fail(&mut self, e: Error) -> Error {
         self.abandon_in_flight();
         self.done = true;
@@ -593,14 +598,15 @@ impl<'a> FileDownload<'a> {
     }
 
     /// Put the CLOSE on the wire, without waiting for its answer. Only ever
-    /// sends one: `done` is set first, so a caller dropped mid-send doesn't
-    /// send a second (the handle then stays open, as with any dropped
-    /// download).
+    /// sends one: `close_started` is set first, so neither a second call nor
+    /// the drop of a download whose call was dropped mid-send sends another
+    /// (the handle then stays open until the session ends).
     async fn start_close(&mut self) -> Result<()> {
-        if self.done {
+        if self.done || self.close_started {
             return Ok(());
         }
         self.done = true;
+        self.close_started = true;
         // Any READs still out were sent before the CLOSE, so the server
         // answers them first; their responses are discarded once the guards
         // drop here.
@@ -662,15 +668,14 @@ async fn send_read(
 
 impl Drop for FileDownload<'_> {
     fn drop(&mut self) {
-        // A handle whose session ended went with it, so nothing leaks.
-        if !self.done && self.conn.pinned_session_is_current() {
-            debug!(
-                "stream: FileDownload dropped before completion, file handle may leak \
-                 (bytes_received={}/{})",
-                self.bytes_received, self.file_size
+        if !self.close_started {
+            trace!(
+                "stream: FileDownload dropped at {}/{} bytes, closing its handle",
+                self.bytes_received,
+                self.file_size
             );
-            // We can't close the handle in Drop because it's async.
-            // The caller should consume the download fully or call close().
+            self.tree
+                .close_dropped_handle(&self.conn, self.file_id, "FileDownload");
         }
     }
 }
@@ -692,10 +697,9 @@ impl Drop for FileDownload<'_> {
 /// the single SMB session (the receiver task multiplexes responses by
 /// `MessageId`).
 ///
-/// Call [`close`](FileReader::close) when done to release the server handle.
-/// Like the other stream handles, `Drop` cannot CLOSE (Rust has no async drop),
-/// so a reader dropped without `close()` leaks the handle until session teardown
-/// and logs a debug warning.
+/// Call [`close`](FileReader::close) when done to release the server handle
+/// and hear how that went. A reader dropped without it closes the handle as it
+/// drops, without the answer (see [`FileWriter`]'s "Dropping it" section).
 ///
 /// # Example
 ///
@@ -883,9 +887,9 @@ impl FileReader {
 
     /// Close the file handle, releasing it on the server.
     ///
-    /// Consumes `self` so read-after-close is a compile error. Call this on
-    /// every reader; a dropped-without-close reader leaks the handle (see the
-    /// type-level note).
+    /// Consumes `self` so read-after-close is a compile error. Dropping the
+    /// reader closes the handle too; this one waits for the server's answer
+    /// and returns it.
     ///
     /// A reader whose session has ended (a reconnect) sends nothing and
     /// returns `Ok`: the server let go of the handle with the session.
@@ -900,12 +904,9 @@ impl FileReader {
 
 impl Drop for FileReader {
     fn drop(&mut self) {
-        // A handle whose session ended went with it, so nothing leaks.
-        if !self.closed && self.conn.pinned_session_is_current() {
-            debug!(
-                "stream: FileReader dropped without close(), file handle may leak \
-                 until session teardown"
-            );
+        if !self.closed {
+            self.tree
+                .close_dropped_handle(&self.conn, self.file_id, "FileReader");
         }
     }
 }
@@ -925,11 +926,10 @@ impl Drop for FileReader {
 ///
 /// # Cancellation
 ///
-/// To cancel an upload, stop calling `write_next_chunk`. The file handle
-/// will be closed (without flush) when the `FileUpload` is dropped, though
-/// this cannot be guaranteed in async contexts since `Drop` is synchronous.
-/// For clean cancellation, call `write_next_chunk` in a loop that checks
-/// your own cancellation condition.
+/// To cancel an upload, stop calling `write_next_chunk` and drop the
+/// `FileUpload`: that closes the file handle without a flush (see
+/// [`FileWriter`]'s "Dropping it" section). The server keeps what it wrote
+/// so far, so delete the partial file if you don't want it.
 ///
 /// # Example
 ///
@@ -1087,32 +1087,30 @@ impl<'a> FileUpload<'a> {
         e
     }
 
-    /// Flush and close the file handle. Only runs once.
+    /// Flush and close the file handle. Closes only once: `done` is set
+    /// before the CLOSE, so a dropped upload never sends a second. A failed
+    /// FLUSH leaves the handle open, and dropping the upload closes it.
     async fn flush_and_close(&mut self) -> Result<()> {
         if self.done {
             return Ok(());
         }
-        self.done = true;
-
         // Flush to ensure data is persisted.
         self.tree.flush_handle(&mut self.conn, self.file_id).await?;
-        // Close the handle.
+        self.done = true;
         self.tree.close_handle(&mut self.conn, self.file_id).await
     }
 }
 
 impl Drop for FileUpload<'_> {
     fn drop(&mut self) {
-        // A handle whose session ended went with it, so nothing leaks.
-        if !self.done && self.conn.pinned_session_is_current() {
-            debug!(
-                "stream: FileUpload dropped before completion, file handle may leak \
-                 (bytes_written={}/{})",
+        if !self.done {
+            trace!(
+                "stream: FileUpload dropped at {}/{} bytes, closing its handle unflushed",
                 self.bytes_written(),
                 self.total_bytes
             );
-            // We can't close the handle in Drop because it's async.
-            // The caller should drive the upload to completion.
+            self.tree
+                .close_dropped_handle(&self.conn, self.file_id, "FileUpload");
         }
     }
 }
@@ -1131,6 +1129,24 @@ impl Drop for FileUpload<'_> {
 /// Call [`finish`](FileWriter::finish) when done to flush, close the handle,
 /// and get the total confirmed byte count, or [`abort`](FileWriter::abort) to
 /// give up on the file.
+///
+/// # Dropping it
+///
+/// A writer dropped without `finish` or `abort` (or whose `finish` failed
+/// before its CLOSE) closes its handle as it drops, without a flush, the way
+/// `abort` does. The CLOSE is queued before the drop returns, behind the
+/// WRITEs the writer already sent and ahead of anything sent on the
+/// connection after, so deleting the partial file right after dropping its
+/// writer finds it closed. Two exceptions: with no credit on hand the CLOSE
+/// goes out a moment later with no such order, and outside any async runtime
+/// in that same case it can't be sent, and the handle stays open until the
+/// session ends. A handle whose session already ended sends nothing.
+///
+/// The same holds for every type that owns an open handle:
+/// [`FileReader`], [`FileUpload`], [`FileDownload`],
+/// [`DirectoryReader`](crate::DirectoryReader), and [`Watcher`](crate::Watcher).
+/// A handle's CLOSE is only ever sent once: once `finish`, `abort`, or
+/// `close` has started one, dropping the handle sends nothing more.
 ///
 /// Owns its `Connection` and `Arc<Tree>` (both cheap `Arc::clone`s), so the
 /// writer is `'static` and N concurrent writers pipeline over one SMB session
@@ -1563,9 +1579,9 @@ impl FileWriter {
     /// to prevent write-after-close at compile time.
     pub async fn finish(mut self) -> Result<u64> {
         self.flush_all(true).await?;
-        self.tree.close_handle(&mut self.conn, self.file_id).await?;
-
+        // Before the CLOSE, so the drop at the end never sends a second one.
         self.done = true;
+        self.tree.close_handle(&mut self.conn, self.file_id).await?;
         Ok(self.pipe.confirmed())
     }
 
@@ -1647,7 +1663,9 @@ impl FileWriter {
 
         // 4. Best-effort CLOSE. If it fails, log and move on. A writer whose
         //    session ended has nothing to close: the server let go of the
-        //    handle with the session.
+        //    handle with the session. `done` first, so the drop at the end
+        //    never sends a second CLOSE.
+        self.done = true;
         match self.tree.close_handle(&mut self.conn, self.file_id).await {
             Ok(()) | Err(Error::HandleInvalidated { .. }) => {}
             Err(e) => debug!(
@@ -1656,9 +1674,6 @@ impl FileWriter {
                 e
             ),
         }
-
-        // 5. Silence the Drop warning — we finalized cleanly.
-        self.done = true;
         Ok(self.pipe.confirmed())
     }
 
@@ -1810,8 +1825,8 @@ impl FileWriter {
             } | Error::InvalidData { .. }
                 | Error::SignatureInvalid { .. }
         ) {
-            let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
             self.done = true;
+            let _ = self.tree.close_handle(&mut self.conn, self.file_id).await;
         }
         e
     }
@@ -1819,13 +1834,14 @@ impl FileWriter {
 
 impl Drop for FileWriter {
     fn drop(&mut self) {
-        // A handle whose session ended went with it, so nothing leaks.
-        if !self.done && self.conn.pinned_session_is_current() {
-            debug!(
-                "stream: FileWriter dropped without finish(), file handle may leak \
-                 (bytes_written={})",
+        if !self.done {
+            trace!(
+                "stream: FileWriter dropped after {} confirmed bytes, closing its handle \
+                 unflushed",
                 self.pipe.confirmed()
             );
+            self.tree
+                .close_dropped_handle(&self.conn, self.file_id, "FileWriter");
         }
     }
 }
@@ -2422,12 +2438,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_writer_abort_sets_done_so_drop_is_silent() {
-        // After abort() returns, the `done` flag is set, so the Drop impl
-        // does not log a "dropped without finish()" warning. We can't
-        // inspect `done` once the writer has been consumed, but we can
-        // confirm abort returns Ok (which only happens on the done=true
-        // path) and that the test ends cleanly under log capture.
+    async fn file_writer_abort_sets_done_so_drop_sends_no_second_close() {
+        // abort() marks the writer done before its CLOSE, so the drop at the
+        // end of abort's frame sends nothing more.
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
@@ -2437,12 +2450,13 @@ mod tests {
         let conn = setup_connection(&mock);
         let tree = test_tree();
 
-        let writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
-        let result = writer.abort().await;
-        assert!(result.is_ok());
-        // The writer has been consumed. `Drop` ran inside abort's frame
-        // with done=true, so no warning fired. (Behavior-only check;
-        // exposing `done` for inspection was not needed.)
+        let writer = tree
+            .create_file_writer(conn.clone(), "out.bin")
+            .await
+            .unwrap();
+        assert!(writer.abort().await.is_ok());
+        tokio::task::yield_now().await;
+        assert_eq!(sent_commands(&mock), [Command::Create, Command::Close]);
     }
 
     // ── FileReader tests ───────────────────────────────────────────────
@@ -2595,27 +2609,271 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_reader_dropped_without_close_sends_no_close() {
-        // Documents the leak contract: dropping without close() issues NO CLOSE
-        // (the handle lingers server-side until session teardown). Drop logs a
-        // debug warning; we assert the wire behavior it implies.
+    async fn file_reader_dropped_without_close_closes_its_handle() {
         let mock = Arc::new(MockTransport::new());
         let file_id = test_file_id();
 
         mock.queue_response(reader_opened(file_id, 100));
         mock.queue_response(build_read_response(vec![0x11; 4]));
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_flush_response());
 
-        let conn = setup_connection(&mock);
+        let mut conn = setup_connection(&mock);
         let tree = test_tree();
 
         {
-            let reader = tree.open_file_reader(conn, "leak.bin").await.unwrap();
+            let reader = tree
+                .open_file_reader(conn.clone(), "leak.bin")
+                .await
+                .unwrap();
             assert_eq!(reader.read_at(0, 4).await.unwrap(), vec![0x11; 4]);
             // Dropped here without close().
         }
+        tree.flush_handle(&mut conn, OTHER_FILE).await.unwrap();
 
-        // CREATE + 1 READ, and crucially NO CLOSE.
-        assert_eq!(mock.sent_count(), 2);
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::Read,
+                Command::Close,
+                Command::Flush
+            ]
+        );
+        assert_eq!(closed_file_id(&mock, 2), file_id);
+    }
+
+    // ── Close on drop ──────────────────────────────────────────────────
+
+    /// A handle no test opened, for the request sent after a drop.
+    const OTHER_FILE: FileId = FileId {
+        persistent: 0x77,
+        volatile: 0x88,
+    };
+
+    /// The `FileId` the CLOSE sent as frame `n` names.
+    fn closed_file_id(mock: &MockTransport, n: usize) -> FileId {
+        use crate::msg::header::Header;
+        let bytes = mock.sent_message(n).unwrap();
+        let body = &bytes[Header::SIZE..];
+        // StructureSize (2), Flags (2), Reserved (4), then the FileId.
+        FileId {
+            persistent: u64::from_le_bytes(body[8..16].try_into().unwrap()),
+            volatile: u64::from_le_bytes(body[16..24].try_into().unwrap()),
+        }
+    }
+
+    /// The incident behind this: a copy failed, its driver dropped the
+    /// in-flight writers, and its cleanup's deletes of their temp files hit
+    /// `STATUS_SHARING_VIOLATION`, because a dropped writer sent no CLOSE and
+    /// its handle stayed open for as long as the session lived. Now the drop
+    /// queues the CLOSE before it returns, so it reaches the server ahead of
+    /// anything the owner sends next, the delete included.
+    #[tokio::test]
+    async fn file_writer_dropped_mid_upload_closes_before_anything_sent_after() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(writer_opened(file_id));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_flush_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+        let mut writer = tree
+            .create_file_writer(conn.clone(), "out.bin")
+            .await
+            .unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+        drop(writer);
+        tree.flush_handle(&mut conn, OTHER_FILE).await.unwrap();
+
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::Write,
+                Command::Close,
+                Command::Flush
+            ]
+        );
+        assert_eq!(closed_file_id(&mock, 2), file_id);
+    }
+
+    /// `finish` that failed at the FLUSH leaves the handle open, and the
+    /// drop closes it.
+    #[tokio::test]
+    async fn file_writer_whose_finish_failed_closes_on_drop() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(writer_opened(file_id));
+        mock.queue_response(build_write_response(100));
+        mock.queue_response(crate::client::test_helpers::build_flush_error_response(
+            NtStatus::DISK_FULL,
+        ));
+        mock.queue_response(build_close_response());
+
+        let conn = setup_connection(&mock);
+        let tree = test_tree();
+        let mut writer = tree.create_file_writer(conn, "out.bin").await.unwrap();
+        writer.write_chunk(&[0u8; 100]).await.unwrap();
+        writer.finish().await.unwrap_err();
+
+        wait_until(|| mock.sent_count() == 4).await;
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::Write,
+                Command::Flush,
+                Command::Close
+            ]
+        );
+    }
+
+    /// A handle closed on purpose gets exactly one CLOSE: a second one could
+    /// close another open the server has since given the same id.
+    #[tokio::test]
+    async fn a_finished_or_closed_handle_sends_no_second_close_on_drop() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(writer_opened(file_id));
+        mock.queue_response(build_flush_response());
+        mock.queue_response(build_close_response());
+        mock.queue_response(reader_opened(file_id, 0));
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_flush_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+        let writer = tree
+            .create_file_writer(conn.clone(), "out.bin")
+            .await
+            .unwrap();
+        writer.finish().await.unwrap();
+        let reader = tree.open_file_reader(conn.clone(), "in.bin").await.unwrap();
+        reader.close().await.unwrap();
+        tree.flush_handle(&mut conn, OTHER_FILE).await.unwrap();
+
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::Flush,
+                Command::Close,
+                Command::Create,
+                Command::Close,
+                Command::Flush
+            ]
+        );
+    }
+
+    /// `Drop` can't count on an async runtime being there: a writer dropped
+    /// on a plain thread still closes its handle, because the CLOSE is
+    /// queued for the connection's own writer task, not spawned.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn file_writer_dropped_outside_any_runtime_still_closes() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(writer_opened(file_id));
+        mock.queue_response(build_close_response());
+
+        // Kept, as a consumer keeps its client: a writer holding the last
+        // clone takes the whole connection down with it instead, and the
+        // server lets go of the handle with the session.
+        let conn = setup_connection(&mock);
+        let writer = test_tree()
+            .create_file_writer(conn.clone(), "out.bin")
+            .await
+            .unwrap();
+        std::thread::spawn(move || drop(writer)).join().unwrap();
+
+        wait_until(|| mock.sent_count() == 2).await;
+        assert_eq!(sent_commands(&mock), [Command::Create, Command::Close]);
+        assert_eq!(closed_file_id(&mock, 1), file_id);
+    }
+
+    /// The same for an upload dropped partway: its doc always promised the
+    /// handle would close.
+    #[tokio::test]
+    async fn file_upload_dropped_partway_closes_its_handle() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(build_write_response(65536));
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_flush_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+        let data = vec![0u8; 3 * 65536];
+        {
+            let mut upload = FileUpload::new(
+                std::borrow::Cow::Borrowed(&*tree),
+                conn.clone(),
+                file_id,
+                &data,
+                65536,
+            );
+            assert!(upload.write_next_chunk().await.unwrap());
+        }
+        tree.flush_handle(&mut conn, OTHER_FILE).await.unwrap();
+
+        assert_eq!(
+            sent_commands(&mock),
+            [Command::Write, Command::Close, Command::Flush]
+        );
+        assert_eq!(closed_file_id(&mock, 1), file_id);
+    }
+
+    /// And for a download abandoned partway.
+    #[tokio::test]
+    async fn file_download_dropped_partway_closes_its_handle() {
+        let mock = Arc::new(MockTransport::new());
+        let file_id = test_file_id();
+        mock.queue_response(build_create_response(file_id, 3 * 65536));
+        mock.queue_response(build_read_response(vec![0x11; 65536]));
+        // The READ after it is already out when the download is dropped.
+        mock.queue_response(build_read_response(vec![0x22; 65536]));
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_flush_response());
+
+        let mut conn = setup_connection(&mock);
+        let tree = test_tree();
+        {
+            let mut opener = conn.clone();
+            let mut download = tree
+                .download(&mut opener, "big.bin")
+                .await
+                .unwrap()
+                .with_read_ahead(crate::ReadAhead::SEQUENTIAL);
+            download.next_chunk().await.unwrap().unwrap();
+        }
+        tree.flush_handle(&mut conn, OTHER_FILE).await.unwrap();
+
+        assert_eq!(
+            sent_commands(&mock),
+            [
+                Command::Create,
+                Command::Read,
+                Command::Read,
+                Command::Close,
+                Command::Flush
+            ]
+        );
+        assert_eq!(closed_file_id(&mock, 3), file_id);
+    }
+
+    /// Poll `f` until it holds, panicking rather than hanging if it never
+    /// does. For the parts of a close-on-drop that happen in the background.
+    async fn wait_until(mut f: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !f() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "condition never became true within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     // ── Progress tests ─────────────────────────────────────────────────

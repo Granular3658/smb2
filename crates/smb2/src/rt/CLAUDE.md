@@ -6,7 +6,7 @@ runtime" section.
 
 ## Files
 
-- `mod.rs`: `backend()`, `spawn` / `TaskHandle`, `sleep` / `sleep_until` / `Sleep`, `timeout` / `timeout_at` /
+- `mod.rs`: `backend()`, `spawn` / `try_spawn` (`None` where `spawn` would panic, for `Drop`) / `TaskHandle`, `sleep` / `sleep_until` / `Sleep`, `timeout` / `timeout_at` /
   `Elapsed`, `yield_now`, and `Instant`
 - `net.rs`: `resolve`, `TcpStream` (split into `ReadHalf` / `WriteHalf`), `UdpSocket` (the KDC client's)
 - `tests.rs`: each contract scenario is one async fn, run once under `#[tokio::test]` and once under `smol::block_on`

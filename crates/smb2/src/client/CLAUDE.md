@@ -79,6 +79,20 @@ for the writer task's ack; `writer_loop` owns the transport's write half and is 
 - **Torn down, not retried, on failure.** A write abandoned partway has already put bytes on the wire, so the stream
   can't be resynced. A frame rejected *before* any byte went out (oversized) is the caller's problem alone and leaves
   the connection alive.
+- **A failed write is a lost connection, typed as one.** The transport's `Error::Io` becomes `Error::SendFailed
+  { command, source }` (`ErrorKind::ConnectionLost`, retryable, the OS error as `source`) for the caller whose frame
+  it was; every other waiter gets `Disconnected`. Whatever the errno (`EPIPE`, `ECONNRESET`, ...), the connection is
+  gone, so nothing sniffs it. The writer fans out *before* answering that caller, so it already sees
+  `is_disconnected()`. ❌ Don't hand the raw `Error::Io` back: it classifies as `ErrorKind::Io` ("the connection may be
+  fine"), and a consumer then failed the one file in flight while every other waiter recovered (Cmdr, 2026-10-19).
+  `Error::Io` from a live connection means a local failure (a streamed upload's own callback). Read errors already
+  reach waiters as `Disconnected` through `fan_error_to_waiters`. Pinned by
+  `the_request_whose_send_broke_the_connection_reports_it_lost`.
+- **Handing over can be synchronous.** `Inner::try_queue` puts a frame in the queue without awaiting (`try_send`), and
+  `Connection::dispatch_without_waiting` builds a whole request around it (a credit by `try_reserve`, the waiter, the
+  signed bytes); it's what `Drop` uses (§ Dropping a handle). The frame's place in the queue is its place on the wire.
+  `QueuedFrame` holds the frame's count in `send_queue_depth` until its ack (or its drop), so a cancelled caller can't
+  leave the gauge counting it.
 - **Whole frames only.** `TcpTransport::send` writes a 4-byte length header and then the body. A caller cancelled
   between the two used to leave a header with no body on the wire and every later frame landed inside it — and
   consumers cancel constantly (a user aborting a copy). Queuing the frame as one message makes that unreachable.
@@ -349,7 +363,9 @@ FileWriter provides push-based pipelined writes. The consumer pushes chunks at t
 - **An error closes the handle and is final.** A failed query moves to `Closing` carrying its error, which outranks the CLOSE's; later calls return `Ok(None)`, like `FileDownload` after an error. Same error precedence as the old inline loop, so `list_directory` reports what it always did.
 - **A batch is never empty**: a SUCCESS answer with no whole entry is recorded (for the instrumented trace) and skipped.
 - **Reconnect: the open replays, the listing never does.** The reader is pinned before its CREATE like every handle (§ Reconnection), so after a revival `next_batch` fails with `HandleInvalidated` and sends nothing, and `close` succeeds without sending. A new session can't resume an old cursor, and replaying from the start would hand the caller entries twice. `SmbClient::open_directory_reader` uses `replaying`, since nothing has been listed when the CREATE fails, and follows a DFS link like `list_directory` (the reader owns the target's tree).
-- `Drop` mid-listing logs at debug, as `FileReader` does; there's no async drop to send the CLOSE.
+- `Drop` mid-listing (`Ready` or `Querying`) closes the handle (§ Dropping a handle); a query still out was queued
+  first, so the server answers it before the CLOSE. In `Closing` it sends nothing more, even if that CLOSE's future
+  went away before it got out.
 - **Index numbers are opt-in, and the default listing is byte-for-byte what it was.** `ListOptions::index_numbers` (`open_directory_reader_with`, `list_directory_with`) asks for `FileIdBothDirectoryInformation` (class 37): the default class plus `Reserved2` and the 64-bit `FileId` (MS-FSCC § 2.4.22), the number `FileInternalInformation` calls `IndexNumber` (§ 2.4.27), so it equals `FileIdentity::index_number` for the same file (Docker `guest_a_listings_index_numbers_are_the_ones_stat_with_identity_reports`). Same round trips, 10 bytes more per entry. `the_default_listing_asks_for_class_3_and_reports_no_index` pins the default request field by field. The field is `index_number: Option<u64>`, not a `FileIdentity`: a listing carries no volume serial, and `FileIdentity::is_proof` needs both halves. A 0 means "none" (and is what a server MAY send for `..`), so it becomes `None`. Both classes parse in `msg/directory_info.rs` and map names through the one `parse_directory_entries`.
 - **A refused class 37 falls back on the same handle.** `STATUS_INVALID_INFO_CLASS` or `STATUS_NOT_SUPPORTED` (MS-SMB2 § 3.3.5.18) on the FIRST query (`State::Querying.restart`, so nothing has been handed out) switches the reader to class 3 and restarts the scan: no second CREATE, every `index_number` `None`. ❌ Never fall back on a later query: restarting after a batch went out hands the caller entries twice. The connection learns it (`listing_ids_refused`, erased on revival), so a recursive scan pays the refusal once per connection rather than per directory, and its one `debug` line fires once. Any other error is the listing's error, as before.
 
@@ -357,7 +373,7 @@ FileWriter provides push-based pipelined writes. The consumer pushes chunks at t
 
 `FileReader` (in `stream.rs`) holds ONE open handle and serves any number of *positioned* reads (`read_at(offset, len)`, the SMB analog of `pread`) before an explicit `close()`. It's the primitive for a consumer that parses a file's structure by jumping around it (zip central-directory browse + entry extract), where reopening per read would leak a handle each time. Build one via `open_file_reader(tree: Arc<Tree>, conn, path)` (free fn), `Tree::open_file_reader(&Arc<Self>, conn, path)`, or `SmbClient::open_file_reader(&mut self, tree, path)` (clones the tree's own connection, follows a DFS link).
 
-Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error); like the other stream handles, `Drop` can't CLOSE (no async drop) and only logs a debug warning, so a dropped-without-close reader leaks the handle until session teardown. Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop-sends-no-close) and the `guest_file_reader_positioned_reads` Docker test.
+Same owned-`Connection` + `Arc<Tree>` shape as `FileWriter`, so it's `'static`. `read_at` takes `&self` (no shared cursor) and issues `execute_with_credits` READs, splitting a range larger than `MaxReadSize` into consecutive wire reads and reassembling. It clamps to the size seen at open, so a read at/after EOF returns empty and a straddling read is short — never an error. `close()` consumes `self` (read-after-close is a compile error) and waits for the answer; a reader dropped without it closes its handle anyway (§ Dropping a handle). Pinned by the `stream.rs` `file_reader_*` mock tests (one CREATE, N READs, one CLOSE; EOF clamping; range splitting; drop closes) and the `guest_file_reader_positioned_reads` Docker test.
 
 ## Resolving names (`resolve.rs`)
 
@@ -471,7 +487,20 @@ FileWriter has two terminal operations:
 - `finish()` — send all buffered data, drain in-flight WRITEs, FLUSH (fsync on the server), CLOSE. Use on normal completion.
 - `abort()` — discard unsent data, drain in-flight WRITEs to keep credits/message-ids in sync, skip FLUSH, best-effort CLOSE. Use on cancellation or error paths where the partial remote file is going to be deleted anyway — `abort()` saves the fsync round-trip. The caller is responsible for deleting the partial remote file.
 
-Both consume `self` so write-after-close/abort is a compile error. `Drop` logs a debug warning if neither was called (handle leaks).
+Both consume `self` so write-after-close/abort is a compile error. A writer dropped without either closes its handle unflushed, like `abort()` without the wait (§ Dropping a handle); so does one whose `finish()` failed before its CLOSE (a refused FLUSH, say).
+
+## Dropping a handle: the CLOSE is queued before `Drop` returns
+
+Every type that owns an open handle (`FileWriter`, `FileReader`, `FileUpload`, `FileDownload`, `DirectoryReader`, `Watcher`) closes it when dropped still open, through `Tree::close_dropped_handle`. Consumers drop these routinely: a copy driver that stops on the first failure drops every writer in flight, and a handle left open keeps the file locked against the consumer's own cleanup (`STATUS_SHARING_VIOLATION` deleting the temp file it just wrote, Cmdr 2026-10-19) for as long as the session lives.
+
+- **Queued synchronously, so ordered.** `Drop` can't await, and a spawned CLOSE would race the owner's next request: the delete right after the drop got there first. `dispatch_without_waiting` takes a credit with `try_reserve`, builds and signs the CLOSE, and `try_send`s it into the writer task's queue before `Drop` returns. It lands after every request the handle already queued (a writer's in-flight WRITEs: `WritePipe::dispatch` returns only once its frame is queued, so a dropped `write_chunk` leaves nothing half-sent behind it) and before anything the owner sends next. A spawned task then only waits for the answer and logs a failure at `debug`; with no runtime in reach (`rt::try_spawn` answers `None` instead of panicking) the CLOSE goes out all the same and its answer is discarded.
+- **Fallback, unordered.** No credit on hand, or a full queue: the CLOSE is sent from a spawned task instead, with no ordering promise. No runtime either: logged at `debug`, and the handle stays open until the session ends.
+- ❌ **Never a second CLOSE.** Each type marks the CLOSE as started *before* sending it (`done` / `closed` / `close_started` / `State::Closing`), and `Drop` sends nothing once it is, even when the future that started it was dropped before its frame got out (that handle then stays open until the session ends). A second CLOSE is worse than a leak: the server may have given the same file id to a new open in between (Windows reuses volatile ids), and the stray CLOSE would close somebody else's file on this session.
+- **A handle from a session that ended sends nothing** (`pinned_session_is_current`), as with an explicit close: the server let go of it with the session.
+- **A handle holding the connection's last clone** takes the connection down with it on drop (`Inner::drop` stops the writer task, so the queued CLOSE never goes out). That's fine: the socket closes, and the server releases every handle with the session.
+- **Known limit: an `async fn` dropped mid-call.** A `Tree` method holding a handle only for the call (`write_file_compound`, the pipelined reads and writes, `copy`, and so on) closes it as its last step, and a caller dropping that future between the CREATE and the CLOSE leaves the handle open until the session ends. The widest window is the CREATE's own answer: until it arrives the client doesn't know the file id, so nothing caller-side can close it. Fixing that needs the receiver task to close the handle of a CREATE answered after its caller left (and not one a compound already closed): issue #24.
+
+Pinned by the `stream.rs` close-on-drop tests (`file_writer_dropped_mid_upload_closes_before_anything_sent_after`, `..._outside_any_runtime_still_closes`, `a_finished_or_closed_handle_sends_no_second_close_on_drop`, and one per type), `directory.rs` `a_dropped_reader_closes_after_its_query_and_never_twice`, and `watcher.rs` `close_on_drop_tests`.
 
 ## Resuming an upload
 
@@ -611,8 +640,6 @@ Decisions behind this shape (cited by ID from code, like decision E3), and what 
 - **Signing and encryption are mutually exclusive on the wire**: When encrypting, zero the signature field (AEAD provides integrity). On receive, skip signature verification if decryption succeeded.
 - **Compound encryption wraps the entire chain**: One TRANSFORM_HEADER for all sub-requests concatenated, not per sub-request.
 - **Share-level encryption**: If a share has `SMB2_SHAREFLAG_ENCRYPT_DATA`, encryption is activated even if the session didn't require it.
-- **FileDownload/FileUpload can leak handles on drop**: Rust has no async drop. An upload not consumed fully, or a download dropped before its last chunk arrives, leaks the file handle. The types log a warning. (A download sends its CLOSE as the last chunk lands, so dropping it after that is safe.)
-- **FileWriter can leak handles on drop**: Same as FileDownload/FileUpload. Rust has no async drop. If not consumed via `finish()` or `abort()`, the file handle leaks. The type logs a debug warning.
 - **DFS paths must include server\share prefix**: When `SMB2_FLAGS_DFS_OPERATIONS` is set, the server expects the path to start with `server\share\` (MS-SMB2 3.2.4.3). `Tree::format_path()` handles this automatically for DFS shares. Without the prefix, Samba strips the first two path components, leading to wrong file opens.
 - **tree.server stores addr:port**: The `server` field on `Tree` stores the full `addr:port` string (not just hostname) so `Connections::for_tree` can distinguish servers that share the same hostname but use different ports.
 - **Every write that creates a file comes in a replacing and an exclusive form**: `write_file_compound` / `create_file_writer` use `FileOverwriteIf` (create or replace); `write_file_compound_exclusive` / `create_file_writer_exclusive` use `FileCreate`, which the server refuses atomically with `STATUS_OBJECT_NAME_COLLISION` (`ErrorKind::AlreadyExists`, an `Error::Protocol` naming the CREATE) if the name exists. A consumer that checked a name was free and then writes must use the exclusive form: the replacing one silently overwrites a file another writer put there in between. The disposition stays private (`*_with_disposition`), so the public surface is exactly these pairs.

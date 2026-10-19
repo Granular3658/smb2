@@ -535,6 +535,34 @@ pub enum Error {
         waited: std::time::Duration,
     },
 
+    /// The socket failed while this request was being written to it, so the
+    /// connection was torn down.
+    ///
+    /// The request's own send hit the failure: the server reset the
+    /// connection (`ECONNRESET`), already closed it (`EPIPE` on the next
+    /// write), or the OS gave up on it. `source` is that OS error, kept for
+    /// the log and for a consumer that wants to say why; branch on
+    /// [`Error::kind`], never on the io error. Whatever it is, the
+    /// connection is gone: a write that fails partway leaves half a frame on
+    /// the wire, so nothing sent after it could be trusted.
+    ///
+    /// Only the request whose send failed gets this. Every other request in
+    /// flight on the connection gets [`Error::Disconnected`], and the
+    /// connection already reports
+    /// [`is_disconnected`](crate::client::connection::Connection::is_disconnected)
+    /// by the time any of them hears. Classifies as
+    /// [`ErrorKind::ConnectionLost`], the same as `Disconnected`, and reports
+    /// as retryable. On an established connection, [`Error::Io`] never means
+    /// the connection was lost.
+    #[error("lost the connection while sending a {command:?} request: {source}")]
+    SendFailed {
+        /// The command that was being sent (the first sub-op of a compound).
+        command: crate::types::Command,
+        /// What the socket said.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A request ran out of deadline on a connection the server had gone
     /// completely silent on, so the whole session was declared dead.
     ///
@@ -586,6 +614,7 @@ impl Error {
                 | Error::Disconnected
                 | Error::CreditStarvation { .. }
                 | Error::SendTimeout { .. }
+                | Error::SendFailed { .. }
                 | Error::ServerUnresponsive { .. }
                 | Error::ReconnectFailed { .. }
                 | Error::DurableHandleLost { .. }
@@ -786,6 +815,9 @@ impl Error {
             // wearing a live socket; consumers already reconnect on TimedOut.
             Error::CreditStarvation { .. } => ErrorKind::TimedOut,
             Error::SendTimeout { .. } => ErrorKind::TimedOut,
+            // The socket failed under the write and the connection went with
+            // it; what the OS called it doesn't change that.
+            Error::SendFailed { .. } => ErrorKind::ConnectionLost,
             // The socket is up but nobody is home. Consumers already
             // reconnect on `ConnectionLost`, and reconnecting is the only
             // useful response, so it classifies with `Disconnected` rather

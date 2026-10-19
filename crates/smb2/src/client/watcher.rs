@@ -153,6 +153,9 @@ pub struct Watcher {
     /// table forever. Before that, a long-lived watcher's abandoned
     /// CHANGE_NOTIFYs showed up as requests "unanswered" for hours.
     pending: Option<WaiterGuard>,
+    /// Set by [`close`](Self::close) before its CLOSE, so the drop after it
+    /// never sends a second.
+    closed: bool,
 }
 
 impl Watcher {
@@ -165,6 +168,7 @@ impl Watcher {
             file_id,
             recursive,
             pending: None,
+            closed: false,
         }
     }
 
@@ -363,14 +367,14 @@ impl Watcher {
     /// Drops the pre-issued CHANGE_NOTIFY, which deregisters its waiter (the
     /// `Connection` receiver task discards the late response silently when it
     /// arrives — same contract `Connection::execute` already documents), then
-    /// issues a CLOSE on the file handle. If `close` is not called explicitly,
-    /// the `Drop` impl still deregisters, but the server-side handle leaks
-    /// until the session ends (there is no async drop in Rust).
+    /// issues a CLOSE on the file handle and waits for its answer. Dropping
+    /// the watcher closes the handle too, without the answer.
     ///
     /// A watcher whose session has ended (a reconnect) sends nothing and
     /// returns `Ok`: the server let go of the handle with the session.
     pub async fn close(mut self) -> Result<()> {
         self.pending.take();
+        self.closed = true;
         match self.tree.close_handle(&mut self.conn, self.file_id).await {
             Err(Error::HandleInvalidated { .. }) => Ok(()),
             result => result,
@@ -380,12 +384,13 @@ impl Watcher {
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        // The pre-issued response receiver (if any) drops with the
-        // Watcher. The `Connection` receiver task discards the late
-        // frame silently when it arrives, matching the contract on
-        // `Connection::execute`. The directory handle itself leaks
-        // server-side until the session ends — the docstring on `close`
-        // already warns about this.
+        // The pre-issued CHANGE_NOTIFY (if any) drops with the watcher, after
+        // this: the server completes it when the CLOSE lands, and the
+        // receiver task discards that late answer.
+        if !self.closed {
+            self.tree
+                .close_dropped_handle(&self.conn, self.file_id, "Watcher");
+        }
     }
 }
 
@@ -968,5 +973,79 @@ mod loss_window_tests {
              got {:?}",
             delivered
         );
+    }
+}
+
+#[cfg(test)]
+mod close_on_drop_tests {
+    use super::*;
+    use crate::client::test_helpers::{
+        build_close_response, build_flush_response, setup_connection,
+    };
+    use crate::msg::header::Header;
+    use crate::pack::{ReadCursor, Unpack};
+    use crate::transport::MockTransport;
+    use crate::types::TreeId;
+    use std::sync::Arc;
+
+    const DIR: FileId = FileId {
+        persistent: 0x31,
+        volatile: 0x32,
+    };
+
+    fn tree() -> Tree {
+        Tree {
+            pin: None,
+            tree_id: TreeId(1),
+            share_name: "test".to_string(),
+            server: "test-server".to_string(),
+            is_dfs: false,
+            encrypt_data: false,
+            dfs_origin: None,
+        }
+    }
+
+    fn sent_commands(mock: &MockTransport) -> Vec<Command> {
+        mock.sent_messages()
+            .iter()
+            .map(|bytes| Header::unpack(&mut ReadCursor::new(bytes)).unwrap().command)
+            .collect()
+    }
+
+    /// A watcher dropped without `close` (a pane closing) releases the
+    /// directory handle, ahead of anything sent after it.
+    #[tokio::test]
+    async fn a_dropped_watcher_closes_its_handle() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_flush_response());
+        let mut conn = setup_connection(&mock);
+
+        drop(Watcher::new(tree(), conn.clone(), DIR, false));
+        tree()
+            .flush_handle(&mut conn, FileId::default())
+            .await
+            .unwrap();
+
+        assert_eq!(sent_commands(&mock), [Command::Close, Command::Flush]);
+    }
+
+    #[tokio::test]
+    async fn a_closed_watcher_sends_one_close() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_close_response());
+        mock.queue_response(build_flush_response());
+        let mut conn = setup_connection(&mock);
+
+        Watcher::new(tree(), conn.clone(), DIR, false)
+            .close()
+            .await
+            .unwrap();
+        tree()
+            .flush_handle(&mut conn, FileId::default())
+            .await
+            .unwrap();
+
+        assert_eq!(sent_commands(&mock), [Command::Close, Command::Flush]);
     }
 }

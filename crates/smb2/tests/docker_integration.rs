@@ -557,6 +557,39 @@ async fn guest_a_stamp_by_path_loses_to_an_open_writers_close() {
         .expect("delete_file");
 }
 
+/// The incident shape against a real Samba: a copy gives up, drops its writer
+/// with WRITEs still in flight, and deletes the partial file straight away.
+/// While the writer is open the delete is refused, so a dropped writer that
+/// kept its handle would fail the delete; the CLOSE queued by the drop has to
+/// reach the server first.
+#[tokio::test]
+#[ignore]
+async fn guest_a_dropped_writer_lets_go_of_the_file_before_the_next_request() {
+    let _ = env_logger::try_init();
+    let (mut conn, tree) = connect_guest().await;
+    let tree = std::sync::Arc::new(tree);
+    let path = "docker_test_dropped_writer.tmp";
+
+    let mut writer = tree
+        .create_file_writer(conn.clone(), path)
+        .await
+        .expect("writer");
+    writer
+        .write_chunk(&vec![0x5a; 4 * 1024 * 1024])
+        .await
+        .expect("write_chunk");
+    let refused = tree
+        .delete_file(&mut conn, path)
+        .await
+        .expect_err("an open writer keeps the file from being deleted");
+    assert_eq!(refused.kind(), smb2::ErrorKind::SharingViolation, "{refused}");
+
+    drop(writer);
+    tree.delete_file(&mut conn, path)
+        .await
+        .expect("the drop closed the handle before the delete got there");
+}
+
 // ── Attributes (smb-guest) ──────────────────────────────────────────
 
 fn attrs(bits: u32) -> smb2::FileAttributes {

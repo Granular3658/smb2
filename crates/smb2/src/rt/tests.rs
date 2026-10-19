@@ -180,6 +180,24 @@ mod on_tokio {
     async fn a_tokio_runtime_runs_on_tokio() {
         assert_eq!(backend(), Backend::Tokio);
     }
+
+    #[tokio::test]
+    async fn try_spawn_runs_the_task_inside_a_runtime() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&finished);
+        try_spawn(async move { flag.store(true, Ordering::SeqCst) })
+            .expect("a runtime is in reach")
+            .detach();
+        assert!(eventually(&finished).await);
+    }
+
+    /// `Drop` calls it from wherever the owner let go, so it answers `None`
+    /// where `spawn` would panic, and never panics itself.
+    #[cfg(not(feature = "smol"))]
+    #[test]
+    fn try_spawn_outside_any_runtime_declines_instead_of_panicking() {
+        assert!(try_spawn(async {}).is_none());
+    }
 }
 
 #[cfg(feature = "smol")]

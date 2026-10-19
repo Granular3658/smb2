@@ -182,6 +182,20 @@ where
     }
 }
 
+/// [`spawn`], or `None` where `spawn` would panic: a build with only the
+/// `tokio` feature, called outside a tokio runtime. For `Drop`, which runs
+/// wherever the owner happens to let go and must never panic.
+pub(crate) fn try_spawn<F>(future: F) -> Option<TaskHandle>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    #[cfg(all(feature = "tokio", not(feature = "smol")))]
+    if tokio::runtime::Handle::try_current().is_err() {
+        return None;
+    }
+    Some(spawn(future))
+}
+
 /// Give the executor one turn: the current task goes to the back of the
 /// queue, and whatever is ready runs first.
 ///
