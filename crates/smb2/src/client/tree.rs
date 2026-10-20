@@ -208,8 +208,13 @@ pub struct DirectoryEntry {
 impl DirectoryEntry {
     /// The entry is a link to another place (a junction, a symlink, or any
     /// other name surrogate, [`ReparseTag::is_name_surrogate`]). A walk
-    /// should list it and not descend into it; deleting it removes the link
-    /// and leaves its target alone.
+    /// should list it and not descend into it, and delete it with
+    /// [`Tree::delete_link`], which leaves its target alone.
+    ///
+    /// Only as good as the server's listing: Samba lists a Unix symlink as
+    /// whatever it points to (verified on 4.20.6 and 4.23.10, 2026-10-20), so
+    /// this is `false` for one there. On Samba 4.23 a [`Tree::stat`] of the
+    /// path does say ([`FileInfo::is_link`]).
     pub fn is_link(&self) -> bool {
         self.reparse_tag.is_some_and(ReparseTag::is_name_surrogate)
     }

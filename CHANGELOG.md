@@ -5,6 +5,26 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.34.0] - 2026-10-20
+
+### Breaking
+
+- **Deleting, renaming, stat-ing, or setting the times of a junction or symlink acts on the link, never on what it points to.** `delete_file`, `delete_directory`, `rename`, `stat` (and `stat_with_identity`, `stat_files`), and `set_times` now open the path's reparse point itself (`FILE_OPEN_REPARSE_POINT`, MS-SMB2 § 2.2.13), as Windows' own `DeleteFile`, `RemoveDirectory`, `MoveFileEx`, and `SetFileAttributes` do. Before, the server opened a junction's target, so `delete_directory` on a junction to an empty folder deleted that folder and `rename` moved it, and a symlink was refused with `STATUS_STOPPED_ON_SYMLINK`. On Samba 4.23, deleting a symlink deleted the file it pointed to. On anything that isn't a reparse point nothing changes. If you relied on `stat` describing a junction's target, stat the target's own path; listing the junction still lists the target's contents.
+
+### Added
+
+- **Listings say which entries are junctions and symlinks.** `DirectoryEntry::reparse_tag` is the entry's reparse tag, `Some` exactly when its attributes have `REPARSE_POINT` (both listing classes carry it in the slot that otherwise holds the EA size, MS-FSCC § 2.4.8), at no extra cost. `DirectoryEntry::is_link` says whether it names another place, so a recursive walk can list a junction without descending into it: a recursive delete that walked into one deleted the target's files.
+- **`ReparseTag`**: a `u32` newtype with the well-known tags as constants (`MOUNT_POINT`, `SYMLINK`, `LX_SYMLINK`, `NFS`, `DEDUP`, `CLOUD`, `STORAGE_SYNC`, ...) and `is_name_surrogate`, the test that tells a link from a dedup or cloud-files placeholder (which carry the reparse bit too), including for tags it has no name for. Any tag round-trips.
+- **`FileInfo::reparse_tag` and `FileInfo::is_link`**: `stat` and its siblings ask `FileAttributeTagInformation` (MS-FSCC § 2.4.6) in the same compound. The metadata an open hands back (`read_file_compound_with_info`, `FileReader::info`, ...) has no tag, so it's `None` there.
+- **`Tree::delete_link` / `SmbClient::delete_link`** delete a link whatever kind of entry the server calls it: a junction is a directory on Windows, while Samba reports a symlink as a file and refuses `delete_directory` on one with `STATUS_NOT_A_DIRECTORY`. On a path that isn't a link it deletes a file, or a directory only if it's empty.
+- `NtStatus::STOPPED_ON_SYMLINK` and `FileAttributes::is_reparse_point`.
+- **`smb2 ls -R` doesn't descend into junctions and directory symlinks** (smb2-cli 0.4.25), which walked someone else's tree or looped forever on one pointing up. It still lists them. `ls --json` and `stat --json` gain `isLink` and `reparseTag` (the raw tag, or `null`).
+
+### Notes
+
+- **Samba doesn't mark a Unix symlink in a listing**, so `is_link` is `false` for one there and a walk can't tell. Samba 4.23.10 reports it as `ReparseTag::SYMLINK` to a `stat`; Samba 4.20.6 ignores `FILE_OPEN_REPARSE_POINT` altogether, so deleting a symlink there still deletes its target, whatever the client sends. Details: `docs/notes/samba-symlinks-and-reparse-points.md`.
+- The Windows behavior follows the spec; it wasn't run against a Windows server.
+
 ## [0.33.0] - 2026-10-20
 
 ### Breaking
