@@ -1879,14 +1879,17 @@ struct Inner {
     /// Called on every reconnect lifecycle event, if a consumer asked to be
     /// told. See [`Connection::on_reconnect`].
     reconnect_observer: StdMutex<Option<ReconnectObserver>>,
-    /// The session id this connection had before it was revived, or `0`.
+    /// The session the next SESSION_SETUP replaces, or `0`: the one this
+    /// connection had before it was revived, or one a consumer named with
+    /// [`Connection::set_previous_session_id`].
     ///
     /// SESSION_SETUP carries it as `PreviousSessionId` (MS-SMB2 § 2.2.5), which
     /// is how a client says "this is me again" after a disconnect. Without it
     /// the server has no way to connect the new session to the old one, so it
-    /// holds the dead session's state until its own timeout and — the reason
-    /// this exists — will not let the new session claim the old one's durable
-    /// opens.
+    /// holds the dead session's state (its open handles, and the share locks
+    /// they take) until its own timeout. With it, the server ends the old
+    /// session before answering, which closes those handles; Windows 8.1 and
+    /// later close its durable opens too (MS-SMB2 product notes <337>, <351>).
     previous_session_id: AtomicU64,
     /// The session most recently established on this connection.
     ///
@@ -5320,13 +5323,40 @@ impl Connection {
         self.inner.oplock_trees.lock().unwrap().remove(&file_id);
     }
 
-    /// The session id this connection had before its last revival, or `0` if
-    /// it has never been revived.
+    /// The session the next session setup here replaces, or `0`.
     ///
+    /// A revival sets it to the session it's replacing, and
+    /// [`set_previous_session_id`](Self::set_previous_session_id) lets a
+    /// consumer name one; a successful setup clears it.
     /// [`Session::setup`](crate::Session::setup) sends it as
-    /// `PreviousSessionId`. See the field docs for why it matters.
+    /// `PreviousSessionId`, which is what lets the server close the old
+    /// session's handles at once rather than at its own timeout.
     pub fn previous_session_id(&self) -> SessionId {
         SessionId(self.inner.previous_session_id.load(Ordering::Acquire))
+    }
+
+    /// Announce `id` as `PreviousSessionId` on the next session setup here, so
+    /// the server ends that session and closes everything it still has open.
+    ///
+    /// This is for a consumer that replaces a dead connection with a new one
+    /// rather than reviving it in place (which announces its old session by
+    /// itself): pass the old connection's [`session_id`](Self::session_id)
+    /// before [`Session::setup`](crate::Session::setup).
+    /// [`ClientConfig::previous_session_id`](crate::ClientConfig::previous_session_id)
+    /// does the same for [`SmbClient::connect`](crate::SmbClient::connect).
+    /// The setup that succeeds retires it; a refused one keeps it for the
+    /// retry. `SessionId(0)` clears it.
+    ///
+    /// ❌ **Only a session you've given up on.** A server that finds the id
+    /// logged in as the same user ends it, whether or not it was dead (MS-SMB2
+    /// § 3.3.5.5.3), so naming a session that's still in use (a sibling
+    /// connection's, say) cuts it off mid-request. A different user's session,
+    /// or an id the server doesn't know, is ignored, and so is any id on a
+    /// Samba guest login. The caveats are on the `ClientConfig` field.
+    pub fn set_previous_session_id(&self, id: SessionId) {
+        self.inner
+            .previous_session_id
+            .store(id.0, Ordering::Release);
     }
 
     /// Record the session that has just been established here.

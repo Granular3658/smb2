@@ -70,9 +70,9 @@ async fn guest_client() -> SmbClient {
     .expect("SmbClient::connect to smb-guest failed")
 }
 
-/// Create an SmbClient connected with credentials to smb-auth.
-async fn auth_client() -> SmbClient {
-    SmbClient::connect(ClientConfig {
+/// The config `auth_client` connects with.
+fn auth_config() -> ClientConfig {
+    ClientConfig {
         addr: AUTH_ADDR.to_string(),
         timeout: TIMEOUT,
         username: "testuser".to_string(),
@@ -84,9 +84,14 @@ async fn auth_client() -> SmbClient {
         dfs_target_overrides: HashMap::new(),
         connect_options: None,
         ..Default::default()
-    })
-    .await
-    .expect("SmbClient::connect to smb-auth failed")
+    }
+}
+
+/// Create an SmbClient connected with credentials to smb-auth.
+async fn auth_client() -> SmbClient {
+    SmbClient::connect(auth_config())
+        .await
+        .expect("SmbClient::connect to smb-auth failed")
 }
 
 // ── Basic operations (smb-guest) ─────────────────────────────────────
@@ -325,6 +330,121 @@ async fn a_delete_still_succeeds_while_another_client_has_the_file_open() {
         Some(smb2::types::status::NtStatus::OBJECT_NAME_NOT_FOUND),
         "the file goes once the other client closes it"
     );
+}
+
+/// What a replacement client finds when it names the session it replaces
+/// while that session's writer still holds a file open.
+struct Replaced {
+    /// A delete from a client that doesn't name the old session.
+    stranger_delete: smb2::Result<()>,
+    /// The same delete from the client that names it.
+    replacement_delete: smb2::Result<()>,
+    /// The old session's next request, after the replacement logged in.
+    old_session_after: smb2::Result<smb2::client::FsInfo>,
+}
+
+async fn replace_a_session_holding_a_file(config: ClientConfig, share: &str) -> Replaced {
+    let path = "previous_session_held.tmp";
+
+    let mut old = SmbClient::connect(config.clone())
+        .await
+        .expect("old client");
+    let old_tree = old.connect_share(share).await.expect("old connect_share");
+    let _ = old.delete_file(&old_tree, path).await;
+    let mut writer = old
+        .create_file_writer(&old_tree, path)
+        .await
+        .expect("old writer");
+    writer.write_chunk(b"half a copy").await.expect("write");
+
+    let mut stranger = SmbClient::connect(config.clone()).await.expect("stranger");
+    let stranger_tree = stranger.connect_share(share).await.expect("connect_share");
+    let stranger_delete = stranger.delete_file(&stranger_tree, path).await;
+
+    let mut replacement = SmbClient::connect(ClientConfig {
+        previous_session_id: Some(old.session_id()),
+        ..config
+    })
+    .await
+    .expect("replacement client");
+    let tree = replacement
+        .connect_share(share)
+        .await
+        .expect("connect_share");
+    let replacement_delete = replacement.delete_file(&tree, path).await;
+    let old_session_after = old_tree.fs_info(old.connection_mut()).await;
+
+    drop(writer);
+    let _ = replacement.delete_file(&tree, path).await;
+    Replaced {
+        stranger_delete,
+        replacement_delete,
+        old_session_after,
+    }
+}
+
+/// A client built to replace one whose connection dropped names the old
+/// session (`ClientConfig::previous_session_id`), and the server ends it
+/// before answering the login, so the file the old session was writing is
+/// free at once. Without it, the server keeps the old session's write handle
+/// open until it notices the dead connection by itself, and a delete meets
+/// `STATUS_SHARING_VIOLATION` (vdavid/cmdr#581). The old connection stays up
+/// here, which is the hard case: the server has no reason of its own to let go.
+#[tokio::test]
+#[ignore]
+async fn a_replacement_client_frees_the_old_sessions_handles() {
+    use smb2::types::status::NtStatus;
+    let _ = env_logger::try_init();
+
+    let replaced = replace_a_session_holding_a_file(auth_config(), "private").await;
+
+    assert_eq!(
+        replaced.stranger_delete.unwrap_err().status(),
+        Some(NtStatus::SHARING_VIOLATION),
+        "a client that doesn't name the old session meets its write handle"
+    );
+    replaced
+        .replacement_delete
+        .expect("the replacement deletes the file the old session held");
+    // Samba answers the ended session with `STATUS_USER_SESSION_DELETED`,
+    // unsigned (it has no key left to sign with), and an unsigned answer on a
+    // signed session is discarded (MS-SMB2 § 3.2.5.1.3).
+    let ended = replaced
+        .old_session_after
+        .expect_err("the old session is over");
+    assert_eq!(
+        ended.kind(),
+        smb2::ErrorKind::SignatureInvalid,
+        "got: {ended}"
+    );
+}
+
+/// Samba doesn't end a guest session for `PreviousSessionId`: it skips the
+/// lookup when the new login isn't an authenticated user (`/* TODO */` in
+/// `smb2srv_session_close_previous_send`, Samba master on 2026-10-20). Pinned
+/// so the docs' "named accounts only, on Samba" stays true; if this starts
+/// failing because the delete succeeds, Samba has implemented it.
+#[tokio::test]
+#[ignore]
+async fn samba_keeps_a_replaced_guest_sessions_handles() {
+    use smb2::types::status::NtStatus;
+    let _ = env_logger::try_init();
+    let config = ClientConfig {
+        addr: GUEST_ADDR.to_string(),
+        timeout: TIMEOUT,
+        compression: false,
+        ..Default::default()
+    };
+
+    let replaced = replace_a_session_holding_a_file(config, "public").await;
+
+    assert_eq!(
+        replaced.replacement_delete.unwrap_err().status(),
+        Some(NtStatus::SHARING_VIOLATION)
+    );
+    replaced
+        .old_session_after
+        .expect("the old guest session lives on");
 }
 
 #[tokio::test]

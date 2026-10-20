@@ -947,6 +947,82 @@ mod tests {
         );
     }
 
+    /// Queue the two NTLM rounds of a login the server accepts as `session_id`.
+    fn queue_accepted_login(mock: &MockTransport, session_id: SessionId, final_status: NtStatus) {
+        mock.queue_response(build_session_setup_response(
+            NtStatus::MORE_PROCESSING_REQUIRED,
+            session_id,
+            build_ntlm_challenge(),
+            SessionFlags(0),
+        ));
+        mock.queue_response(build_session_setup_response(
+            final_status,
+            session_id,
+            vec![],
+            SessionFlags(0),
+        ));
+    }
+
+    /// The `PreviousSessionId` each SESSION_SETUP the mock saw carried.
+    fn announced_previous_session_ids(mock: &MockTransport) -> Vec<u64> {
+        mock.sent_messages()
+            .iter()
+            .map(|sent| {
+                let mut cursor = ReadCursor::new(sent);
+                let header = Header::unpack(&mut cursor).unwrap();
+                assert_eq!(header.command, Command::SessionSetup);
+                SessionSetupRequest::unpack(&mut cursor)
+                    .unwrap()
+                    .previous_session_id
+            })
+            .collect()
+    }
+
+    /// A consumer replacing a client after a drop seeds the dead session's id:
+    /// both rounds announce it (MS-SMB2 § 3.2.4.2.3), and once the new session
+    /// is up it's retired, so a later setup can't point at it again.
+    #[tokio::test]
+    async fn a_seeded_previous_session_id_rides_every_round_and_retires_on_success() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        queue_accepted_login(&mock, SessionId(0x2222), NtStatus::SUCCESS);
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        set_test_params(&mut conn, Dialect::Smb2_0_2);
+
+        conn.set_previous_session_id(SessionId(0x1111));
+        Session::setup(&mut conn, "user", "pass", "").await.unwrap();
+
+        assert_eq!(announced_previous_session_ids(&mock), [0x1111, 0x1111]);
+        assert_eq!(conn.previous_session_id(), SessionId(0));
+    }
+
+    /// A refused login leaves the seed in place, so the retry with the right
+    /// password still tells the server which session it replaces.
+    #[tokio::test]
+    async fn a_refused_login_keeps_the_seeded_previous_session_id() {
+        let mock = Arc::new(MockTransport::new());
+        mock.enable_auto_rewrite_msg_id();
+        queue_accepted_login(&mock, SessionId(0x2222), NtStatus::LOGON_FAILURE);
+        let mut conn = Connection::from_transport(
+            Box::new(mock.clone()),
+            Box::new(mock.clone()),
+            "test-server",
+        );
+        set_test_params(&mut conn, Dialect::Smb2_0_2);
+
+        conn.set_previous_session_id(SessionId(0x1111));
+        Session::setup(&mut conn, "user", "wrong", "")
+            .await
+            .unwrap_err();
+
+        assert_eq!(announced_previous_session_ids(&mock), [0x1111, 0x1111]);
+        assert_eq!(conn.previous_session_id(), SessionId(0x1111));
+    }
+
     /// Helper: put a connection in the state NEGOTIATE leaves it in.
     ///
     /// That includes a credit window: the NEGOTIATE response is what opens

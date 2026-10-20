@@ -5,6 +5,19 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.33.0] - 2026-10-20
+
+### Breaking
+
+- **`ClientConfig` has a new `previous_session_id` field.** A struct literal that spreads `..Default::default()` (as the docs show) compiles unchanged; one that lists every field needs to add `previous_session_id: None`.
+
+### Added
+
+- **A client that replaces one whose connection dropped can free the files the old session had open.** Set `ClientConfig::previous_session_id` to the old client's `SmbClient::session_id()` (new), and the first session setup announces it as `PreviousSessionId` (MS-SMB2 § 3.2.4.2.3). The server then ends the old session before it answers the login, closing its handles. Without it, the server keeps them open until it notices the dead connection on its own, which after a drop with no TCP reset takes minutes, and meanwhile deleting or renaming a file the old session was writing fails with `STATUS_SHARING_VIOLATION`. smb2's own reconnects (`auto_reconnect`, `SmbClient::reconnect`) already did this; now a consumer that builds a fresh client can too. Low-level callers use the new `Connection::set_previous_session_id` before `Session::setup`. Things to know:
+  - **Name only a session you've given up on.** The server ends it whether or not it was still working, so naming a live one (a sibling connection's, say) cuts it off: on a signed session its requests then fail with `Error::SignatureInvalid`, since the server's refusal comes back unsigned.
+  - **Samba only ends a named account's session.** It ignores the field on a guest login (verified against Samba 4.20.6).
+  - **Windows 8.1 and later also close the old session's durable opens**, so leave it unset if you mean to reclaim one.
+
 ## [0.32.1] - 2026-10-19
 
 ### Fixed

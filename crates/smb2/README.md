@@ -383,6 +383,8 @@ For when you want to do one thing and get the result:
   10 minutes (`Connection::set_long_poll_refresh`), so a server that quietly drops one heals itself
 - `client.fs_info(&mut share)`: Disk space (total, free, used)
 - `client.reconnect()`: Reconnect after network failure
+- `client.session_id()`: The session to name in `ClientConfig::previous_session_id` when you build a new client to
+  replace this one after a drop, so the server closes the files the old session still had open
 - `client.credits()`: Current available credits
 - `client.estimated_rtt()`: Round-trip time from negotiate
 - `client.disconnect_share(&share)`: Disconnect from a share

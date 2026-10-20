@@ -81,7 +81,7 @@ use crate::error::Result;
 use crate::pack::Unpack;
 use crate::rpc::srvsvc::ShareInfo;
 use crate::types::status::NtStatus;
-use crate::types::{FileId, TreeId};
+use crate::types::{FileId, SessionId, TreeId};
 use crate::Error;
 use connections::{ConnectionEntry, Connections};
 
@@ -177,6 +177,38 @@ pub struct ClientConfig {
     ///
     /// Default: 30 s, sized for a NAS waking a spun-down disk.
     pub response_timeout: Option<Duration>,
+    /// The session this client replaces, announced as `PreviousSessionId` in
+    /// its first session setup so the server ends that session and closes
+    /// what it still had open.
+    ///
+    /// Set it when you build a new client because an old one's connection
+    /// dropped: pass the old client's [`SmbClient::session_id`]. Without it the
+    /// server can't tell the new session belongs to the old one, so it keeps
+    /// the old session's handles open until it notices the dead connection on
+    /// its own, which after a drop with no TCP reset takes minutes. Until then
+    /// a file the old session had open stays locked, and deleting or renaming
+    /// it meets `STATUS_SHARING_VIOLATION`. A client that revives itself
+    /// ([`auto_reconnect`](Self::auto_reconnect), [`SmbClient::reconnect`])
+    /// announces its old session without this.
+    ///
+    /// Only the server at [`addr`](Self::addr) sees it; DFS target
+    /// connections start their own sessions. The server ignores an id it
+    /// doesn't know, or one a different user logged in as, and Samba ignores
+    /// it for a guest login: only a named account's session is ended there
+    /// (verified against Samba 4.20.6 and its source, 2026-10-20).
+    ///
+    /// ❌ **Only a session you've given up on.** The server ends the session
+    /// whether or not it was dead, so a session another client is still using
+    /// (a sibling connection to the same server, say) is cut off mid-request:
+    /// on a signed session, every request it sends afterwards fails with
+    /// [`Error::SignatureInvalid`], since the server's refusal comes back
+    /// unsigned. Name each replaced session once, from the client that
+    /// replaces it. And on Windows 8.1 and later this closes the old session's
+    /// durable opens too, so leave it unset when you mean to reclaim a durable
+    /// handle the old session held.
+    ///
+    /// Default: `None`.
+    pub previous_session_id: Option<SessionId>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -194,6 +226,7 @@ impl std::fmt::Debug for ClientConfig {
             dfs_target_overrides,
             connect_options,
             response_timeout,
+            previous_session_id,
         } = self;
         f.debug_struct("ClientConfig")
             .field("addr", addr)
@@ -207,6 +240,7 @@ impl std::fmt::Debug for ClientConfig {
             .field("dfs_target_overrides", dfs_target_overrides)
             .field("connect_options", connect_options)
             .field("response_timeout", response_timeout)
+            .field("previous_session_id", previous_session_id)
             .finish()
     }
 }
@@ -251,6 +285,7 @@ impl Default for ClientConfig {
             dfs_target_overrides: std::collections::HashMap::new(),
             connect_options: None,
             response_timeout: Some(connection::RESPONSE_TIMEOUT),
+            previous_session_id: None,
         }
     }
 }
@@ -529,6 +564,9 @@ impl SmbClient {
         // Before NEGOTIATE, so the handshake itself is bounded by it.
         conn.set_response_timeout(config.response_timeout);
         conn.negotiate().await?;
+        if let Some(previous) = config.previous_session_id {
+            conn.set_previous_session_id(previous);
+        }
 
         let session = Session::setup(
             &mut conn,
@@ -941,6 +979,17 @@ impl SmbClient {
     /// Get the session info.
     pub fn session(&self) -> &Session {
         &self.session
+    }
+
+    /// The id of the session this client's connection is on now.
+    ///
+    /// Remember it while the client works: when its connection drops and you
+    /// build a new client in its place, pass it as
+    /// [`ClientConfig::previous_session_id`] so the server closes what this
+    /// session had open. Unlike [`session`](Self::session), it follows a
+    /// session a reconnect established behind this client's back.
+    pub fn session_id(&self) -> SessionId {
+        self.connections.primary().session_id()
     }
 
     /// Get the client config.
