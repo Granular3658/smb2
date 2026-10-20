@@ -9,6 +9,7 @@ Zero-cost newtype wrappers for protocol IDs, command/dialect enums, and bitflag 
 | `mod.rs` | `SessionId`, `TreeId`, `FileId`, `MessageId`, `CreditCharge`, `Command`, `Dialect`, `OplockLevel` |
 | `flags.rs` | Bitflag types: `HeaderFlags`, `Capabilities`, `SecurityMode`, `FileAccessMask`, `FileAttributes` (re-exported at the crate root; `SETTABLE` is MS-FSA's `ValidSetAttributes`), etc. |
 | `status.rs` | `NtStatus` enum (from MS-ERREF) with severity/facility helpers |
+| `reparse.rs` | `ReparseTag(u32)` (MS-FSCC § 2.1.2.1): named tags, `is_name_surrogate` (the "is it a link" test), `is_cloud`. A newtype, not an enum, so any tag round-trips and no two values mean the same tag |
 
 ## Newtype IDs
 

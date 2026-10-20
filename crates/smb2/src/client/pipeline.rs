@@ -592,9 +592,18 @@ mod tests {
         );
         let std_resp = build_query_info_response(std_info);
 
+        // FileAttributeTagInformation: attributes, then a tag (none here).
+        let tag_resp = build_query_info_response([0x20u32, 0].map(u32::to_le_bytes).concat());
+
         let close_resp = build_close_response();
 
-        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            basic_resp,
+            std_resp,
+            tag_resp,
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);

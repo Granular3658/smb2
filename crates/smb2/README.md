@@ -30,6 +30,9 @@ we have more control to reach even better speeds.
 - Setting a file's timestamps (any of them, leaving the rest alone) and its Hidden and Read-only attributes, and reads
   that hand out the file's dates and attributes at no extra cost, so a copy keeps its source's modification date and
   flags
+- Junctions and symlinks on Windows shares: listings and `stat` say which entries are links (`entry.is_link()`,
+  `ReparseTag`), so a recursive walk can skip them, and deleting (`delete_link`), renaming, or stat-ing one acts on
+  the link itself, never on what it points to
 - Pipelined I/O with sliding window for large file transfers
 - SMB 2.x (HMAC-SHA256) and 3.x (AES-CMAC, AES-GMAC) signing, and encryption (AES-128/256-CCM/GCM). A response
   whose signature is missing or wrong, and a guest session offered in place of the account you signed in as, are
@@ -370,6 +373,7 @@ For when you want to do one thing and get the result:
 - `client.rename_files(&mut share, &renames)`: Batch rename
 - `client.create_directory(&share, path)`: Create a directory
 - `client.delete_directory(&share, path)`: Remove a directory
+- `client.delete_link(&share, path)`: Remove a junction or symlink, leaving its target alone
 - `client.download(&share, path)`: Streaming download with progress (memory-efficient)
 - `client.upload(&share, path, data)`: Streaming upload with progress
 - `client.write_file_streamed(&mut share, path, callback)`: Write from a streaming source (memory-efficient, pipelined)

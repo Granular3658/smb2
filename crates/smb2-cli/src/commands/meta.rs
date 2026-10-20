@@ -76,7 +76,9 @@ async fn ls_sorted(
             .with_context(|| format!("listing {}", target.with_path(&path).display()))?;
         for entry in entries {
             if let Some(full) = child_path(&path, &entry) {
-                if format.recursive && entry.is_directory {
+                // A junction or directory symlink lists, but isn't walked:
+                // its contents live elsewhere, and one pointing up loops.
+                if format.recursive && entry.is_directory && !entry.is_link() {
                     pending.push(full.clone());
                 }
                 rows.push((full, entry));
@@ -93,6 +95,9 @@ async fn ls_sorted(
                     "path": path,
                     "name": entry.name,
                     "isDirectory": entry.is_directory,
+                    "isLink": entry.is_link(),
+                    // The raw tag, `null` when it isn't a reparse point.
+                    "reparseTag": entry.reparse_tag.map(|tag| tag.0),
                     "size": entry.size,
                     "modified": output::unix_seconds(entry.modified),
                     "created": output::unix_seconds(entry.created),
@@ -140,7 +145,7 @@ async fn ls_streaming(
             for entry in &batch {
                 if let Some(full) = child_path(&path, entry) {
                     push_row(&mut text, &full, entry, format);
-                    if format.recursive && entry.is_directory {
+                    if format.recursive && entry.is_directory && !entry.is_link() {
                         subdirectories.push(full);
                     }
                 }
@@ -230,6 +235,8 @@ pub async fn stat(
                     items.push(json!({
                         "path": path,
                         "isDirectory": info.is_directory,
+                        "isLink": info.is_link(),
+                        "reparseTag": info.reparse_tag.map(|tag| tag.0),
                         "size": info.size,
                         "modified": output::unix_seconds(info.modified),
                         "created": output::unix_seconds(info.created),

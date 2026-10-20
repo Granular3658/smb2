@@ -1648,6 +1648,16 @@ impl SmbClient {
         .map(|(done, _)| done)
     }
 
+    /// Delete a junction, symlink, or other link on the given share, leaving
+    /// what it points to alone. See [`Tree::delete_link`].
+    pub async fn delete_link(&mut self, tree: &Tree, path: &str) -> Result<()> {
+        self.beside_tree(tree, path, |mut conn, tree, path| async move {
+            tree.delete_link(&mut conn, &path).await
+        })
+        .await
+        .map(|(done, _)| done)
+    }
+
     /// Delete multiple files on the given share.
     ///
     /// Returns results in the same order as the input paths.

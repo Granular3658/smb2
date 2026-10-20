@@ -138,6 +138,10 @@ pub(super) const FILE_BASIC_INFORMATION: u8 = 4;
 /// FileStandardInformation class for QUERY_INFO (MS-FSCC 2.4.41).
 pub(super) const FILE_STANDARD_INFORMATION: u8 = 5;
 
+/// FileAttributeTagInformation class for QUERY_INFO (MS-FSCC 2.4.6): the
+/// attributes and the reparse tag.
+const FILE_ATTRIBUTE_TAG_INFORMATION: u8 = 35;
+
 /// FileRenameInformation class for SET_INFO (MS-FSCC 2.4.34.2).
 const FILE_RENAME_INFORMATION: u8 = 10;
 
@@ -1045,15 +1049,51 @@ impl Tree {
     /// failed. When another client genuinely has the file open, the server
     /// refuses the exclusive open, and the delete goes ahead sharing
     /// everything: the file is gone for good once that client closes it.
+    ///
+    /// A symlink to a file is deleted itself, never its target (see
+    /// [`delete_link`](Self::delete_link)).
     pub async fn delete_file(&self, conn: &mut Connection, path: &str) -> Result<()> {
+        self.delete_exclusive_first(conn, path, FILE_NON_DIRECTORY_FILE, "file")
+            .await
+    }
+
+    /// Delete a junction, symlink, or other link, leaving what it points to
+    /// alone. One round trip, like [`delete_file`](Self::delete_file).
+    ///
+    /// Use it for an entry whose [`is_link`](DirectoryEntry::is_link) is set.
+    /// A link isn't the same kind of entry everywhere: a junction or
+    /// `mklink /D` symlink is a directory on Windows, while Samba reports a
+    /// symlink as a file whichever way it points, so `delete_directory`
+    /// refuses one there with `STATUS_NOT_A_DIRECTORY` (verified on Samba
+    /// 4.23.10, 2026-10-20). This opens the reparse point itself
+    /// (`FILE_OPEN_REPARSE_POINT`, MS-SMB2 § 2.2.13) with no file-or-directory
+    /// condition, so it deletes the link whichever the server says it is.
+    ///
+    /// On a path that isn't a link it deletes a file, or a directory only if
+    /// it's empty (`STATUS_DIRECTORY_NOT_EMPTY` otherwise), so a stale
+    /// `is_link` can't take a folder's contents with it.
+    pub async fn delete_link(&self, conn: &mut Connection, path: &str) -> Result<()> {
+        self.delete_exclusive_first(conn, path, 0, "link").await
+    }
+
+    /// [`delete_compound`](Self::delete_compound) sharing only delete access,
+    /// then sharing everything if another open refuses that (see
+    /// [`delete_file`](Self::delete_file) for why).
+    async fn delete_exclusive_first(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        type_option: u32,
+        kind: &str,
+    ) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
         let exclusive = self
             .delete_compound(
                 conn,
                 path,
-                FILE_NON_DIRECTORY_FILE,
+                type_option,
                 ShareAccess(ShareAccess::FILE_SHARE_DELETE),
-                "file",
+                kind,
             )
             .await;
         match exclusive {
@@ -1072,7 +1112,7 @@ impl Tree {
                     e.status(),
                     path
                 );
-                self.delete_compound(conn, path, FILE_NON_DIRECTORY_FILE, SHARE_ALL, "file")
+                self.delete_compound(conn, path, type_option, SHARE_ALL, kind)
                     .await
             }
             other => other,
@@ -1166,7 +1206,10 @@ impl Tree {
             file_attributes: 0,
             share_access: SHARE_ALL,
             create_disposition: CreateDisposition::FileOpen,
-            create_options: 0,
+            // Describe the link itself, the way its listing entry does. A
+            // junction opened without it is its target, and a symlink is
+            // refused with STATUS_STOPPED_ON_SYMLINK (MS-SMB2 § 3.3.5.9).
+            create_options: FILE_OPEN_REPARSE_POINT,
             name: normalized,
             create_contexts: vec![],
         };
@@ -1196,6 +1239,18 @@ impl Tree {
         let index_req = FileIdentity::index_query();
         let volume_req = FileIdentity::volume_query();
 
+        // QUERY_INFO for FileAttributeTagInformation (which kind of reparse
+        // point, if any).
+        let tag_req = QueryInfoRequest {
+            info_type: InfoType::File,
+            file_info_class: FILE_ATTRIBUTE_TAG_INFORMATION,
+            output_buffer_length: 8,
+            additional_information: 0,
+            flags: 0,
+            file_id: FileId::SENTINEL,
+            input_buffer: vec![],
+        };
+
         // CLOSE with sentinel FileId.
         let close_req = CloseRequest {
             flags: 0,
@@ -1208,9 +1263,11 @@ impl Tree {
             tree_id: Some(self.tree_id),
             credit_charge: CreditCharge(1),
         };
-        // The optional identity queries go after the required ones (AGENTS.md
-        // pitfall 31): a server that fails every related op after a failed
-        // one (MS-SMB2 § 3.3.5.2.7.2) can then only take the CLOSE with them.
+        // The optional queries go after the required ones (AGENTS.md pitfall
+        // 31): a server that fails every related op after a failed one
+        // (MS-SMB2 § 3.3.5.2.7.2) can then only take the CLOSE with them. The
+        // tag goes last, so a server refusing it can't cost the identity a
+        // caller asked for by name.
         let mut ops = vec![
             op(Command::Create, &create_req),
             op(Command::QueryInfo, &basic_req),
@@ -1220,6 +1277,7 @@ impl Tree {
             ops.push(op(Command::QueryInfo, &index_req));
             ops.push(op(Command::QueryInfo, &volume_req));
         }
+        ops.push(op(Command::QueryInfo, &tag_req));
         ops.push(op(Command::Close, &close_req));
 
         let responses = all_or_first_err(conn.execute_compound(&ops).await?, ops.len())?;
@@ -1265,7 +1323,8 @@ impl Tree {
             }
         }
 
-        let info = file_info_from(&basic.body, &std.body)?;
+        let mut info = file_info_from(&basic.body, &std.body)?;
+        info.reparse_tag = reparse_tag_from(&responses[responses.len() - 2]);
         let identity = if with_identity {
             FileIdentity::from_frames(Some(&responses[3]), Some(&responses[4]))
                 .filter(FileIdentity::is_proof)
@@ -2515,6 +2574,10 @@ impl Tree {
     ///
     /// Sends CREATE (with `DELETE_ON_CLOSE`) + CLOSE as a single compound
     /// message. The directory must be empty.
+    ///
+    /// A junction or directory symlink is deleted itself, never its target
+    /// (see [`delete_link`](Self::delete_link), which also covers a server
+    /// that reports a link as a file).
     pub async fn delete_directory(&self, conn: &mut Connection, path: &str) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
         self.delete_compound(conn, path, FILE_DIRECTORY_FILE, SHARE_ALL, "directory")
@@ -2527,7 +2590,7 @@ impl Tree {
     /// single round-trip.
     ///
     /// `type_option` selects file vs directory (`FILE_NON_DIRECTORY_FILE`
-    /// or `FILE_DIRECTORY_FILE`), and `share_access` is what the CREATE lets
+    /// or `FILE_DIRECTORY_FILE`, or 0 for either), and `share_access` is what the CREATE lets
     /// other opens keep (see `delete_file`). `kind` is used only for log
     /// messages.
     ///
@@ -3498,6 +3561,20 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
     })
 }
 
+/// The tag a `FileAttributeTagInformation` answer carries, `None` when the
+/// server refused it or the file isn't a reparse point. The tag counts only
+/// beside the answer's own REPARSE_POINT bit (MS-FSCC § 2.4.6).
+fn reparse_tag_from(frame: &Frame) -> Option<ReparseTag> {
+    if frame.header.status != NtStatus::SUCCESS {
+        return None;
+    }
+    let resp = QueryInfoResponse::unpack(&mut ReadCursor::new(&frame.body)).ok()?;
+    let buf = resp.output_buffer.get(..8)?;
+    let attributes = FileAttributes::new(u32::from_le_bytes(buf[0..4].try_into().unwrap()));
+    let tag = u32::from_le_bytes(buf[4..8].try_into().unwrap());
+    attributes.is_reparse_point().then_some(ReparseTag(tag))
+}
+
 /// The [`FileInfo`] a CREATE response already answers: every open reports the
 /// file's size, attributes, and times, so a read that opened the file needs no
 /// `stat` to know them.
@@ -4284,6 +4361,55 @@ mod tests {
         );
     }
 
+    /// A link is a directory on Windows (a junction, `mklink /D`) and a file on
+    /// Samba, so `delete_link` names neither: only the reparse point itself.
+    #[tokio::test]
+    async fn delete_link_opens_the_reparse_point_whatever_its_type() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            build_set_info_response(),
+            build_close_response(),
+        ]));
+        let mut conn = setup_connection(&mock);
+        stat_tree()
+            .delete_link(&mut conn, "junction")
+            .await
+            .unwrap();
+
+        let create = sent_create(&mock, 0);
+        assert_eq!(create.create_options, FILE_OPEN_REPARSE_POINT);
+        assert!(create.desired_access.contains(FileAccessMask::DELETE));
+        assert_eq!(
+            sent_compound(&mock, 0),
+            vec![
+                (Command::Create, None),
+                (Command::SetInfo, None),
+                (Command::Close, None)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_link_refused_exclusively_retries_shared() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(failed_delete_compound(NtStatus::SHARING_VIOLATION));
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            build_set_info_response(),
+            build_close_response(),
+        ]));
+        let mut conn = setup_connection(&mock);
+        stat_tree().delete_link(&mut conn, "link").await.unwrap();
+
+        assert_eq!(mock.sent_count(), 2);
+        assert_eq!(sent_create(&mock, 1).share_access, SHARE_ALL);
+        assert_eq!(
+            sent_create(&mock, 1).create_options,
+            FILE_OPEN_REPARSE_POINT
+        );
+    }
+
     /// A compound response whose CREATE failed with `status`, every later op
     /// cascading the same status.
     fn failed_delete_compound(status: NtStatus) -> Vec<u8> {
@@ -4531,7 +4657,13 @@ mod tests {
         let std_resp = build_query_info_response(std_info);
         let close_resp = build_close_response();
 
-        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            basic_resp,
+            std_resp,
+            no_tag(),
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -4593,7 +4725,13 @@ mod tests {
         close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
         let close_resp = pack_message(&close_hdr, &err_body);
 
-        let frame = build_compound_response_frame(&[create_resp, q1_resp, q2_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            q1_resp,
+            q2_resp.clone(),
+            q2_resp,
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);
@@ -4650,7 +4788,13 @@ mod tests {
         close_hdr.status = NtStatus::UNSUCCESSFUL;
         let close_resp = pack_message(&close_hdr, &err_body);
 
-        let frame = build_compound_response_frame(&[create_resp, q1_resp, q2_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            q1_resp,
+            q2_resp.clone(),
+            q2_resp,
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         // Queue response for the standalone CLOSE retry.
@@ -4733,16 +4877,31 @@ mod tests {
         build_query_info_response(out)
     }
 
+    /// `FileAttributeTagInformation` (MS-FSCC § 2.4.6): attributes, then
+    /// the tag.
+    fn tag_answer(attributes: u32, tag: u32) -> Vec<u8> {
+        let mut out = attributes.to_le_bytes().to_vec();
+        out.extend_from_slice(&tag.to_le_bytes());
+        build_query_info_response(out)
+    }
+
+    /// The tag answer for a file that isn't a reparse point.
+    fn no_tag() -> Vec<u8> {
+        tag_answer(FileAttributes::ARCHIVE, 0)
+    }
+
+    const TAG: Option<(InfoType, u8)> = Some((InfoType::File, FILE_ATTRIBUTE_TAG_INFORMATION));
     const BASIC: Option<(InfoType, u8)> = Some((InfoType::File, FILE_BASIC_INFORMATION));
     const STANDARD: Option<(InfoType, u8)> = Some((InfoType::File, FILE_STANDARD_INFORMATION));
 
     #[tokio::test]
-    async fn plain_stat_stays_four_ops_with_no_identity_query() {
+    async fn plain_stat_asks_for_the_tag_and_no_identity() {
         let mock = Arc::new(MockTransport::new());
         mock.queue_response(build_compound_response_frame(&[
             build_create_response(STAT_FILE, 0),
             stat_basic(),
             stat_standard(),
+            no_tag(),
             build_close_response(),
         ]));
         let mut conn = setup_connection(&mock);
@@ -4754,6 +4913,7 @@ mod tests {
                 (Command::Create, None),
                 (Command::QueryInfo, BASIC),
                 (Command::QueryInfo, STANDARD),
+                (Command::QueryInfo, TAG),
                 (Command::Close, None),
             ]
         );
@@ -4769,6 +4929,7 @@ mod tests {
             stat_standard(),
             index_answer(0x77),
             volume_answer(0xBEEF),
+            no_tag(),
             build_close_response(),
         ]));
         let mut conn = setup_connection(&mock);
@@ -4795,6 +4956,7 @@ mod tests {
                 (Command::QueryInfo, STANDARD),
                 (Command::QueryInfo, Some((InfoType::File, 6))),
                 (Command::QueryInfo, Some((InfoType::Filesystem, 1))),
+                (Command::QueryInfo, TAG),
                 (Command::Close, None),
             ]
         );
@@ -4810,6 +4972,7 @@ mod tests {
             build_create_response(STAT_FILE, 0),
             stat_basic(),
             stat_standard(),
+            build_query_info_error_response(NtStatus::NOT_SUPPORTED),
             build_query_info_error_response(NtStatus::NOT_SUPPORTED),
             build_query_info_error_response(NtStatus::NOT_SUPPORTED),
             build_close_error_response(NtStatus::NOT_SUPPORTED),
@@ -4839,6 +5002,7 @@ mod tests {
                 stat_standard(),
                 index_answer(index),
                 volume_answer(serial),
+                no_tag(),
                 build_close_response(),
             ]));
             let mut conn = setup_connection(&mock);
@@ -4848,6 +5012,63 @@ mod tests {
                 .unwrap();
             assert_eq!(identity, None, "index {index:#x}, serial {serial:#x}");
         }
+    }
+
+    /// A stat describes the link itself (MS-SMB2 § 2.2.13), as its listing
+    /// entry does, and says which kind of reparse point it is.
+    #[tokio::test]
+    async fn stat_of_a_junction_describes_the_junction_and_carries_its_tag() {
+        let junction = FileAttributes::DIRECTORY | FileAttributes::REPARSE_POINT;
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            build_query_info_response(build_file_basic_info(1, 2, 3, 4, junction)),
+            build_query_info_response(build_file_standard_info(0, 0, 1, false, true)),
+            tag_answer(junction, 0xA000_0003),
+            build_close_response(),
+        ]));
+        let mut conn = setup_connection(&mock);
+        let info = stat_tree().stat(&mut conn, "junction").await.unwrap();
+
+        assert_eq!(info.reparse_tag, Some(ReparseTag::MOUNT_POINT));
+        assert!(info.is_directory && info.is_link());
+        let options = sent_create(&mock, 0).create_options;
+        assert_ne!(options & FILE_OPEN_REPARSE_POINT, 0, "{options:#x}");
+    }
+
+    #[tokio::test]
+    async fn stat_of_an_ordinary_file_has_no_tag() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            stat_basic(),
+            stat_standard(),
+            // A tag with no reparse bit beside it MUST be ignored (§ 2.4.6).
+            tag_answer(FileAttributes::ARCHIVE, 0xA000_0003),
+            build_close_response(),
+        ]));
+        let mut conn = setup_connection(&mock);
+        let info = stat_tree().stat(&mut conn, "doc.txt").await.unwrap();
+        assert_eq!(info.reparse_tag, None);
+        assert!(!info.is_link());
+    }
+
+    #[tokio::test]
+    async fn a_refused_tag_query_still_stats_and_closes_the_handle() {
+        let mock = Arc::new(MockTransport::new());
+        mock.queue_response(build_compound_response_frame(&[
+            build_create_response(STAT_FILE, 0),
+            stat_basic(),
+            stat_standard(),
+            build_query_info_error_response(NtStatus::INVALID_INFO_CLASS),
+            build_close_error_response(NtStatus::INVALID_INFO_CLASS),
+        ]));
+        mock.queue_response(build_close_response());
+        let mut conn = setup_connection(&mock);
+        let info = stat_tree().stat(&mut conn, "doc.txt").await.unwrap();
+
+        assert_eq!((info.size, info.reparse_tag), (2048, None));
+        assert_eq!(mock.sent_count(), 2, "compound + standalone CLOSE");
     }
 
     // ── Batch stat tests ──────────────────────────────────────────────
@@ -4878,6 +5099,7 @@ mod tests {
                 create_resp,
                 basic_resp,
                 std_resp,
+                no_tag(),
                 close_resp,
             ]));
         }
@@ -4934,6 +5156,7 @@ mod tests {
             create_resp,
             basic_resp,
             std_resp,
+            no_tag(),
             close_resp,
         ]));
 
@@ -4962,7 +5185,11 @@ mod tests {
         close_hdr.status = NtStatus::OBJECT_NAME_NOT_FOUND;
         let close_err = pack_message(&close_hdr, &err_body);
         mock.queue_response(build_compound_response_frame(&[
-            create_err, q1_err, q2_err, close_err,
+            create_err,
+            q1_err,
+            q2_err.clone(),
+            q2_err,
+            close_err,
         ]));
 
         let mut conn = setup_connection(&mock);
@@ -7641,7 +7868,13 @@ mod tests {
 
         let close_resp = build_close_response();
 
-        let frame = build_compound_response_frame(&[create_resp, basic_resp, std_resp, close_resp]);
+        let frame = build_compound_response_frame(&[
+            create_resp,
+            basic_resp,
+            std_resp,
+            no_tag(),
+            close_resp,
+        ]);
         mock.queue_response(frame);
 
         let mut conn = setup_connection(&mock);

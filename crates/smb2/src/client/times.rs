@@ -46,7 +46,7 @@
 use log::{debug, trace, warn};
 
 use crate::client::connection::{CompoundOp, Connection};
-use crate::client::tree::{all_or_first_err, FILE_BASIC_INFORMATION};
+use crate::client::tree::{all_or_first_err, FILE_BASIC_INFORMATION, FILE_OPEN_REPARSE_POINT};
 use crate::error::Result;
 use crate::msg::close::CloseRequest;
 use crate::msg::create::{
@@ -244,8 +244,9 @@ impl Tree {
 
         // Attribute-write access is all FileBasicInformation needs (MS-FSCC
         // § 2.4.7), and sharing everything keeps the open from tripping over a
-        // reader or writer that holds the file. No create options, so a
-        // directory opens as well as a file.
+        // reader or writer that holds the file. No file-or-directory option,
+        // so a directory opens as well as a file, and a link opens itself:
+        // setting a junction's times or attributes must not touch its target.
         let create_req = CreateRequest {
             requested_oplock_level: OplockLevel::None,
             impersonation_level: ImpersonationLevel::Impersonation,
@@ -259,7 +260,7 @@ impl Tree {
                     | ShareAccess::FILE_SHARE_DELETE,
             ),
             create_disposition: CreateDisposition::FileOpen,
-            create_options: 0,
+            create_options: FILE_OPEN_REPARSE_POINT,
             name: normalized.clone(),
             create_contexts: vec![],
         };
@@ -567,7 +568,8 @@ mod tests {
             .desired_access
             .contains(FileAccessMask::FILE_WRITE_DATA));
         assert_eq!(create.create_disposition, CreateDisposition::FileOpen);
-        assert_eq!(create.create_options, 0, "files and directories alike");
+        // Files and directories alike, and a link itself, never its target.
+        assert_eq!(create.create_options, FILE_OPEN_REPARSE_POINT);
 
         let set = SetInfoRequest::unpack(&mut ReadCursor::new(&subs[1].1)).unwrap();
         assert_eq!(set.info_type, InfoType::File);
