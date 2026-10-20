@@ -4,6 +4,7 @@
 //! used types are re-exported at the crate root.
 
 pub mod flags;
+pub mod reparse;
 pub mod status;
 
 use std::fmt;

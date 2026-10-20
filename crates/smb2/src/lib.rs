@@ -126,6 +126,9 @@ pub use client::tree::{
 pub use client::times::FileTimes;
 pub use types::flags::FileAttributes;
 
+// What kind of reparse point (junction, symlink, cloud placeholder) an entry is.
+pub use types::reparse::ReparseTag;
+
 // What a path resolved to on the server (`Tree::resolve`), and which file it is.
 pub use client::durable::FileIdentity;
 pub use client::resolve::Resolved;

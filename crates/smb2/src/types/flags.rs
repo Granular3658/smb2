@@ -398,6 +398,13 @@ impl FileAttributes {
     pub const fn is_directory(&self) -> bool {
         self.contains(Self::DIRECTORY)
     }
+
+    /// A reparse point: a junction, a symlink, or a file a storage filter
+    /// manages. Its [`ReparseTag`](crate::ReparseTag) says which.
+    #[inline]
+    pub const fn is_reparse_point(&self) -> bool {
+        self.contains(Self::REPARSE_POINT)
+    }
 }
 
 impl_flags!(FileAttributes, u32);

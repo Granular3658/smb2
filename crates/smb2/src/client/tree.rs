@@ -35,6 +35,7 @@ use crate::msg::write::{WriteRequest, WriteResponse};
 use crate::pack::{FileTime, ReadCursor, Unpack};
 use crate::rt;
 use crate::types::flags::{FileAccessMask, FileAttributes};
+use crate::types::reparse::ReparseTag;
 use crate::types::status::NtStatus;
 #[cfg(test)]
 use crate::types::MessageId;
@@ -120,6 +121,12 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// Create option: the target must not be a directory.
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 
+/// Create option: open a reparse point itself, not what it points to
+/// (MS-SMB2 § 2.2.13). Without it, the server opens a junction's target and
+/// refuses a symlink with `STATUS_STOPPED_ON_SYMLINK` (§ 3.3.5.9). On anything
+/// that isn't a reparse point it changes nothing.
+pub(super) const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
 /// Share mode that lets every other open keep reading, writing, and deleting.
 const SHARE_ALL: ShareAccess = ShareAccess(
     ShareAccess::FILE_SHARE_READ | ShareAccess::FILE_SHARE_WRITE | ShareAccess::FILE_SHARE_DELETE,
@@ -182,6 +189,26 @@ pub struct DirectoryEntry {
     /// within one volume; a listing doesn't say which volume, so it isn't a
     /// whole `FileIdentity` on its own.
     pub index_number: Option<u64>,
+    /// What kind of reparse point the entry is, `Some` exactly when
+    /// `attributes` has [`REPARSE_POINT`](FileAttributes::REPARSE_POINT)
+    /// (both listing classes carry the tag then, MS-FSCC § 2.4.8 and
+    /// § 2.4.17).
+    ///
+    /// A junction or a directory symlink still lists with `is_directory`
+    /// set, so check [`is_link`](Self::is_link) before descending into one: a
+    /// recursive delete that walks into a junction deletes its target's
+    /// files.
+    pub reparse_tag: Option<ReparseTag>,
+}
+
+impl DirectoryEntry {
+    /// The entry is a link to another place (a junction, a symlink, or any
+    /// other name surrogate, [`ReparseTag::is_name_surrogate`]). A walk
+    /// should list it and not descend into it; deleting it removes the link
+    /// and leaves its target alone.
+    pub fn is_link(&self) -> bool {
+        self.reparse_tag.is_some_and(ReparseTag::is_name_surrogate)
+    }
 }
 
 /// One QUERY_DIRECTORY round trip within a directory listing, captured by
@@ -280,6 +307,23 @@ pub struct FileInfo {
     pub changed: FileTime,
     /// The file's attributes: Hidden, Read-only, Directory, and the rest.
     pub attributes: FileAttributes,
+    /// What kind of reparse point the file is, when `attributes` has
+    /// [`REPARSE_POINT`](FileAttributes::REPARSE_POINT) and the call asked
+    /// (`FileAttributeTagInformation`, MS-FSCC § 2.4.6). [`Tree::stat`] and
+    /// its siblings ask; the metadata an open hands back
+    /// ([`Tree::read_file_compound_with_info`], the streaming handles)
+    /// doesn't carry it, so it's `None` there.
+    pub reparse_tag: Option<ReparseTag>,
+}
+
+impl FileInfo {
+    /// The file is a link to another place (a junction, a symlink, or any
+    /// other name surrogate, [`ReparseTag::is_name_surrogate`]). Only as good
+    /// as [`reparse_tag`](Self::reparse_tag): `false` when the call didn't
+    /// ask.
+    pub fn is_link(&self) -> bool {
+        self.reparse_tag.is_some_and(ReparseTag::is_name_surrogate)
+    }
 }
 
 /// File system space information for a share.
@@ -1480,7 +1524,9 @@ impl Tree {
                     | ShareAccess::FILE_SHARE_DELETE,
             ),
             create_disposition: CreateDisposition::FileOpen,
-            create_options: 0,
+            // Rename the link, not its target: a junction opened without it
+            // is its target directory, which the rename would move.
+            create_options: FILE_OPEN_REPARSE_POINT,
             name: from_normalized.clone(),
             create_contexts: vec![],
         };
@@ -2513,7 +2559,9 @@ impl Tree {
             file_attributes: 0,
             share_access,
             create_disposition: CreateDisposition::FileOpen,
-            create_options: type_option,
+            // The link itself, never its target: a junction opened without
+            // it is its target directory, which the delete would remove.
+            create_options: type_option | FILE_OPEN_REPARSE_POINT,
             name: normalized.clone(),
             create_contexts: vec![],
         };
@@ -3446,6 +3494,7 @@ pub(super) fn file_info_from(basic_body: &[u8], std_body: &[u8]) -> Result<FileI
         accessed,
         changed,
         attributes,
+        reparse_tag: None,
     })
 }
 
@@ -3462,6 +3511,7 @@ pub(crate) fn file_info_from_create(resp: &CreateResponse) -> FileInfo {
         accessed: resp.last_access_time,
         changed: resp.change_time,
         attributes,
+        reparse_tag: None,
     }
 }
 
@@ -3490,6 +3540,11 @@ pub(crate) fn parse_directory_entries(
                 // 0 is "this file system has none" (MS-FSCC § 2.4.22), and
                 // what a server MAY send for `..`.
                 index_number: entry.file_id.filter(|&id| id != 0),
+                // EaSize carries the tag when the reparse bit is set
+                // (MS-FSCC § 2.4.8), and the EAs' size otherwise.
+                reparse_tag: attributes
+                    .is_reparse_point()
+                    .then_some(ReparseTag(entry.ea_size)),
             }
         })
         .collect())
@@ -3870,6 +3925,68 @@ mod tests {
         assert_eq!(entries[0].name, "a?b");
     }
 
+    /// One listed entry with `attributes` and `ea_size` in the slot MS-FSCC
+    /// § 2.4.8 says carries the reparse tag when REPARSE_POINT is set.
+    fn listed_with(class: FileInformationClass, attributes: u32, ea_size: u32) -> DirectoryEntry {
+        let data = directory_info::pack_entries(
+            class,
+            &[directory_info::DirectoryInfoEntry {
+                file_attributes: attributes,
+                ea_size,
+                file_name: "entry".to_string(),
+                ..Default::default()
+            }],
+        )
+        .unwrap();
+        parse_directory_entries(class, &data).unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn a_listed_junction_carries_the_mount_point_tag_in_both_classes() {
+        for class in [
+            FileInformationClass::FileBothDirectoryInformation,
+            FileInformationClass::FileIdBothDirectoryInformation,
+        ] {
+            let entry = listed_with(
+                class,
+                FileAttributes::DIRECTORY | FileAttributes::REPARSE_POINT,
+                0xA000_0003,
+            );
+            assert_eq!(
+                entry.reparse_tag,
+                Some(ReparseTag::MOUNT_POINT),
+                "{class:?}"
+            );
+            // Still a directory by its attributes, but not one to walk into.
+            assert!(entry.is_directory);
+            assert!(entry.is_link());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_listed_cloud_placeholder_carries_its_tag_and_is_not_a_link() {
+        let entry = listed_with(
+            FileInformationClass::FileBothDirectoryInformation,
+            FileAttributes::ARCHIVE | FileAttributes::REPARSE_POINT,
+            0x9000_101A,
+        );
+        assert_eq!(entry.reparse_tag, Some(ReparseTag(0x9000_101A)));
+        assert!(entry.reparse_tag.unwrap().is_cloud());
+        assert!(!entry.is_link());
+    }
+
+    #[tokio::test]
+    async fn an_entry_without_the_reparse_bit_has_no_tag_whatever_its_ea_size() {
+        // EaSize is the extended attributes' size then, not a tag.
+        let entry = listed_with(
+            FileInformationClass::FileBothDirectoryInformation,
+            FileAttributes::DIRECTORY,
+            0xA000_0003,
+        );
+        assert_eq!(entry.reparse_tag, None);
+        assert!(!entry.is_link());
+    }
+
     #[tokio::test]
     async fn format_path_prepends_dfs_prefix() {
         let tree = Tree {
@@ -4114,6 +4231,56 @@ mod tests {
         assert_eq!(
             req.share_access,
             ShareAccess(ShareAccess::FILE_SHARE_DELETE)
+        );
+    }
+
+    /// The CREATE that opens a compound `mock` was sent at `index`.
+    fn sent_create(mock: &MockTransport, index: usize) -> CreateRequest {
+        let sent = mock.sent_message(index).unwrap();
+        let mut cursor = ReadCursor::new(&sent);
+        let _header = Header::unpack(&mut cursor).unwrap();
+        CreateRequest::unpack(&mut cursor).unwrap()
+    }
+
+    /// Deleting or renaming a junction or symlink acts on the link, never on
+    /// what it points to (MS-SMB2 § 2.2.13 `FILE_OPEN_REPARSE_POINT`): without
+    /// the flag the server opens a junction's target, so a delete removed the
+    /// target directory and a rename moved it.
+    #[tokio::test]
+    async fn delete_and_rename_open_the_reparse_point_itself() {
+        let tree = stat_tree();
+        let ok_compound = || {
+            build_compound_response_frame(&[
+                build_create_response(STAT_FILE, 0),
+                build_set_info_response(),
+                build_close_response(),
+            ])
+        };
+        let mock = Arc::new(MockTransport::new());
+        for _ in 0..3 {
+            mock.queue_response(ok_compound());
+        }
+        let mut conn = setup_connection(&mock);
+
+        tree.delete_file(&mut conn, "link.txt").await.unwrap();
+        tree.delete_directory(&mut conn, "junction").await.unwrap();
+        tree.rename(&mut conn, "junction", "renamed").await.unwrap();
+
+        for (index, what) in ["delete_file", "delete_directory", "rename"]
+            .into_iter()
+            .enumerate()
+        {
+            let options = sent_create(&mock, index).create_options;
+            assert_ne!(options & FILE_OPEN_REPARSE_POINT, 0, "{what}: {options:#x}");
+        }
+        // The type check stays: a directory delete still refuses a file.
+        assert_ne!(
+            sent_create(&mock, 0).create_options & FILE_NON_DIRECTORY_FILE,
+            0
+        );
+        assert_ne!(
+            sent_create(&mock, 1).create_options & FILE_DIRECTORY_FILE,
+            0
         );
     }
 

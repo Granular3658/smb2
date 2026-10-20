@@ -71,6 +71,11 @@ nt_status_codes! {
     /// No more files were found which match the file specification.
     NO_MORE_FILES = 0x8000_0006, "STATUS_NO_MORE_FILES";
 
+    /// An open reached a symbolic link, which the server doesn't follow
+    /// (MS-SMB2 § 2.2.2.2.1, § 3.3.5.9). The error data carries the link's
+    /// target; opening with `FILE_OPEN_REPARSE_POINT` opens the link itself.
+    STOPPED_ON_SYMLINK = 0x8000_002D, "STATUS_STOPPED_ON_SYMLINK";
+
     // -- Errors (severity 0b11) --
 
     /// The requested operation was unsuccessful.
