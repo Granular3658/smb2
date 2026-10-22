@@ -53,6 +53,8 @@ pub enum Job {
 #[derive(Debug)]
 pub enum Outcome {
     Done,
+    /// A `mkdir -p` found the directory already there, so it had nothing to do.
+    AlreadyThere,
     Stat(FileInfo),
     Failed(String),
 }
@@ -190,7 +192,7 @@ async fn create_directory(
             // that has already failed once, so the batch pays nothing for it.
             let occupant = remote::kind(client, tree, path).await.ok();
             match resolve_collision(occupant, parents) {
-                Ok(()) => Outcome::Done,
+                Ok(()) => Outcome::AlreadyThere,
                 Err(message) => Outcome::Failed(message),
             }
         }

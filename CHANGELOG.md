@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`smb2 mkdir -p` counts only the directories it created** (smb2-cli 0.4.26). Every directory that was already there counted as created, so a second run said "Created 4 of 4 paths." It now says "Created 1 of 4 paths; 3 already existed.", or "Nothing to create: all 4 paths already existed." when there was nothing to do.
+
 ## [0.34.0] - 2026-10-20
 
 ### Breaking

@@ -10,17 +10,34 @@ use crate::target::Target;
 /// How a batch of jobs finished, so every command reports the same way.
 struct Report {
     total: usize,
+    /// Paths that needed nothing done (a `mkdir -p` over an existing
+    /// directory). They succeeded, but counting them as created would claim
+    /// work that never happened.
+    already_there: usize,
     failed: Vec<(String, String)>,
 }
 
 impl Report {
+    fn summary(&self, verb: &str) -> String {
+        let total = self.total;
+        let already_there = self.already_there;
+        let changed = total - self.failed.len() - already_there;
+        if already_there == 0 {
+            format!("{verb} {changed} of {total} paths.")
+        } else if already_there == total {
+            format!("Nothing to create: all {total} paths already existed.")
+        } else {
+            format!("{verb} {changed} of {total} paths; {already_there} already existed.")
+        }
+    }
+
     fn print(&self, verb: &str, dry_run: bool) -> Result<()> {
-        let succeeded = self.total - self.failed.len();
         if dry_run {
+            let succeeded = self.total - self.failed.len();
             println!("Would have {verb} {succeeded} of {} paths.", self.total);
             return Ok(());
         }
-        println!("{verb} {succeeded} of {} paths.", self.total);
+        println!("{}", self.summary(verb));
         if !self.failed.is_empty() {
             eprintln!("\n{} failed:", self.failed.len());
             for (path, message) in self.failed.iter().take(50) {
@@ -51,15 +68,20 @@ async fn run_jobs(
     })
     .await?;
 
-    let failed = paths
-        .into_iter()
-        .zip(outcomes)
-        .filter_map(|(path, outcome)| match outcome {
-            Outcome::Failed(message) => Some((path, message)),
-            _ => None,
-        })
-        .collect();
-    Ok(Report { total, failed })
+    let mut already_there = 0;
+    let mut failed = Vec::new();
+    for (path, outcome) in paths.into_iter().zip(outcomes) {
+        match outcome {
+            Outcome::Failed(message) => failed.push((path, message)),
+            Outcome::AlreadyThere => already_there += 1,
+            Outcome::Done | Outcome::Stat(_) => {}
+        }
+    }
+    Ok(Report {
+        total,
+        already_there,
+        failed,
+    })
 }
 
 pub async fn mkdir(
@@ -82,6 +104,7 @@ pub async fn mkdir(
         }
         return Report {
             total: paths.len(),
+            already_there: 0,
             failed: vec![],
         }
         .print("created", true);
@@ -140,6 +163,7 @@ pub async fn rm(
         }
         return Report {
             total: paths.len(),
+            already_there: 0,
             failed: vec![],
         }
         .print("deleted", true);
@@ -164,6 +188,7 @@ pub async fn rmdir(
         }
         return Report {
             total: paths.len(),
+            already_there: 0,
             failed: vec![],
         }
         .print("removed", true);
@@ -219,6 +244,7 @@ pub async fn mv(
         }
         return Report {
             total: pairs.len(),
+            already_there: 0,
             failed: vec![],
         }
         .print("moved", true);
@@ -243,5 +269,36 @@ mod tests {
         let expanded =
             with_ancestors(&["2026/2026-08-05".to_string(), "2026/2026-08-06".to_string()]);
         assert_eq!(expanded, vec!["2026", "2026/2026-08-05", "2026/2026-08-06"]);
+    }
+
+    fn report(total: usize, already_there: usize, failed: usize) -> Report {
+        Report {
+            total,
+            already_there,
+            failed: (0..failed)
+                .map(|index| (format!("path-{index}"), "no".to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn summary_counts_only_what_was_created() {
+        assert_eq!(report(4, 0, 0).summary("Created"), "Created 4 of 4 paths.");
+        assert_eq!(
+            report(4, 3, 0).summary("Created"),
+            "Created 1 of 4 paths; 3 already existed."
+        );
+        assert_eq!(
+            report(4, 2, 1).summary("Created"),
+            "Created 1 of 4 paths; 2 already existed."
+        );
+    }
+
+    #[test]
+    fn summary_says_so_when_everything_was_already_there() {
+        assert_eq!(
+            report(4, 4, 0).summary("Created"),
+            "Nothing to create: all 4 paths already existed."
+        );
     }
 }

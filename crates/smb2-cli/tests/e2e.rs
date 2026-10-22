@@ -601,13 +601,24 @@ fn put_streams_a_file_larger_than_one_write() {
 #[ignore = "needs the smb-auth container"]
 fn mkdir_p_is_idempotent_and_creates_nested_directories() {
     let share = Fixture::new("mkdir-p");
-    ok(&["mkdir", "-p", &share.target("2026/2026-08-28")]);
+    // `-p` walks every ancestor, so the fixture's own `cli-e2e/mkdir-p/` counts
+    // as two paths that were already there.
+    let stdout = ok(&["mkdir", "-p", &share.target("2026/2026-08-28")]);
+    assert_eq!(stdout.trim(), "Created 2 of 4 paths; 2 already existed.");
     assert_eq!(share.kind("2026"), Kind::Directory);
     assert_eq!(share.kind("2026/2026-08-28"), Kind::Directory);
 
-    // Running it again has to be a clean no-op, which is the whole point of -p.
-    ok(&["mkdir", "-p", &share.target("2026/2026-08-28")]);
+    // Running it again has to be a clean no-op, which is the whole point of -p,
+    // and it has to say so rather than claim it created what was already there.
+    let stdout = ok(&["mkdir", "-p", &share.target("2026/2026-08-28")]);
+    assert_eq!(
+        stdout.trim(),
+        "Nothing to create: all 4 paths already existed."
+    );
     assert_eq!(share.kind("2026/2026-08-28"), Kind::Directory);
+
+    let stdout = ok(&["mkdir", "-p", &share.target("2026/2026-08-29")]);
+    assert_eq!(stdout.trim(), "Created 1 of 4 paths; 3 already existed.");
 }
 
 /// Reporting success over a file is what once hid a wrong path until a much
