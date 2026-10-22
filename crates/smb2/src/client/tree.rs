@@ -148,6 +148,11 @@ const FILE_RENAME_INFORMATION: u8 = 10;
 /// FileDispositionInformation class for SET_INFO (MS-FSCC 2.4.11).
 const FILE_DISPOSITION_INFORMATION: u8 = 13;
 
+/// How long a delete whose CLOSE came back `STATUS_UNSUCCESSFUL` waits before
+/// its one retry: room for the delete that won QNAP's recycle-folder race to
+/// finish (see `delete_compound`).
+const DELETE_RETRY_PAUSE: Duration = Duration::from_millis(50);
+
 /// FileEndOfFileInformation class for SET_INFO (MS-FSCC 2.4.14).
 const FILE_END_OF_FILE_INFORMATION: u8 = 20;
 
@@ -2606,6 +2611,17 @@ impl Tree {
     /// Setting the disposition explicitly makes the server validate while it
     /// still has somewhere to put the error, and it comes back as
     /// `STATUS_DIRECTORY_NOT_EMPTY`.
+    ///
+    /// A CLOSE answered `STATUS_UNSUCCESSFUL` gets one more try after
+    /// [`DELETE_RETRY_PAUSE`]. That's a QNAP with its recycle bin on, where
+    /// deletes on several connections race to create the same `@Recycle`
+    /// folder and the losers' files stay in place (verified on QuTS hero with
+    /// Samba 4.20.0 + QNAP `ksmbd`, 2026-10-22,
+    /// `docs/notes/2026-10-22-rm-close-unsuccessful.md`). The failed attempt
+    /// sends its own standalone CLOSE for the handle QNAP leaves open, so the
+    /// retry is a fresh delete, and dropping the future during the pause
+    /// leaves nothing behind. Any other status, or a second failure, is
+    /// returned as is.
     async fn delete_compound(
         &self,
         conn: &mut Connection,
@@ -2615,6 +2631,32 @@ impl Tree {
         kind: &str,
     ) -> Result<()> {
         let conn = &mut self.pinned_conn(conn);
+        match self
+            .delete_compound_once(conn, path, type_option, share_access, kind)
+            .await
+        {
+            Err(Error::Protocol {
+                status: NtStatus::UNSUCCESSFUL,
+                command: Command::Close,
+            }) => {
+                debug!("tree: delete_{kind} CLOSE was unsuccessful, retrying once path={path:?}");
+                rt::sleep(DELETE_RETRY_PAUSE).await;
+                self.delete_compound_once(conn, path, type_option, share_access, kind)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    /// One attempt of [`delete_compound`](Self::delete_compound).
+    async fn delete_compound_once(
+        &self,
+        conn: &mut Connection,
+        path: &str,
+        type_option: u32,
+        share_access: ShareAccess,
+        kind: &str,
+    ) -> Result<()> {
         let normalized = self.format_path(path);
         trace!("tree: delete_{kind} (compound) path={path:?}");
 
@@ -4558,14 +4600,15 @@ mod tests {
             volatile: 0xBB,
         };
 
-        // Compound: CREATE and SET_INFO succeed, CLOSE fails.
+        // Compound: CREATE and SET_INFO succeed, CLOSE fails (with a status
+        // that isn't retried; UNSUCCESSFUL is, see the retry tests).
         let create_resp = build_create_response(file_id, 0);
         let setinfo_resp = build_set_info_response();
 
         let mut close_hdr = Header::new_request(Command::Close);
         close_hdr.flags.set_response();
         close_hdr.credits = 32;
-        close_hdr.status = NtStatus::UNSUCCESSFUL;
+        close_hdr.status = NtStatus::ACCESS_DENIED;
         let close_resp = pack_message(
             &close_hdr,
             &crate::msg::header::ErrorResponse {
@@ -4595,6 +4638,96 @@ mod tests {
         assert!(result.is_err());
         // Compound frame + standalone CLOSE = 2 messages sent.
         assert_eq!(mock.sent_count(), 2);
+    }
+
+    /// A delete compound whose CREATE and SET_INFO succeeded and whose CLOSE
+    /// came back `close_status`.
+    fn close_failed_delete_compound(file_id: FileId, close_status: NtStatus) -> Vec<u8> {
+        let mut close_hdr = Header::new_request(Command::Close);
+        close_hdr.flags.set_response();
+        close_hdr.credits = 32;
+        close_hdr.status = close_status;
+        let close_resp = pack_message(
+            &close_hdr,
+            &crate::msg::header::ErrorResponse {
+                error_context_count: 0,
+                error_data: vec![],
+            },
+        );
+        build_compound_response_frame(&[
+            build_create_response(file_id, 0),
+            build_set_info_response(),
+            close_resp,
+        ])
+    }
+
+    /// QNAP's recycle bin answers the CLOSE `STATUS_UNSUCCESSFUL` when parallel
+    /// deletes race to create the same `@Recycle` folder, leaving the file in
+    /// place. A second try, once the winner has made the folder, goes through
+    /// (`docs/notes/2026-10-22-rm-close-unsuccessful.md`).
+    #[tokio::test]
+    async fn delete_retries_once_when_the_close_is_unsuccessful() {
+        let file_id = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+        for directory in [false, true] {
+            let mock = Arc::new(MockTransport::new());
+            mock.queue_response(close_failed_delete_compound(
+                file_id,
+                NtStatus::UNSUCCESSFUL,
+            ));
+            mock.queue_response(build_close_response());
+            mock.queue_response(build_compound_response_frame(&[
+                build_create_response(file_id, 0),
+                build_set_info_response(),
+                build_close_response(),
+            ]));
+            let mut conn = setup_connection(&mock);
+
+            let result = if directory {
+                stat_tree().delete_directory(&mut conn, "dir").await
+            } else {
+                stat_tree().delete_file(&mut conn, "racing.txt").await
+            };
+
+            result.unwrap_or_else(|e| panic!("directory={directory}: {e}"));
+            // Compound, standalone CLOSE of the handle it left open, compound.
+            assert_eq!(mock.sent_count(), 3, "directory={directory}");
+            assert_eq!(sent_create(&mock, 2).name, sent_create(&mock, 0).name);
+        }
+    }
+
+    /// One retry, not a loop: a CLOSE that keeps failing surfaces its status.
+    #[tokio::test]
+    async fn delete_gives_up_after_one_retry_of_an_unsuccessful_close() {
+        let file_id = FileId {
+            persistent: 0xAA,
+            volatile: 0xBB,
+        };
+        let mock = Arc::new(MockTransport::new());
+        for _ in 0..2 {
+            mock.queue_response(close_failed_delete_compound(
+                file_id,
+                NtStatus::UNSUCCESSFUL,
+            ));
+            mock.queue_response(build_close_response());
+        }
+        let mut conn = setup_connection(&mock);
+
+        let err = stat_tree()
+            .delete_file(&mut conn, "stuck.txt")
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Protocol {
+                status: NtStatus::UNSUCCESSFUL,
+                command: Command::Close
+            }
+        ));
+        assert_eq!(mock.sent_count(), 4);
     }
 
     // ── Write file tests ─────────────────────────────────────────────
@@ -6001,7 +6134,7 @@ mod tests {
         let mut close_hdr = Header::new_request(Command::Close);
         close_hdr.flags.set_response();
         close_hdr.credits = 32;
-        close_hdr.status = NtStatus::UNSUCCESSFUL;
+        close_hdr.status = NtStatus::ACCESS_DENIED; // UNSUCCESSFUL is retried
         let close_fail = pack_message(&close_hdr, &err_body);
         mock.queue_response(build_compound_response_frame(&[
             create_resp,

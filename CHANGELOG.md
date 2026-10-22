@@ -9,6 +9,8 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- **Parallel deletes on a QNAP with the recycle bin on no longer fail with `STATUS_UNSUCCESSFUL during Close`.** When deletes on several connections are the first into a folder, QNAP's recycle bin races to create the matching `@Recycle` folder, and the losers' CLOSE comes back `STATUS_UNSUCCESSFUL` with the file left in place (`smb2 rm` at its default `-j 8` failed up to 7 of 15 files). `delete_file`, `delete_link`, and `delete_directory` now retry once, after 50 ms, when their CLOSE answers that status; any other failure, or a second one, is reported as before. No file was ever lost: a reported failure always meant the file was still there.
+
 - **`smb2 mkdir -p` counts only the directories it created** (smb2-cli 0.4.26). Every directory that was already there counted as created, so a second run said "Created 4 of 4 paths." It now says "Created 1 of 4 paths; 3 already existed.", or "Nothing to create: all 4 paths already existed." when there was nothing to do.
 
 ## [0.34.0] - 2026-10-20
