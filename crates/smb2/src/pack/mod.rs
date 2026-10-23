@@ -91,7 +91,7 @@ impl<'a> ReadCursor<'a> {
     ///
     /// `byte_len` must be even (each code unit is 2 bytes).
     pub fn read_utf16_le(&mut self, byte_len: usize) -> Result<String> {
-        if byte_len % 2 != 0 {
+        if !byte_len.is_multiple_of(2) {
             return Err(Error::invalid_data(format!(
                 "UTF-16LE byte length must be even, got {}",
                 byte_len

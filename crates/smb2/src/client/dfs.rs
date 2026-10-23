@@ -626,7 +626,7 @@ fn prefix_matches(prefix: &[String], components: &[&str]) -> bool {
 /// surrogate pair all mean the server and the client disagree about the path,
 /// which is not something to guess at.
 fn prefix_from_path_consumed(request_path: &str, path_consumed: u16) -> Option<&str> {
-    if path_consumed == 0 || path_consumed % 2 != 0 {
+    if path_consumed == 0 || !path_consumed.is_multiple_of(2) {
         return None;
     }
     let want = usize::from(path_consumed / 2);

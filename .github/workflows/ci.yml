@@ -141,7 +141,7 @@ jobs:
   # The MSRV promise covers what a consumer compiles: the library (every feature) and the CLI binary. Tests and
   # dev-dependencies are ours alone, so they're held to stable, not to the MSRV. Each OS, for the `cfg`-gated code.
   msrv:
-    name: Verify MSRV (1.85, ${{ matrix.os }})
+    name: Verify MSRV (1.87, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -155,7 +155,7 @@ jobs:
       - name: Install Rust toolchain (MSRV)
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.85"
+          toolchain: "1.87"
 
       - name: Cache cargo registry and target
         uses: Swatinem/rust-cache@v2

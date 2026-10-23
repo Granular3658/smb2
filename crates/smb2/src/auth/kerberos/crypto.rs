@@ -225,7 +225,7 @@ pub fn decrypt_aes_cts(key: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u
     let second_last_start = (n_blocks - 2) * block_size;
     let last_start = (n_blocks - 1) * block_size;
 
-    if orig_len % block_size != 0 {
+    if !orig_len.is_multiple_of(block_size) {
         let tail_len = orig_len - (n_blocks - 1) * block_size;
 
         // c_{n-1} is the swapped full block (at second_last_start).
@@ -574,7 +574,7 @@ fn aes_ecb_decrypt(key: &[u8], block: &[u8]) -> [u8; 16] {
 /// Implemented manually using AES-ECB to avoid cbc crate API complexity.
 fn aes_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     assert!(
-        data.len() % 16 == 0,
+        data.len().is_multiple_of(16),
         "AES-CBC input must be a multiple of 16 bytes"
     );
 
@@ -602,7 +602,7 @@ fn aes_cbc_encrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
 /// Implemented manually using AES-ECB to avoid cbc crate API complexity.
 fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Vec<u8> {
     assert!(
-        data.len() % 16 == 0,
+        data.len().is_multiple_of(16),
         "AES-CBC input must be a multiple of 16 bytes"
     );
 

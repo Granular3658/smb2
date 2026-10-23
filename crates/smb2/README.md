@@ -4,7 +4,7 @@
 [![docs.rs](https://img.shields.io/docsrs/smb2)](https://docs.rs/smb2)
 [![CI](https://github.com/vdavid/smb2/actions/workflows/ci.yml/badge.svg)](https://github.com/vdavid/smb2/actions/workflows/ci.yml)
 [![License](https://img.shields.io/crates/l/smb2)](https://github.com/vdavid/smb2/blob/main/LICENSE-MIT)
-[![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](https://blog.rust-lang.org/2025/02/20/Rust-1.85.0.html)
+[![MSRV](https://img.shields.io/badge/MSRV-1.87-blue)](https://blog.rust-lang.org/2025/05/15/Rust-1.87.0/)
 
 A pure-Rust SMB2/3 client library with pipelined I/O. No C dependencies, no FFI. Faster than native macOS SMB in all
 operations: 1.3-5x faster on uploads, downloads, listings, and deletes.
@@ -318,7 +318,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.34"
+smb2 = "0.35"
 ```
 
 You'll also need an async runtime. smb2 runs on [tokio](https://github.com/tokio-rs/tokio) out of the box:

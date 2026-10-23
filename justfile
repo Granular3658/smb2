@@ -9,7 +9,7 @@
 #     clippy      - Run clippy with -D warnings
 #     test        - Run tests
 #     doc         - Build documentation
-#     msrv        - Check MSRV (1.85) compatibility
+#     msrv        - Check MSRV (1.87) compatibility
 #     audit       - Security audit (requires cargo-audit)
 #     deny        - License/dependency check (requires cargo-deny)
 #     udeps       - Find unused dependencies (requires nightly + cargo-udeps)
@@ -28,7 +28,7 @@
 #     clean       - Remove build artifacts
 #     install-tools - Install required development tools
 #
-# MSRV: 1.85
+# MSRV: 1.87
 
 set shell := ["bash", "-uc"]
 
@@ -112,17 +112,17 @@ doc:
     @cargo doc --no-deps --quiet
     @echo "[+] Docs built"
 
-# Check MSRV compatibility (requires rustup with 1.85 toolchain). Covers what consumers compile (the library with
+# Check MSRV compatibility (requires rustup with 1.87 toolchain). Covers what consumers compile (the library with
 # every feature, and the CLI binary), not tests or dev-dependencies, which only need stable. Same steps as CI's `msrv` job.
 msrv:
-    @echo "[*] Checking MSRV (1.85) compatibility..."
-    @if ! rustup run 1.85.0 rustc --version &> /dev/null; then \
-        echo "[!] Rust 1.85 not found. Install with: rustup toolchain install 1.85.0"; \
+    @echo "[*] Checking MSRV (1.87) compatibility..."
+    @if ! rustup run 1.87.0 rustc --version &> /dev/null; then \
+        echo "[!] Rust 1.87 not found. Install with: rustup toolchain install 1.87.0"; \
         exit 1; \
     fi
-    @RUSTFLAGS="-D warnings" cargo +1.85.0 check --quiet
-    @RUSTFLAGS="-D warnings" cargo +1.85.0 check -p smb2 --all-features --quiet
-    @RUSTFLAGS="-D warnings" cargo +1.85.0 check -p smb2 --no-default-features --features smol --quiet
+    @RUSTFLAGS="-D warnings" cargo +1.87.0 check --quiet
+    @RUSTFLAGS="-D warnings" cargo +1.87.0 check -p smb2 --all-features --quiet
+    @RUSTFLAGS="-D warnings" cargo +1.87.0 check -p smb2 --no-default-features --features smol --quiet
     @echo "[+] MSRV check passed"
 
 # Run security audit (requires cargo-audit)

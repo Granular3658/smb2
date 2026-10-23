@@ -6428,7 +6428,7 @@ pub(crate) fn split_compound(data: &[u8]) -> Result<Vec<Vec<u8>>> {
             )));
         }
 
-        if !results.is_empty() && offset % 8 != 0 {
+        if !results.is_empty() && !offset.is_multiple_of(8) {
             return Err(Error::invalid_data(format!(
                 "compound response at offset {} is not 8-byte aligned -- must disconnect",
                 offset,
@@ -9999,7 +9999,7 @@ mod send_path_liveness_tests {
 
     #[async_trait::async_trait]
     impl TransportSend for GatedSend {
-        // Rust 1.99 renamed `fetch_update` to `try_update`, which the 1.85 MSRV lacks.
+        // Rust 1.99 renamed `fetch_update` to `try_update`, which the 1.87 MSRV lacks.
         #[allow(deprecated)]
         async fn send(&self, data: &[u8]) -> Result<()> {
             if self

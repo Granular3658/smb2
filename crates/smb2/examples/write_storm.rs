@@ -214,7 +214,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         while in_flight.len() < cfg.conc && next < cfg.files {
             let idx = next;
             next += 1;
-            let is_large = idx % cfg.large_every == 0;
+            let is_large = idx.is_multiple_of(cfg.large_every);
             let body = if is_large {
                 Arc::clone(&large_body)
             } else {

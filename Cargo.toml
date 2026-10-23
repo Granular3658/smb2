@@ -10,7 +10,7 @@ exclude = ["benchmarks/smb", "benchmarks/smb-listing", "benchmarks/read-ahead"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.87"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vdavid/smb2"
 

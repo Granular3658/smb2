@@ -5,6 +5,16 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [0.35.0] - 2026-10-23
+
+### Breaking
+
+- **The MSRV is now Rust 1.87** (was 1.85), so smb2 can require the fixed `ctutils` below.
+
+### Security
+
+- **Signature checks use `ctutils` 0.4.4 or newer**, which fixes RUSTSEC-2026-0385: earlier releases could compile the constant-time mask generation into a branch on secret values, a timing side channel. smb2 compares every response signature through it. smb2-cli 0.4.28 picks it up.
+
 ## [0.34.1] - 2026-10-22
 
 ### Fixed

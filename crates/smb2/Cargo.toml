@@ -1,6 +1,6 @@
 [package]
 name = "smb2"
-version = "0.34.1"
+version = "0.35.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -48,7 +48,7 @@ smol = { version = "2.0.2", optional = true }
 # Crypto -- signing, encryption, key derivation
 hmac = "0.13"
 sha2 = "0.11"
-# Capped below 0.9.3, which needs rustc 1.89 (our MSRV is 1.85). A lockfile can't hold this for a library: consumers
+# Capped below 0.9.3, which needs rustc 1.89 (our MSRV is 1.87). A lockfile can't hold this for a library: consumers
 # resolve their own, so the cap has to live here. Lift it together with an MSRV bump to 1.89+, and drop the matching
 # rule in renovate.json.
 aes = ">=0.9.1, <0.9.3"
@@ -57,8 +57,8 @@ ccm = "0.6.1"
 cmac = "0.8.0"
 digest = "0.11"
 # Constant-time signature comparison. RustCrypto's own crate, already in the tree through aes-gcm, ccm, and digest.
-# Capped below 0.4.3, which needs rustc 1.87, for the same reason as `aes` above. Lift it with an MSRV bump to 1.87+.
-ctutils = ">=0.4.2, <0.4.3"
+# 0.4.4 is the floor: earlier releases can branch on secret values (RUSTSEC-2026-0385).
+ctutils = "0.4.4"
 
 # NTLM authentication (MS-NLMP)
 md-5 = "0.11"

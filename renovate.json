@@ -28,14 +28,9 @@
       "groupName": null
     },
     {
-      "description": "aes 0.9.3 needs rustc 1.89 and our MSRV is 1.85, so crates/smb2/Cargo.toml caps it below 0.9.3. Lift this rule together with that cap when the MSRV moves to 1.89+.",
+      "description": "aes 0.9.3 needs rustc 1.89 and our MSRV is 1.87, so crates/smb2/Cargo.toml caps it below 0.9.3. Lift this rule together with that cap when the MSRV moves to 1.89+.",
       "matchPackageNames": ["aes"],
       "allowedVersions": "<0.9.3"
-    },
-    {
-      "description": "ctutils 0.4.3 needs rustc 1.87 and our MSRV is 1.85, so crates/smb2/Cargo.toml caps it below 0.4.3. Lift this rule together with that cap when the MSRV moves to 1.87+.",
-      "matchPackageNames": ["ctutils"],
-      "allowedVersions": "<0.4.3"
     },
     {
       "description": "dist generates this workflow and its plan job fails if it drifts from what dist would generate. Its actions move when `cargo-dist-version` is bumped and `dist generate` re-run.",
