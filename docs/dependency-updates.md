@@ -60,9 +60,10 @@ job checks the consumer's view independently.
 - **Security fixes**: immediate PRs, automerged.
 - **Fuzz harness lockfile**: `crates/smb2/fuzz/` is its own workspace, so the grouped PR never refreshes its
   `Cargo.lock`, and its indirect deps drift (a `cmov` advisory on 2026-10-27). A `lockFileMaintenance` PR (a plain
-  `cargo update` there) runs weekly before 6am Monday and automerges. Two caveats: it skips the three-day window (see
-  above), and PR CI never builds the harness (`fuzz.yml` runs on its Monday 04:15 UTC schedule), so a broken refresh
-  shows up there. A package rule turns it off for every other `Cargo.toml`.
+  `cargo update` there) opens weekly before 6am Monday and never automerges, for two reasons: it skips the three-day
+  window (see above), and PR CI never builds the harness (`fuzz.yml` runs only on its Monday 04:15 UTC schedule).
+  Cmdr's weekly `/weekly-upgrades` pass merges it once every version in it is at least three days old and the harness
+  builds (`cargo +nightly fuzz build` in `crates/smb2/`). A package rule turns it off for every other `Cargo.toml`.
 - **Not managed**: the Rust toolchain in workflows (moves with the MSRV), `dist`'s generated release workflow, and
   `benchmarks/smb/**`. Their rules say why.
 

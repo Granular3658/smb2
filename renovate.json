@@ -49,7 +49,7 @@
       "enabled": false
     },
     {
-      "description": "Lock file maintenance (a weekly plain `cargo update`) runs only for the fuzz harness. It's its own workspace, so the main grouped PR never touches its lockfile, and its indirect deps otherwise drift until a release. Everywhere else it stays off: Renovate can't apply minimumReleaseAge to it (see docs/dependency-updates.md). Both paths are negated because matchFileNames also tests each package file's lockfiles.",
+      "description": "Lock file maintenance (a weekly plain `cargo update`) runs only for the fuzz harness, and never automerges: Cmdr's weekly upgrades pass merges it once every version in it is at least three days old and the harness builds. It's its own workspace, so the main grouped PR never touches its lockfile, and its indirect deps otherwise drift until a release. Everywhere else it stays off: Renovate can't apply minimumReleaseAge to it (see docs/dependency-updates.md). Both paths are negated because matchFileNames also tests each package file's lockfiles.",
       "matchUpdateTypes": ["lockFileMaintenance"],
       "matchFileNames": ["!crates/smb2/fuzz/Cargo.toml", "!crates/smb2/fuzz/Cargo.lock"],
       "enabled": false
@@ -58,7 +58,7 @@
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 6am on monday"],
-    "automerge": true
+    "automerge": false
   },
   "cargo": {
     "enabled": true
