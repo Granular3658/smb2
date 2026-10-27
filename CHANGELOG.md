@@ -7,9 +7,9 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
-### Fixed
+### Breaking
 
-- **`sha2` is capped below 0.11.1**, which needs Rust 1.88, so a consumer on the 1.87 MSRV resolves a version it can build. The lockfile alone can't do that for a library.
+- **The MSRV is now Rust 1.91** (was 1.87), under a new policy: smb2 supports the Rust releases from the last 12 months, and raising the MSRV is always a minor version bump with a changelog line. The `aes` and `sha2` version caps are gone, so smb2 no longer holds your whole dependency graph on older `sha2` and `aes` releases. When a dependency's newest release needs a newer Rust than yours, Cargo's MSRV-aware resolver (`resolver = "3"`, the edition 2024 default) picks one you can build.
 
 ## [0.35.0] - 2026-10-23
 

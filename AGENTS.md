@@ -592,3 +592,4 @@ curl -sfL "https://raw.githubusercontent.com/awakecoding/openspecs/publish/$S/$S
 - [mtp-rs](https://github.com/vdavid/mtp-rs): architecture template
 - [smb-rs](https://github.com/oll3/smb-rs): reference implementation, sanity check only
 - [docs/releasing.md](docs/releasing.md) — how to publish a new version to crates.io, and how `smb2-cli-v*` tags build prebuilt CLI binaries and the Homebrew formula via dist
+- [docs/dependency-updates.md](docs/dependency-updates.md) — the MSRV policy, why `Cargo.toml` never caps a dependency for the MSRV, how Renovate is set up, and everything an MSRV raise touches. Read before merging a Renovate PR or touching `rust-version`.

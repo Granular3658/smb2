@@ -907,8 +907,10 @@ mod tests {
         let domain = String::from_utf16(
             &pairs[0]
                 .1
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -1282,8 +1284,10 @@ mod tests {
         let domain_bytes = &authenticate[domain_offset..domain_offset + domain_len];
         let domain = String::from_utf16(
             &domain_bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
                 .collect::<Vec<_>>(),
         )
         .unwrap();
@@ -1295,8 +1299,10 @@ mod tests {
         let user_bytes = &authenticate[user_offset..user_offset + user_len];
         let user = String::from_utf16(
             &user_bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&pair| u16::from_le_bytes(pair))
                 .collect::<Vec<_>>(),
         )
         .unwrap();

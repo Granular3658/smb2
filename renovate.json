@@ -28,14 +28,9 @@
       "groupName": null
     },
     {
-      "description": "aes 0.9.3 needs rustc 1.89 and our MSRV is 1.87, so crates/smb2/Cargo.toml caps it below 0.9.3. Lift this rule together with that cap when the MSRV moves to 1.89+.",
-      "matchPackageNames": ["aes"],
-      "allowedVersions": "<0.9.3"
-    },
-    {
-      "description": "sha2 0.11.1 needs rustc 1.88 and our MSRV is 1.87, so crates/smb2/Cargo.toml caps it below 0.11.1. Lift this rule together with that cap when the MSRV moves to 1.88+.",
-      "matchPackageNames": ["sha2"],
-      "allowedVersions": "<0.11.1"
+      "description": "A library's Cargo.toml floors are a promise to consumers, so in-range updates move only Cargo.lock. Cargo.lock may then need a newer Rust than the MSRV: that's fine, because the MSRV CI job resolves afresh like a consumer on the MSRV (see docs/dependency-updates.md).",
+      "matchManagers": ["cargo"],
+      "rangeStrategy": "update-lockfile"
     },
     {
       "description": "dist generates this workflow and its plan job fails if it drifts from what dist would generate. Its actions move when `cargo-dist-version` is bumped and `dist generate` re-run.",
@@ -43,7 +38,7 @@
       "enabled": false
     },
     {
-      "description": "The MSRV CI job pins the oldest toolchain we support on purpose; bumping it would stop checking the MSRV at all. Move it by hand together with rust-version in Cargo.toml.",
+      "description": "The MSRV CI job pins the oldest toolchain we support on purpose; bumping it would stop checking the MSRV at all. Move it by hand together with rust-version in Cargo.toml (see docs/dependency-updates.md).",
       "matchManagers": ["github-actions"],
       "matchDepNames": ["rust"],
       "enabled": false

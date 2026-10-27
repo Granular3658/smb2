@@ -10,7 +10,8 @@ exclude = ["benchmarks/smb", "benchmarks/smb-listing", "benchmarks/read-ahead"]
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.87"
+# Rust releases from the last 12 months. Raising it is a minor version bump; see docs/dependency-updates.md.
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/vdavid/smb2"
 

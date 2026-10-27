@@ -27,16 +27,16 @@ Run `just --list` to see all available commands.
 
 ### MSRV (minimum supported Rust version)
 
-We support Rust 1.87. Before submitting PRs, verify MSRV compatibility:
+We support the Rust releases from the last 12 months, currently Rust 1.91. Raising it is a minor version bump with a changelog line. Before submitting PRs, verify MSRV compatibility:
 
 ```bash
-rustup toolchain install 1.87.0  # One-time setup
+rustup toolchain install 1.91.0  # One-time setup
 just msrv                         # Check MSRV compatibility
 ```
 
 This catches issues that only appear on older Rust versions. CI runs this check, so `just msrv` locally saves a round-trip.
 
-The MSRV covers what consumers compile: the library (every feature) and the CLI binary. Tests and dev-dependencies only need stable Rust, so a dev-dependency may require a newer toolchain. A library dependency may not; when one raises its MSRV in a patch release, we cap it in `crates/smb2/Cargo.toml` (see `aes`) with a matching rule in `renovate.json`.
+The MSRV covers what consumers compile: the library (every feature) and the CLI binary. Tests and dev-dependencies only need stable Rust, so a dev-dependency may require a newer toolchain. `just msrv` resolves dependencies afresh the way a consumer on the MSRV would, so `Cargo.lock` may hold versions that need a newer Rust, and `Cargo.toml` never caps a dependency for the MSRV. Details in [docs/dependency-updates.md](docs/dependency-updates.md).
 
 ## Project structure
 
@@ -142,7 +142,7 @@ Everything is little-endian on the wire (except the TCP transport framing, which
 1. Fork and create a branch
 2. Make your changes
 3. Run `just` (checks format, lint, test, and doc)
-4. Run `just msrv` to verify Rust 1.87 compatibility
+4. Run `just msrv` to verify Rust 1.91 compatibility
 5. If you have a Samba server, run integration tests
 6. Open a PR with a clear description including how you tested your changes
 

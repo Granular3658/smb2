@@ -940,8 +940,10 @@ async fn short_name(conn: &Connection, tree: &Tree, path: &str) -> String {
         .output_buffer;
     let len = u32::from_le_bytes(buf[0..4].try_into().unwrap()) as usize;
     let units: Vec<u16> = buf[4..4 + len]
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
         .collect();
     String::from_utf16(&units).unwrap()
 }
