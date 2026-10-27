@@ -7,9 +7,11 @@ The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [0.36.0] - 2026-10-27
+
 ### Breaking
 
-- **The MSRV is now Rust 1.91** (was 1.87), under a new policy: smb2 supports the Rust releases from the last 12 months, and raising the MSRV is always a minor version bump with a changelog line. The `aes` and `sha2` version caps are gone, so smb2 no longer holds your whole dependency graph on older `sha2` and `aes` releases. When a dependency's newest release needs a newer Rust than yours, Cargo's MSRV-aware resolver (`resolver = "3"`, the edition 2024 default) picks one you can build.
+- **The MSRV is now Rust 1.91** (was 1.87), under a new policy: smb2 supports the Rust releases from the last 12 months, and raising the MSRV is always a minor version bump with a changelog line. The `aes` and `sha2` version caps are gone, so smb2 no longer holds your whole dependency graph on older `sha2` and `aes` releases. When a dependency's newest release needs a newer Rust than yours, Cargo's MSRV-aware resolver (`resolver = "3"`, the edition 2024 default) picks one you can build. smb2-cli 0.5.0 moves to the same MSRV.
 
 ## [0.35.0] - 2026-10-23
 

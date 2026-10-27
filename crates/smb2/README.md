@@ -318,7 +318,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-smb2 = "0.35"
+smb2 = "0.36"
 ```
 
 You'll also need an async runtime. smb2 runs on [tokio](https://github.com/tokio-rs/tokio) out of the box:
@@ -334,7 +334,7 @@ own reactor and executor threads, so this also works under any other executor (`
 
 ```toml
 [dependencies]
-smb2 = { version = "0.35", default-features = false, features = ["smol"] }
+smb2 = { version = "0.36", default-features = false, features = ["smol"] }
 smol = "2"
 ```
 
@@ -344,7 +344,7 @@ uses tokio's channels and semaphores either way; they work on any executor.
 ### MSRV
 
 smb2 supports the Rust releases from the last 12 months, currently Rust 1.91 or newer. Raising this minimum is a minor
-version bump (like 0.35 to 0.36), and the changelog always says so. When one of smb2's dependencies ships a release
+version bump (like 0.36 to 0.37), and the changelog always says so. When one of smb2's dependencies ships a release
 that needs a newer Rust than yours, Cargo's MSRV-aware resolver (on by default with `resolver = "3"` or edition 2024)
 picks a version your Rust can build.
 
