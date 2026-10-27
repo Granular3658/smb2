@@ -47,7 +47,8 @@ smol = { version = "2.0.2", optional = true }
 
 # Crypto -- signing, encryption, key derivation
 hmac = "0.13"
-sha2 = "0.11"
+# Capped below 0.11.1, which needs rustc 1.88 (our MSRV is 1.87). Same reason and lift condition as `aes` below.
+sha2 = ">=0.11.0, <0.11.1"
 # Capped below 0.9.3, which needs rustc 1.89 (our MSRV is 1.87). A lockfile can't hold this for a library: consumers
 # resolve their own, so the cap has to live here. Lift it together with an MSRV bump to 1.89+, and drop the matching
 # rule in renovate.json.

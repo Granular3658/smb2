@@ -5,6 +5,12 @@ All notable changes to smb2 will be documented in this file.
 The format is based on [keep a changelog](https://keepachangelog.com/en/1.1.0/), and we use
 [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`sha2` is capped below 0.11.1**, which needs Rust 1.88, so a consumer on the 1.87 MSRV resolves a version it can build. The lockfile alone can't do that for a library.
+
 ## [0.35.0] - 2026-10-23
 
 ### Breaking
