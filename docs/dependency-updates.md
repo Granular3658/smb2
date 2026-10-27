@@ -44,7 +44,7 @@ Verified on 2026-10-27 against Renovate `main` (`lib/modules/manager/cargo/artif
   `semver-coerced` constraint versioning let 4.0.1 through again. Renovate doesn't read `rust-version` from
   `Cargo.toml` either (renovatebot/renovate#26314, open).
 - **`lockFileMaintenance` would respect the MSRV** (it runs a plain `cargo update`), but Renovate can't apply
-  `minimumReleaseAge` to it, so it would drop our three-day window. Not enabled.
+  `minimumReleaseAge` to it, so it would drop our three-day window. Not enabled, except for the fuzz harness below.
 
 Hence the split above: Renovate keeps `Cargo.lock` current with `--precise` (and the three-day window), and the MSRV
 job checks the consumer's view independently.
@@ -58,6 +58,11 @@ job checks the consumer's view independently.
 - **Non-major updates**: one grouped PR, weekly before 6am Monday (Europe/Budapest), automerged once CI is green.
 - **Major updates**: one grouped PR, monthly on the 1st, never automerged.
 - **Security fixes**: immediate PRs, automerged.
+- **Fuzz harness lockfile**: `crates/smb2/fuzz/` is its own workspace, so the grouped PR never refreshes its
+  `Cargo.lock`, and its indirect deps drift (a `cmov` advisory on 2026-10-27). A `lockFileMaintenance` PR (a plain
+  `cargo update` there) runs weekly before 6am Monday and automerges. Two caveats: it skips the three-day window (see
+  above), and PR CI never builds the harness (`fuzz.yml` runs on its Monday 04:15 UTC schedule), so a broken refresh
+  shows up there. A package rule turns it off for every other `Cargo.toml`.
 - **Not managed**: the Rust toolchain in workflows (moves with the MSRV), `dist`'s generated release workflow, and
   `benchmarks/smb/**`. Their rules say why.
 

@@ -47,8 +47,19 @@
       "description": "The SMB benchmark harness is excluded from the workspace because sspi pins digest =0.11.0-rc.5, which conflicts with digest 0.11.2. Independent bumps there can never resolve.",
       "matchFileNames": ["benchmarks/smb/**"],
       "enabled": false
+    },
+    {
+      "description": "Lock file maintenance (a weekly plain `cargo update`) runs only for the fuzz harness. It's its own workspace, so the main grouped PR never touches its lockfile, and its indirect deps otherwise drift until a release. Everywhere else it stays off: Renovate can't apply minimumReleaseAge to it (see docs/dependency-updates.md). Both paths are negated because matchFileNames also tests each package file's lockfiles.",
+      "matchUpdateTypes": ["lockFileMaintenance"],
+      "matchFileNames": ["!crates/smb2/fuzz/Cargo.toml", "!crates/smb2/fuzz/Cargo.lock"],
+      "enabled": false
     }
   ],
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 6am on monday"],
+    "automerge": true
+  },
   "cargo": {
     "enabled": true
   },
