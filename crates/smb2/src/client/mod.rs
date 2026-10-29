@@ -1692,6 +1692,20 @@ impl SmbClient {
         tree.stat_many(self.connection_mut(), paths).await
     }
 
+    /// [`stat`](Self::stat), but a link in the last component is followed.
+    /// See [`Tree::stat_following`].
+    pub async fn stat_following(&mut self, tree: &mut Tree, path: &str) -> Result<FileInfo> {
+        self.replaying(tree, path, |mut conn, tree, path| async move {
+            tree.stat_following(&mut conn, &path).await
+        })
+        .await
+        .map(|(value, _)| value)
+    }
+
+    /// Ask the server about `path`: its metadata, in one compound request.
+    ///
+    /// Describes a link rather than what it points to; see
+    /// [`stat_following`](Self::stat_following) for the other answer.
     pub async fn stat(&mut self, tree: &mut Tree, path: &str) -> Result<FileInfo> {
         self.replaying(tree, path, |mut conn, tree, path| async move {
             tree.stat(&mut conn, &path).await

@@ -1158,6 +1158,21 @@ impl Tree {
         results
     }
 
+    /// [`stat`](Self::stat), but a link in the last component is followed.
+    ///
+    /// `stat` describes the link itself, which is what a tool that is about to
+    /// delete or rename an entry wants. A caller asking "is this a directory"
+    /// wants the target: a gallery directory that is a symlink to one is still a
+    /// directory, and reporting the link instead makes the gallery look absent.
+    ///
+    /// A server may refuse to follow on its own (`STATUS_STOPPED_ON_SYMLINK`,
+    /// MS-SMB2 § 3.3.5.9); the error comes back rather than being retried here,
+    /// so the caller can fall back to `stat`.
+    pub async fn stat_following(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
+        let (info, _) = self.stat_compound(conn, path, false, true).await?;
+        Ok(info)
+    }
+
     /// Get file metadata (size, timestamps, is_directory) using a compound request (1 round-trip).
     ///
     /// Sends CREATE + QUERY_INFO (FileBasicInformation) +
@@ -1165,7 +1180,7 @@ impl Tree {
     /// To also learn which file the path names, use
     /// [`stat_with_identity`](Self::stat_with_identity).
     pub async fn stat(&self, conn: &mut Connection, path: &str) -> Result<FileInfo> {
-        let (info, _) = self.stat_compound(conn, path, false).await?;
+        let (info, _) = self.stat_compound(conn, path, false, false).await?;
         Ok(info)
     }
 
@@ -1190,7 +1205,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
     ) -> Result<(FileInfo, Option<FileIdentity>)> {
-        self.stat_compound(conn, path, true).await
+        self.stat_compound(conn, path, true, false).await
     }
 
     /// The compound behind [`stat`](Self::stat) and
@@ -1201,6 +1216,7 @@ impl Tree {
         conn: &mut Connection,
         path: &str,
         with_identity: bool,
+        follow: bool,
     ) -> Result<(FileInfo, Option<FileIdentity>)> {
         let conn = &mut self.pinned_conn(conn);
         let normalized = self.format_path(path);
@@ -1219,7 +1235,10 @@ impl Tree {
             // Describe the link itself, the way its listing entry does. A
             // junction opened without it is its target, and a symlink is
             // refused with STATUS_STOPPED_ON_SYMLINK (MS-SMB2 § 3.3.5.9).
-            create_options: FILE_OPEN_REPARSE_POINT,
+            // `follow` asks for the target instead, which is what a caller that
+            // means "is this path a directory I can use" wants: a gallery
+            // directory that is a link to one is still a directory.
+            create_options: if follow { 0 } else { FILE_OPEN_REPARSE_POINT },
             name: normalized,
             create_contexts: vec![],
         };
