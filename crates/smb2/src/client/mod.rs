@@ -1682,6 +1682,16 @@ impl SmbClient {
     }
 
     /// Get file metadata (size, timestamps, whether it's a directory).
+    /// Whether each of `paths` exists, in two round trips for the whole set.
+    ///
+    /// See [`Tree::stat_many`]: one frame asks about every path, a second closes
+    /// the handles the successful ones left behind. No DFS replay -- the paths are
+    /// expected to name entries in one directory of the tree the caller opened,
+    /// which is what an existence probe looks at.
+    pub async fn stat_many(&mut self, tree: &mut Tree, paths: &[&str]) -> Result<Vec<Result<()>>> {
+        tree.stat_many(self.connection_mut(), paths).await
+    }
+
     pub async fn stat(&mut self, tree: &mut Tree, path: &str) -> Result<FileInfo> {
         self.replaying(tree, path, |mut conn, tree, path| async move {
             tree.stat(&mut conn, &path).await
