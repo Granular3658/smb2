@@ -1079,6 +1079,102 @@ impl Tree {
     /// the per-call setup rather than the wire time. To overlap server work,
     /// run `stat` on several connections concurrently. To describe a whole
     /// directory, `list_directory` is far cheaper than a stat per entry.
+    /// Whether each of `paths` exists, in two round trips for the whole set.
+    ///
+    /// One round trip asks about every path: the CREATEs are independent, so they
+    /// travel in one frame without the related flag and the server answers each of
+    /// them on its own. A second closes the handles the successful ones left
+    /// behind -- a CREATE that succeeded is an open handle, and leaking one per
+    /// name per call would run a server out of them long before the caller noticed.
+    ///
+    /// `stat` is one round trip per path and `list_directory` is one round trip
+    /// plus one per bufferful of entries, so this is the shape an existence probe
+    /// wants: the names are known, and the directory may be large.
+    pub async fn stat_many(
+        &self,
+        conn: &mut Connection,
+        paths: &[&str],
+    ) -> Result<Vec<Result<()>>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests: Vec<CreateRequest> = paths
+            .iter()
+            .map(|path| CreateRequest {
+                requested_oplock_level: OplockLevel::None,
+                impersonation_level: ImpersonationLevel::Impersonation,
+                desired_access: FileAccessMask::new(
+                    FileAccessMask::FILE_READ_ATTRIBUTES | FileAccessMask::SYNCHRONIZE,
+                ),
+                file_attributes: 0,
+                share_access: ShareAccess(
+                    ShareAccess::FILE_SHARE_READ
+                        | ShareAccess::FILE_SHARE_WRITE
+                        | ShareAccess::FILE_SHARE_DELETE,
+                ),
+                create_disposition: CreateDisposition::FileOpen,
+                create_options: 0,
+                name: self.format_path(path),
+                create_contexts: vec![],
+            })
+            .collect();
+        let ops: Vec<CompoundOp<'_>> = requests
+            .iter()
+            .map(|body| CompoundOp {
+                command: Command::Create,
+                body,
+                tree_id: Some(self.tree_id),
+                credit_charge: CreditCharge(1),
+            })
+            .collect();
+
+        let responses = conn.execute_compound_unrelated(&ops).await?;
+
+        let mut results = Vec::with_capacity(responses.len());
+        let mut opened = Vec::new();
+        for response in responses {
+            match response {
+                Ok(frame) if frame.header.status == NtStatus::SUCCESS => {
+                    let mut cursor = ReadCursor::new(&frame.body);
+                    match CreateResponse::unpack(&mut cursor) {
+                        Ok(created) => {
+                            opened.push(created.file_id);
+                            results.push(Ok(()));
+                        }
+                        Err(error) => results.push(Err(error)),
+                    }
+                }
+                Ok(frame) => results.push(Err(Error::Protocol {
+                    status: frame.header.status,
+                    command: Command::Create,
+                })),
+                Err(error) => results.push(Err(error)),
+            }
+        }
+
+        if !opened.is_empty() {
+            let closes: Vec<CloseRequest> = opened
+                .iter()
+                .map(|file_id| CloseRequest {
+                    flags: 0,
+                    file_id: *file_id,
+                })
+                .collect();
+            let close_ops: Vec<CompoundOp<'_>> = closes
+                .iter()
+                .map(|body| CompoundOp {
+                    command: Command::Close,
+                    body,
+                    tree_id: Some(self.tree_id),
+                    credit_charge: CreditCharge(1),
+                })
+                .collect();
+            let _ = conn.execute_compound_unrelated(&close_ops).await;
+        }
+
+        Ok(results)
+    }
+
     pub async fn stat_files(&self, conn: &mut Connection, paths: &[&str]) -> Vec<Result<FileInfo>> {
         if paths.is_empty() {
             return vec![];

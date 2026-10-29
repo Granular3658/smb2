@@ -3916,11 +3916,35 @@ impl Connection {
     ///   a later READ fail — so callers typically match on each inner
     ///   result individually.
     pub async fn execute_compound(&self, ops: &[CompoundOp<'_>]) -> Result<Vec<Result<Frame>>> {
+        self.execute_compound_related(ops, true).await
+    }
+
+    /// Like [`execute_compound`], but the sub-requests are independent.
+    ///
+    /// [`execute_compound`] marks every sub-request after the first as
+    /// `RELATED_OPERATIONS`, which is what a CREATE+QUERY+CLOSE chain needs: the
+    /// server substitutes the handle from the first CREATE. An independent
+    /// operation must not carry that flag -- it tells the server this request
+    /// depends on its predecessor, so one failure is entitled to take the rest of
+    /// the chain with it. Use this when the sub-requests merely happen to travel
+    /// together, such as probing several names in one directory.
+    pub async fn execute_compound_unrelated(
+        &self,
+        ops: &[CompoundOp<'_>],
+    ) -> Result<Vec<Result<Frame>>> {
+        self.execute_compound_related(ops, false).await
+    }
+
+    async fn execute_compound_related(
+        &self,
+        ops: &[CompoundOp<'_>],
+        related: bool,
+    ) -> Result<Vec<Result<Frame>>> {
         self.inner
             .metrics
             .compound_requests_sent
             .fetch_add(1, Ordering::Relaxed);
-        let result = self.execute_compound_inner(ops).await;
+        let result = self.execute_compound_inner(ops, related).await;
         if result.is_err() {
             self.inner
                 .metrics
@@ -3930,7 +3954,11 @@ impl Connection {
         result
     }
 
-    async fn execute_compound_inner(&self, ops: &[CompoundOp<'_>]) -> Result<Vec<Result<Frame>>> {
+    async fn execute_compound_inner(
+        &self,
+        ops: &[CompoundOp<'_>],
+        related: bool,
+    ) -> Result<Vec<Result<Frame>>> {
         if ops.is_empty() {
             return Err(Error::invalid_data(
                 "compound request must have at least one operation",
@@ -3971,7 +3999,7 @@ impl Connection {
             header.session_id = session_id;
             header.tree_id = op.tree_id;
 
-            if i > 0 {
+            if related && i > 0 {
                 header.flags.set_related();
             }
             if should_sign && !should_encrypt {
